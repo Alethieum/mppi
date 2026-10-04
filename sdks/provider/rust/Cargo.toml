@@ -1,0 +1,43 @@
+[package]
+name = "mppi-provider"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.95"
+description = "MPPI provider payment runtime, protocol services and integration interfaces"
+readme = "README.md"
+include = ["src/**", "examples/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[features]
+default = []
+codegen = ["dep:tonic-prost-build"]
+
+[dependencies]
+aws-lc-rs = "=1.18.1"
+axum = { version = "=0.8.9", default-features = false }
+base64 = "=0.23.1"
+zeroize = "=1.9.0"
+alloy-primitives = { version = "=1.7.3", features = ["k256"] }
+alloy-sol-types = "=1.7.3"
+prost = "=0.14.4"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["unbounded_depth", "arbitrary_precision", "raw_value"] }
+futures-core = "=0.3.34"
+getrandom = "=0.4.3"
+http-body = "=1.1.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
+tokio = { version = "=1.53.1", features = ["sync", "time", "rt", "macros"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
+toml = { version = "=0.8.23", default-features = false, features = ["parse", "display"] }
+tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }
+tonic = { version = "=0.14.6", features = ["tls-ring", "tls-native-roots"] }
+tonic-prost = "=0.14.6"
+tonic-prost-build = { version = "=0.14.6", optional = true }
+
+[dev-dependencies]
+k256 = { version = "=0.13.4", features = ["ecdsa"] }
+tokio = { version = "=1.53.1", features = ["test-util"] }
+
+[[example]]
+name = "generate"
+required-features = ["codegen"]

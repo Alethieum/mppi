@@ -1,0 +1,459 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MPPI catalog, amount and provider-report conformance fixtures",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/catalogSuite"
+    },
+    {
+      "$ref": "#/$defs/amountSuite"
+    },
+    {
+      "$ref": "#/$defs/lifecycleSuite"
+    }
+  ],
+  "$defs": {
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "error": {
+      "enum": [
+        "INVALID_VALUE",
+        "LIMIT_EXCEEDED",
+        "NON_CANONICAL",
+        "DUPLICATE_KEY",
+        "INCONSISTENT_USAGE",
+        "UNCOVERED_USAGE"
+      ]
+    },
+    "rates": {
+      "type": "object",
+      "required": [
+        "input",
+        "output"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/decimal"
+        },
+        "output": {
+          "$ref": "#/$defs/decimal"
+        },
+        "cache": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "counts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/decimal"
+      },
+      "description": "Cumulative input_tokens, cache_tokens, output_tokens, in that order."
+    },
+    "runStatus": {
+      "enum": [
+        null,
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "catalogSuite": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "suite",
+        "accept",
+        "reject"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "suite": {
+          "const": "catalog"
+        },
+        "accept": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "utf8",
+              "keccak256"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "utf8": {
+                "type": "string"
+              },
+              "keccak256": {
+                "type": "string",
+                "pattern": "^0x[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "reject": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "rawHex",
+              "error"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "rawHex": {
+                "type": "string",
+                "pattern": "^([0-9a-f]{2})*$"
+              },
+              "error": {
+                "$ref": "#/$defs/error"
+              }
+            }
+          }
+        }
+      }
+    },
+    "amountSuite": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "suite",
+        "cases"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "suite": {
+          "const": "amounts"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "operation",
+              "input"
+            ],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "expect"
+                ],
+                "not": {
+                  "required": [
+                    "error"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "error"
+                ],
+                "not": {
+                  "required": [
+                    "expect"
+                  ]
+                }
+              }
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "funding",
+                  "usage",
+                  "coverage",
+                  "top_up",
+                  "remaining"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "tokens": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "rates": {
+                    "$ref": "#/$defs/rates"
+                  },
+                  "numerators": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/decimal"
+                    }
+                  },
+                  "deposit": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "amount": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "usageNumerator": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "reservations": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/decimal"
+                    }
+                  }
+                }
+              },
+              "expect": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/$defs/decimal"
+                  }
+                ]
+              },
+              "error": {
+                "$ref": "#/$defs/error"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "funding"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "input": {
+                      "required": [
+                        "tokens",
+                        "rates"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "usage"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "input": {
+                      "required": [
+                        "numerators"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "coverage"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "input": {
+                      "required": [
+                        "numerators"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "top_up"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "input": {
+                      "required": [
+                        "deposit",
+                        "amount"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "remaining"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "input": {
+                      "required": [
+                        "deposit",
+                        "usageNumerator",
+                        "reservations",
+                        "rates"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "lifecycleSuite": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "suite",
+        "cases"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "suite": {
+          "const": "lifecycle"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "rates",
+              "previous",
+              "counts",
+              "status"
+            ],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "expect"
+                ],
+                "not": {
+                  "required": [
+                    "error"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "error"
+                ],
+                "not": {
+                  "required": [
+                    "expect"
+                  ]
+                }
+              }
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "rates": {
+                "$ref": "#/$defs/rates"
+              },
+              "counts": {
+                "$ref": "#/$defs/counts"
+              },
+              "status": {
+                "$ref": "#/$defs/runStatus"
+              },
+              "previous": {
+                "type": "object",
+                "required": [
+                  "counts",
+                  "remainingNumerator",
+                  "status"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "counts": {
+                    "$ref": "#/$defs/counts"
+                  },
+                  "remainingNumerator": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "status": {
+                    "$ref": "#/$defs/runStatus"
+                  }
+                }
+              },
+              "expect": {
+                "type": "object",
+                "required": [
+                  "deltaNumerator",
+                  "releasedNumerator",
+                  "remainingNumerator",
+                  "duplicate"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "deltaNumerator": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "releasedNumerator": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "remainingNumerator": {
+                    "$ref": "#/$defs/decimal"
+                  },
+                  "duplicate": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "error": {
+                "$ref": "#/$defs/error"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

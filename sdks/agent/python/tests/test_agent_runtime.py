@@ -1,0 +1,824 @@
+"""Agent Control independently exercised against a native gRPC wire peer.
+
+These focused tests install a known signed local ledger to isolate renewal and
+loss behavior. Full discovery/funding/attachment is covered by the separately
+installed two-role acceptance test; these are not chain or wallet integration.
+"""
+
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import grpc
+import pytest
+from mppi.v1 import mppi_pb2 as pb
+from mppi.v1 import mppi_pb2_grpc as services
+from mppi_agent import Client, ClientError, CloseAccountingError, Hooks
+from mppi_agent.checkpoint import Checkpoint
+from mppi_agent.state import Ledger
+from mppi_protocol._observers import Observers
+from mppi_protocol.amounts import Rates
+from mppi_protocol.catalog import CatalogRow, publish_catalog
+from mppi_protocol.chain import Block, ChainSession, ClosingEvidence, OpeningEvidence
+from mppi_protocol.contract import ContractCalls
+from mppi_protocol.discovery import ProviderIdentity
+from mppi_protocol.signing import LocalSessionSigner, verify_close_auth, verify_voucher
+from mppi_protocol.types import (
+    ChainObservation,
+    Domain,
+    OperationResult,
+    OperationState,
+    PauseLevel,
+    Readiness,
+    RunContext,
+    SessionDescriptor,
+    SessionStatus,
+)
+from mppi_protocol.wire import GRPC_OPTIONS, ByteQueue
+
+DOMAIN = Domain(5042002, b"p" * 20)
+SIGNER = LocalSessionSigner(bytes.fromhex("11" * 32))
+CATALOG = publish_catalog((CatalogRow("test/model", Rates(500_000, 500_000)),))
+DESCRIPTOR = SessionDescriptor(
+    b"a" * 20, SIGNER.address, 7, b"r" * 20, b"o" * 20, bytes.fromhex("36" + "00" * 19), b"s" * 32
+)
+
+
+def component_client() -> Client:
+    client = object.__new__(Client)
+    client._observers = Observers(None)
+    ledger = Ledger(DOMAIN, DESCRIPTOR, CATALOG)
+    ledger.generation, ledger.ready = 1, True
+    context = RunContext(ledger.session_id, b"r" * 32, 1, "test/model", CATALOG.rate_card_hash)
+    ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+    state = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+    snapshot = SimpleNamespace(sessions={ledger.session_id: state})
+    client.chain = SimpleNamespace(
+        current=snapshot, snapshot=lambda: snapshot, readiness=lambda _: Readiness(True)
+    )
+    client.signer = SIGNER
+    client.timeout = 1
+    client._ledger = ledger
+    client._persist = AsyncMock()
+    client._control_failure = None
+    client._attached_generation = 1
+    client._outbound = ByteQueue()
+    client._voucher_lock = asyncio.Lock()
+    client._background = set()
+    client._pending_vouchers = {}
+    client._voucher_task = client._renew_task = None
+    client._queue_options = {"max_messages": 4, "max_bytes": 16384, "wait_ms": 50}
+    client._nonce = client._snapshot_waiter = client._close_waiter = None
+    client._snapshot_applied = None
+    client._operation_locks = {}
+    client._challenges = {}
+    client._outputs = {}
+    client._control = None
+    client._on_low_credit = None
+    client._low_credit_queue = client._low_credit_task = None
+    return client
+
+
+def test_native_control_meter_renews_fixed_signer_authority_without_output_reads() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        received = []
+        finished = asyncio.Event()
+        hold = asyncio.Event()
+
+        class Peer(services.ControlServicer):
+            async def Session(self, requests, context):
+                yield pb.ControlMessage(
+                    low_credit=pb.LowCredit(
+                        session_id=ledger.session_id,
+                        model="test/model",
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        remaining_tokens=0,
+                        suggest_top_up_tokens=10,
+                        coverage_request=pb.CoverageRequest(
+                            run_id=b"r" * 32,
+                            control_generation=1,
+                            required_by_price=[
+                                pb.RequiredTokens(
+                                    model="test/model",
+                                    rate_card_hash=CATALOG.rate_card_hash,
+                                    input_tokens=4,
+                                    cache_tokens=0,
+                                    output_tokens=3,
+                                )
+                            ],
+                        ),
+                    )
+                )
+                first = await anext(requests)
+                received.append(first.voucher)
+                assert first.voucher.cumulative == 4
+                verify_voucher(DOMAIN, DESCRIPTOR, 4, first.voucher.signature)
+                yield pb.ControlMessage(
+                    meter=pb.Meter(
+                        session_id=ledger.session_id,
+                        run_id=b"r" * 32,
+                        seq=1,
+                        input_tokens=4,
+                        cache_tokens=0,
+                        output_tokens=3,
+                    )
+                )
+                second = await anext(requests)
+                received.append(second.voucher)
+                assert second.voucher.cumulative == 5
+                verify_voucher(DOMAIN, DESCRIPTOR, 5, second.voucher.signature)
+                finished.set()
+                await hold.wait()
+
+        server = grpc.aio.server(options=GRPC_OPTIONS)
+        services.add_ControlServicer_to_server(Peer(), server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+        client._control = services.ControlStub(channel).Session()
+        tasks = [
+            asyncio.create_task(client._control_read()),
+            asyncio.create_task(client._control_write()),
+        ]
+        try:
+            await asyncio.wait_for(finished.wait(), 5)
+            assert [voucher.cumulative for voucher in received] == [4, 5]
+            assert ledger.usage_amount == 3
+            assert client._persist.await_count >= 3
+        finally:
+            client._control.cancel()
+            for task in tasks + list(client._background):
+                task.cancel()
+            await asyncio.gather(*tasks, *client._background, return_exceptions=True)
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def test_native_control_session_drain_emits_typed_hook_and_stops_authorization() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        ledger.coverage_numerator = 4_000_000
+        assert client._require_ready() is ledger
+        observed, delivered = [], threading.Event()
+        hold = asyncio.Event()
+
+        def on_drain(notice):
+            observed.append(notice)
+            delivered.set()
+
+        client._observers = Observers(Hooks(on_drain=on_drain))
+        drain = pb.Drain(
+            session_id=ledger.session_id,
+            reason=pb.DRAIN_REASON_PROVIDER_INITIATED,
+        )
+
+        class Peer(services.ControlServicer):
+            async def Session(self, requests, context):
+                yield pb.ControlMessage(drain=drain)
+                await hold.wait()  # Keep Control alive: EOF must not cause the denial.
+
+        server = grpc.aio.server(options=GRPC_OPTIONS)
+        services.add_ControlServicer_to_server(Peer(), server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+        client._control = services.ControlStub(channel).Session()
+        reader = asyncio.create_task(client._control_read())
+        try:
+            assert await asyncio.to_thread(delivered.wait, 2)
+            assert len(observed) == 1 and isinstance(observed[0], pb.Drain)
+            assert observed[0] == drain
+            assert observed[0].session_id == ledger.session_id
+            assert not observed[0].HasField("run_id")
+            assert client._control_failure is None and not reader.done()
+            assert not ledger.ready and ledger.runs[b"r" * 32].failed_transport
+            client._persist.assert_awaited_once()
+            with pytest.raises(ClientError, match="authenticated Control is not ready"):
+                client._require_ready()
+            client._voucher = AsyncMock()
+            await client._renew()
+            client._voucher.assert_not_awaited()
+        finally:
+            client._control.cancel()
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            client._observers.close()
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def test_low_credit_hook_cannot_stall_control_or_mutate_its_payment_records() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        entered, release = threading.Event(), threading.Event()
+        observed = []
+
+        def callback(notice):
+            observed.append(notice.remaining_tokens)
+            notice.session_id = bytes(32)
+            entered.set()
+            assert release.wait(3)
+
+        client._on_low_credit = callback
+        ledger = client._ledger
+        ledger.accept_voucher(
+            pb.Voucher(
+                session_id=ledger.session_id,
+                cumulative=4,
+                signature=SIGNER.sign_voucher(DOMAIN, ledger.session_id, 4),
+            ),
+            100,
+        )
+        ledger.coverage_numerator = 4_000_000
+        renewed = asyncio.Event()
+        finish = asyncio.Event()
+
+        class Peer(services.ControlServicer):
+            async def Session(self, requests, context):
+                yield pb.ControlMessage(
+                    low_credit=pb.LowCredit(
+                        session_id=ledger.session_id,
+                        model="test/model",
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        remaining_tokens=1,
+                        suggest_top_up_tokens=10,
+                    )
+                )
+                assert await asyncio.to_thread(entered.wait, 1)
+                yield pb.ControlMessage(
+                    meter=pb.Meter(
+                        session_id=ledger.session_id,
+                        run_id=b"r" * 32,
+                        seq=1,
+                        input_tokens=4,
+                        cache_tokens=0,
+                        output_tokens=2,
+                    )
+                )
+                voucher = (await anext(requests)).voucher
+                assert voucher.session_id == ledger.session_id and voucher.cumulative == 5
+                renewed.set()
+                await finish.wait()
+
+        server = grpc.aio.server(options=GRPC_OPTIONS)
+        services.add_ControlServicer_to_server(Peer(), server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+        client._control = services.ControlStub(channel).Session()
+        tasks = [
+            asyncio.create_task(client._control_read()),
+            asyncio.create_task(client._control_write()),
+        ]
+        try:
+            await asyncio.wait_for(renewed.wait(), 2)
+            assert not release.is_set() and observed == [1]
+            assert client._control_failure is None and ledger.voucher.cumulative == 5
+        finally:
+            release.set()
+            client._control.cancel()
+            for task in tasks + list(client._background):
+                task.cancel()
+            await asyncio.gather(*tasks, *client._background, return_exceptions=True)
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def test_low_credit_hook_queue_is_bounded_without_waiting_on_control() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        entered, release = threading.Event(), threading.Event()
+        client._on_low_credit = lambda _: (entered.set(), release.wait(2))
+        notice = pb.LowCredit(
+            session_id=client._ledger.session_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            remaining_tokens=1,
+            suggest_top_up_tokens=10,
+        )
+        client._notify_low_credit(notice)
+        assert await asyncio.to_thread(entered.wait, 1)
+        try:
+            for _ in range(client._queue_options["max_messages"]):
+                client._notify_low_credit(notice)
+            with pytest.raises(asyncio.QueueFull):
+                client._notify_low_credit(notice)
+            assert len(client._background) == 1
+        finally:
+            release.set()
+            client._low_credit_task.cancel()
+            await asyncio.gather(client._low_credit_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_control_loss_discards_queued_low_credit_callbacks() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        entered, release = threading.Event(), threading.Event()
+        received = []
+
+        def callback(notice):
+            received.append(notice.remaining_tokens)
+            entered.set()
+            assert release.wait(2)
+
+        client._on_low_credit = callback
+        notice = pb.LowCredit(
+            session_id=client._ledger.session_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            remaining_tokens=1,
+        )
+        client._notify_low_credit(notice)
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            notice.remaining_tokens = 2
+            client._notify_low_credit(notice)
+            client._control_lost(ClientError("fixture disconnect"))
+            release.set()
+            await asyncio.gather(client._low_credit_task, return_exceptions=True)
+            assert received == [1] and not client._ledger.ready
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reconciled", (False, True))
+@pytest.mark.parametrize(
+    "state", (OperationState.CONFIRMED, OperationState.PENDING, OperationState.UNKNOWN)
+)
+def test_top_up_renews_retained_meter_target_only_after_confirmation(state, reconciled) -> None:
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        ledger.accept_voucher(
+            pb.Voucher(
+                session_id=ledger.session_id,
+                cumulative=1,
+                signature=SIGNER.sign_voucher(DOMAIN, ledger.session_id, 1),
+            ),
+            1,
+        )
+        ledger.coverage_numerator = 2_000_000
+        block = Block(
+            ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32),
+            100,
+            b"c" * 32,
+        )
+        snapshot = client.chain.current
+        snapshot.block = block
+        snapshot.sessions[ledger.session_id] = ChainSession(
+            1, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash
+        )
+
+        async def refresh():
+            snapshot.sessions[ledger.session_id] = ChainSession(
+                2, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash
+            )
+
+        client.chain.refresh = AsyncMock(side_effect=refresh)
+        client._local_start = AsyncMock()
+        client._open_lock = asyncio.Lock()
+        client._operations, client._saved = {}, {}
+        client._control = object()
+        client.contract = ContractCalls(DOMAIN, "USDC", "2")
+        client.wallet = SimpleNamespace(sign_funding_authorization=lambda _: b"token-signature")
+        result = OperationResult(
+            "top-up-test",
+            state,
+            "wallet",
+            b"t" * 32,
+            block.observation if state is OperationState.CONFIRMED else None,
+        )
+        client._submit = AsyncMock(return_value=result)
+        await client._renew()
+        assert ledger.voucher.cumulative == 1
+        if reconciled:
+            auth = client._funding_authorization(1)
+            operation = client.contract.top_up(ledger.descriptor, 1, auth, b"token-signature")
+            client._operations[result.operation_ref] = (
+                operation,
+                OperationResult(result.operation_ref, OperationState.PENDING, "wallet", b"t" * 32),
+            )
+            client.chain.reader = SimpleNamespace(reconcile=Mock(return_value=result))
+            assert await client._reconcile_ref(result.operation_ref) == result
+            client._submit.assert_not_awaited()
+        else:
+            assert await client._top_up(ledger.session_id, 1) == result
+        if state is OperationState.CONFIRMED:
+            assert client._renew_task is not None
+            await client._renew_task
+            notice = pb.ControlMessage.FromString(await client._outbound.get())
+            voucher = pb.ControlMessage.FromString(await client._outbound.get()).voucher
+            assert notice.top_up_notice.tx == result.tx_hash
+            assert voucher.cumulative == 2
+            verify_voucher(DOMAIN, DESCRIPTOR, 2, voucher.signature)
+        else:
+            assert ledger.voucher.cumulative == 1 and client._renew_task is None
+            client.chain.refresh.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cause", ["cancel", "generation", "stale", "close"])
+def test_late_signer_response_cannot_authorize_ineligible_run(cause: str) -> None:
+    async def scenario() -> None:
+        client = component_client()
+        entered, release = threading.Event(), threading.Event()
+
+        class DelayedSigner:
+            address = SIGNER.address
+
+            def sign_voucher(self, domain, session_id, amount):
+                entered.set()
+                assert release.wait(2)
+                return SIGNER.sign_voucher(domain, session_id, amount)
+
+        client.signer = DelayedSigner()
+        task = asyncio.create_task(client._voucher(4, generation=1, run_id=b"r" * 32))
+        assert await asyncio.to_thread(entered.wait, 1)
+        if cause == "cancel":
+            client._ledger.runs[b"r" * 32].failed_transport = True
+        elif cause == "generation":
+            client._ledger.generation = 2
+        elif cause == "stale":
+            client.chain.readiness = lambda _: Readiness(False)
+        else:
+            client._ledger.close_pending = True
+        release.set()
+        await task
+        assert client._ledger.voucher is None
+        client._persist.assert_not_awaited()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client._outbound.get(), 0.01)
+
+    asyncio.run(scenario())
+
+
+def test_background_proof_tasks_have_a_hard_capacity() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        gate = asyncio.Event()
+        for _ in range(4):
+            client._spawn(gate.wait())
+        with pytest.raises(ClientError, match="bounded"):
+            client._spawn(gate.wait())
+        assert len(client._background) == 4
+        gate.set()
+        await asyncio.gather(*client._background)
+
+    asyncio.run(scenario())
+
+
+def test_client_owns_loop_and_cleanup_releases_checkpoint(tmp_path: Path) -> None:
+    stopped = threading.Event()
+
+    async def stop() -> None:
+        stopped.set()
+
+    chain = SimpleNamespace(
+        reader=SimpleNamespace(profile=SimpleNamespace(domain=DOMAIN)), stop=stop
+    )
+    client = Client(
+        7,
+        wallet=SimpleNamespace(address=DESCRIPTOR.agent),
+        signer=SIGNER,
+        chain=chain,
+        contract=ContractCalls(DOMAIN, "USDC", "2"),
+        checkpoint_path=tmp_path / "agent.json",
+        signer_reference="fixture:public-test-key",
+    )
+    assert client._thread.is_alive()
+    result = client.close()
+    assert result.unresolved_runs == () and result.pending_operations == ()
+    assert stopped.is_set() and not client._thread.is_alive()
+    assert client.close() == result
+    checkpoint = Checkpoint(tmp_path / "agent.json")
+    checkpoint.close()
+    with pytest.raises(ClientError):
+        client.sessions.list()
+
+
+def test_cleanup_still_stops_loop_and_unlocks_after_persistence_failure(tmp_path: Path) -> None:
+    stopped = threading.Event()
+
+    async def stop() -> None:
+        stopped.set()
+
+    chain = SimpleNamespace(
+        reader=SimpleNamespace(profile=SimpleNamespace(domain=DOMAIN)), stop=stop
+    )
+    client = Client(
+        7,
+        wallet=SimpleNamespace(address=DESCRIPTOR.agent),
+        signer=SIGNER,
+        chain=chain,
+        contract=ContractCalls(DOMAIN, "USDC", "2"),
+        checkpoint_path=tmp_path / "agent.json",
+        signer_reference="fixture:public-test-key",
+    )
+    client._persist = AsyncMock(side_effect=OSError("disk"))
+    client._restored = True
+    with pytest.raises(OSError):
+        client.close()
+    assert stopped.is_set() and not client._thread.is_alive()
+    checkpoint = Checkpoint(tmp_path / "agent.json")
+    checkpoint.close()
+
+
+@pytest.mark.parametrize("attempt_restore", [False, True])
+def test_unused_or_rejected_restoration_preserves_existing_checkpoint_bytes(
+    tmp_path: Path, attempt_restore: bool
+) -> None:
+    path = tmp_path / "agent.json"
+    checkpoint = Checkpoint(path)
+    checkpoint.save(
+        {
+            "version": 1,
+            "scope": {"provider": 8},
+            "operations": [{"ref": "unresolved-funding-must-survive"}],
+        }
+    )
+    checkpoint.close()
+    original = path.read_bytes()
+    chain = SimpleNamespace(
+        reader=SimpleNamespace(profile=SimpleNamespace(domain=DOMAIN)), stop=AsyncMock()
+    )
+    client = Client(
+        7,
+        wallet=SimpleNamespace(address=DESCRIPTOR.agent),
+        signer=SIGNER,
+        chain=chain,
+        contract=ContractCalls(DOMAIN, "USDC", "2"),
+        checkpoint_path=path,
+        signer_reference="fixture:public-test-key",
+    )
+    try:
+        if attempt_restore:
+            with pytest.raises(ClientError, match="scope"):
+                client.sessions.list()
+    finally:
+        client.close()
+    assert path.read_bytes() == original
+    assert not client._thread.is_alive()
+
+
+@pytest.mark.parametrize("capture", [1, 2, 3])
+def test_canonical_close_excess_is_reported_without_erasing_confirmation(capture: int) -> None:
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        ledger.accept_voucher(
+            pb.Voucher(
+                session_id=ledger.session_id,
+                cumulative=100,
+                signature=SIGNER.sign_voucher(DOMAIN, ledger.session_id, 100),
+            ),
+            100,
+        )
+        ledger.apply_meter(
+            pb.Meter(
+                session_id=ledger.session_id,
+                run_id=b"r" * 32,
+                seq=1,
+                input_tokens=4,
+                cache_tokens=0,
+                output_tokens=0,
+            ),
+            100,
+        )
+        ledger.close_pending = True
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+        block = Block(observation, 100, b"c" * 32)
+        tx = b"t" * 32
+        proof = ClosingEvidence(block, capture, 100 - capture, tx)
+        client.chain.reader = SimpleNamespace(closing=lambda *_: proof)
+        client.chain.refresh = AsyncMock()
+        client._close_waiter = asyncio.get_running_loop().create_future()
+        client._saved = {"version": 1}
+        client._closed_error = client._closed_result = None
+        message = pb.CloseResult(
+            session_id=ledger.session_id, tx_hash=tx, capture_amount=capture, refunded=100 - capture
+        )
+        if capture > 2:
+            with pytest.raises(CloseAccountingError) as failure:
+                await client._close_result(message)
+            assert failure.value.operation.state is OperationState.CONFIRMED
+            assert failure.value.operation.tx_hash == tx
+            assert failure.value.capture_amount == 3 and failure.value.usage_amount == 2
+        else:
+            await client._close_result(message)
+            assert client._close_waiter.result().state is OperationState.CONFIRMED
+        assert client._closed_result.state is OperationState.CONFIRMED
+        assert client._saved["confirmed_close"]["capture"] == capture
+        client._persist.assert_awaited_once()
+        client.chain.refresh.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_restarted_public_inspection_reconcile_and_exit_restore_without_open(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent.json"
+    observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+    block = Block(observation, 200, b"c" * 32)
+    contract = ContractCalls(DOMAIN, "USDC", "2")
+
+    async def prepare() -> bytes:
+        client = component_client()
+        client.contract = contract
+        client.wallet = SimpleNamespace(address=DESCRIPTOR.agent)
+        client.signer_reference = "fixture:public-test-key"
+        client._saved = {"version": 1, "scope": client._scope(7)}
+        client._opening_ref = None
+        operation = contract.request_close(DESCRIPTOR)
+        result = OperationResult(
+            "retained-operation",
+            OperationState.CONFIRMED,
+            tx_hash=b"t" * 32,
+            observation=observation,
+        )
+        client._operations = {result.operation_ref: (operation, result)}
+        checkpoint = Checkpoint(path)
+        checkpoint.save(client._record())
+        checkpoint.close()
+        return client._ledger.session_id
+
+    identifier = asyncio.run(prepare())
+    identity = ProviderIdentity(
+        observation,
+        b"g" * 20,
+        7,
+        DESCRIPTOR.operator,
+        DESCRIPTOR.recipient,
+        "https://provider.test/discover",
+        CATALOG,
+    )
+    state = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+    snapshot = SimpleNamespace(
+        block=block,
+        sessions={identifier: state},
+        identities={7: identity},
+        pause_level=PauseLevel.NONE,
+    )
+    retained = OperationResult(
+        "retained-operation", OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=observation
+    )
+    reader = SimpleNamespace(
+        profile=SimpleNamespace(domain=DOMAIN, registry_address=b"g" * 20),
+        reconcile=Mock(return_value=retained),
+        opening=Mock(side_effect=AssertionError("inspection must not open")),
+    )
+    chain = SimpleNamespace(
+        reader=reader,
+        current=snapshot,
+        snapshot=lambda: snapshot,
+        readiness=lambda _: Readiness(True),
+        start=AsyncMock(),
+        watch_session=AsyncMock(return_value=state),
+        watch_provider=AsyncMock(return_value=identity),
+        stop=AsyncMock(),
+    )
+    wallet = SimpleNamespace(
+        address=DESCRIPTOR.agent,
+        execute=Mock(
+            side_effect=lambda call, *, operation_ref: OperationResult(
+                operation_ref, OperationState.UNKNOWN
+            )
+        ),
+    )
+    with patch("mppi_agent.client.discover", side_effect=AssertionError("provider is offline")):
+        client = Client(
+            7,
+            wallet=wallet,
+            signer=SIGNER,
+            chain=chain,
+            contract=contract,
+            checkpoint_path=path,
+            signer_reference="fixture:public-test-key",
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                get = pool.submit(client.sessions.get, identifier)
+                listing = pool.submit(client.sessions.list)
+                assert get.result().session_id == identifier
+                assert listing.result().sessions[0].session_id == identifier
+            assert client.sessions.reconcile("retained-operation") == retained
+            assert client.sessions.requestClose(identifier).state is OperationState.UNKNOWN
+            assert wallet.execute.call_args.args[0] == contract.request_close(DESCRIPTOR).call
+            chain.start.assert_awaited_once()
+            chain.watch_provider.assert_not_awaited()
+            chain.watch_session.assert_awaited_once_with(identifier)
+            reader.opening.assert_not_called()
+            assert client._channel is None
+        finally:
+            client.close()
+
+
+@pytest.mark.parametrize("provider_available", [True, False])
+def test_restored_cooperative_close_attaches_before_new_close_intent(
+    provider_available: bool,
+) -> None:
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        ledger.ready = False
+        client._loop = asyncio.get_running_loop()
+        client._open_lock = asyncio.Lock()
+        client._attached_generation = 0
+        client._closed_error = client._closed_result = None
+        client._opening_ref = "original-opening"
+        client._local_start = AsyncMock()
+        client._start = AsyncMock(
+            side_effect=None if provider_available else OSError("provider offline")
+        )
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+        block = Block(observation, 100, b"c" * 32)
+        original = OperationResult(
+            "original-opening", OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=observation
+        )
+        client._operations = {"original-opening": (None, original)}
+        client._reconcile_ref = AsyncMock(return_value=original)
+        client.chain.reader = SimpleNamespace(
+            opening=Mock(return_value=OpeningEvidence(DESCRIPTOR, block, 100, CATALOG, b"t" * 32))
+        )
+        events = []
+
+        async def connect() -> None:
+            events.append("connect")
+            assert not ledger.close_pending
+            client._control = SimpleNamespace(done=lambda: False)
+
+        async def attach(tx, *, require_ready) -> None:
+            events.append("attach")
+            assert not ledger.close_pending and not require_ready and tx == original.tx_hash
+            ledger.generation, ledger.ready = 2, True
+            client._attached_generation = 2
+
+        async def send(message) -> None:
+            events.append("send")
+            assert ledger.close_pending and client._attached_generation == ledger.generation
+            verify_close_auth(DOMAIN, DESCRIPTOR, message.close_request.signature)
+            client._close_waiter.set_result(
+                OperationResult(
+                    "closed", OperationState.CONFIRMED, tx_hash=b"z" * 32, observation=observation
+                )
+            )
+
+        client._connect, client._attach, client._send = (
+            AsyncMock(side_effect=connect),
+            AsyncMock(side_effect=attach),
+            AsyncMock(side_effect=send),
+        )
+        if provider_available:
+            result = await client._cooperative_close(ledger.session_id)
+            assert result.state is OperationState.CONFIRMED
+            assert events == ["connect", "attach", "send"]
+            client._reconcile_ref.assert_awaited_once_with("original-opening")
+            client.chain.reader.opening.assert_called_once_with(
+                original.tx_hash, ledger.session_id, accepted_catalog=CATALOG
+            )
+            client._persist.assert_awaited_once()
+        else:
+            with pytest.raises(OSError, match="offline"):
+                await client._cooperative_close(ledger.session_id)
+            assert not ledger.close_pending and client._close_waiter is None
+            client._persist.assert_not_awaited()
+            client._send.assert_not_awaited()
+            client._reconcile_ref.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_failed_close_send_preserves_intent_for_explicit_reconnect_retry() -> None:
+    async def scenario() -> None:
+        client = component_client()
+        client._loop = asyncio.get_running_loop()
+        client._open_lock = asyncio.Lock()
+        client._closed_error = client._closed_result = None
+        client._local_start = AsyncMock()
+        client._ensure_close_attachment = AsyncMock()
+        client._send = AsyncMock(side_effect=OSError("lost before send"))
+        with pytest.raises(OSError):
+            await client._cooperative_close(client._ledger.session_id)
+        assert client._ledger.close_pending and not client._ledger.ready
+        assert client._close_waiter is None and client._attached_generation == 0
+        client._persist.assert_awaited_once()
+        assert isinstance(client._control_failure, OSError)
+
+    asyncio.run(scenario())

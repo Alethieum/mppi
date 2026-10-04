@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mppi-protocol"
+version = "0.1.0"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+description = "Shared MPPI wire bindings and exact payment primitives"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "eth-abi==6.0.0",
+  "eth-account==0.14.0",
+  "pycryptodome==3.23.0",
+  "grpcio==1.84.0",
+  "protobuf==7.36.2",
+  "googleapis-common-protos==1.75.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mppi_protocol", "src/mppi"]

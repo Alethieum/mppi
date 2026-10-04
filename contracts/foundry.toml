@@ -1,0 +1,27 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+cache_path = "cache"
+libs = ["lib"]
+remappings = ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/", "forge-std/=lib/forge-std/src/"]
+solc_version = "0.8.37"
+auto_detect_solc = false
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 200
+build_info = true
+extra_output = ["storageLayout"]
+ast = true
+fs_permissions = [{ access = "read", path = "../testvectors" }]
+
+[profile.default.fuzz]
+runs = 1024
+
+[profile.default.invariant]
+runs = 256
+depth = 128
+fail_on_revert = true
+
+[fmt]
+line_length = 120

@@ -1,0 +1,54 @@
+[project]
+name = "mppi-development"
+version = "0.1.0"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["proto/python", "sdks/agent/python", "sdks/provider/python"]
+
+[tool.uv.sources]
+mppi-protocol = { workspace = true }
+mppi-agent = { workspace = true }
+mppi-provider = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "eth-abi==6.0.0",
+  "eth-account==0.14.0",
+  "grpcio-tools==1.84.0",
+  "hatchling==1.32.4",
+  "jsonschema==4.26.0",
+  "mypy==2.3.1",
+  "pip-audit==2.10.1",
+  "pytest==9.1.1",
+  "ruff==0.16.9",
+  "types-grpcio==1.83.0.20260730",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["proto/python/tests", "sdks/agent/python/tests", "sdks/provider/python/tests", "tests"]
+addopts = "--import-mode=importlib -ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["proto/python/src/mppi"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["proto/python/src/mppi_protocol", "sdks/agent/python/src", "sdks/provider/python/src"]
+
+[[tool.mypy.overrides]]
+module = ["mppi.*"]
+follow_imports = "skip"

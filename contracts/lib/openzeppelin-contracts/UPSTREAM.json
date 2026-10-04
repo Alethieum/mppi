@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/OpenZeppelin/openzeppelin-contracts",
+  "version": "v5.7.0",
+  "commit": "cab19933c33c2ad1d4c7a84864a3601dddfd16f3",
+  "retrievedAt": "2026-09-25",
+  "selection": {
+    "mode": "recursive-solidity-import-closure",
+    "entrypoints": [
+      "contracts/proxy/utils/Initializable.sol",
+      "contracts/proxy/utils/UUPSUpgradeable.sol",
+      "contracts/utils/ReentrancyGuard.sol",
+      "contracts/token/ERC20/utils/SafeERC20.sol",
+      "contracts/utils/math/SafeCast.sol",
+      "contracts/utils/cryptography/ECDSA.sol",
+      "contracts/proxy/ERC1967/ERC1967Proxy.sol",
+      "contracts/governance/TimelockController.sol"
+    ],
+    "upstreamModified": false
+  },
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "20aebc68b11c063133aa2af0ef4bb29875477c6d16d715718f0daec563938b84",
+      "bytes": 1090,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/LICENSE"
+    },
+    {
+      "path": "contracts/access/AccessControl.sol",
+      "sha256": "a6893a46a6270c2016db590e3e597c32b004052dad63ccc929ad23ee2ec85473",
+      "bytes": 7035,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/access/AccessControl.sol"
+    },
+    {
+      "path": "contracts/access/IAccessControl.sol",
+      "sha256": "140304b7e99d517c57a13f391dfd3b550ca633a507f7b2af130f391b6cd89cc5",
+      "bytes": 3343,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/access/IAccessControl.sol"
+    },
+    {
+      "path": "contracts/governance/TimelockController.sol",
+      "sha256": "50265193f9ded275033a7b87cd4f6d883f77154b000bf1c5ca7b805052b855c4",
+      "bytes": 16260,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/governance/TimelockController.sol"
+    },
+    {
+      "path": "contracts/interfaces/IERC1363.sol",
+      "sha256": "9c3a75a925a6dac9e88b03cddc58d42fe3131b0aaaad84408521f3f7af2f991b",
+      "bytes": 4454,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/IERC1363.sol"
+    },
+    {
+      "path": "contracts/interfaces/IERC165.sol",
+      "sha256": "dfb3f56fa928a7c6cae41a7ce2c86b9210fa18d33fa26389099d66a0fa790368",
+      "bytes": 193,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/IERC165.sol"
+    },
+    {
+      "path": "contracts/interfaces/IERC1967.sol",
+      "sha256": "c4e901318ab6d4963582c62c62ce988a34c68dbae71846b67decacde79e9a317",
+      "bytes": 637,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/IERC1967.sol"
+    },
+    {
+      "path": "contracts/interfaces/IERC20.sol",
+      "sha256": "0158e2d3e0e28bedd99eec13dcf1a8aa3a70a5b7e4bb2ad709609c95fcc740d1",
+      "bytes": 182,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/IERC20.sol"
+    },
+    {
+      "path": "contracts/interfaces/IERC20Metadata.sol",
+      "sha256": "0ef8d844d8e066abd5c0d8cc1c550c89f2628a4ea9c9bb16c7593d4207800ca8",
+      "bytes": 216,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/IERC20Metadata.sol"
+    },
+    {
+      "path": "contracts/interfaces/draft-IERC1822.sol",
+      "sha256": "73653312bc2eda0ec231553a5295242eaef2d4f46a023532d45fe76cbd0f565f",
+      "bytes": 882,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/interfaces/draft-IERC1822.sol"
+    },
+    {
+      "path": "contracts/proxy/ERC1967/ERC1967Proxy.sol",
+      "sha256": "41a3040398d53999dea3251ff8906e11ec1a699362a1d8f4a55bfc7709cc00f3",
+      "bytes": 2636,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/ERC1967/ERC1967Proxy.sol"
+    },
+    {
+      "path": "contracts/proxy/ERC1967/ERC1967Utils.sol",
+      "sha256": "a89ba2032ab25959c6fde1e508ebf8f966ff632703d3ef79684f578a8fa8033f",
+      "bytes": 6260,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/ERC1967/ERC1967Utils.sol"
+    },
+    {
+      "path": "contracts/proxy/Proxy.sol",
+      "sha256": "fa8aae37b2939371fcbce48b814c0d5c7e57e3e267f348459f29941937746c98",
+      "bytes": 2697,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/Proxy.sol"
+    },
+    {
+      "path": "contracts/proxy/beacon/IBeacon.sol",
+      "sha256": "c1c9726bbb0ec4c540c7c98059dcded69a8586b46c168036672381033ee76239",
+      "bytes": 473,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/beacon/IBeacon.sol"
+    },
+    {
+      "path": "contracts/proxy/utils/Initializable.sol",
+      "sha256": "f527a063813c2bf60c153fb08e38539578935402894fcc36fac42324ca325d3b",
+      "bytes": 9279,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/utils/Initializable.sol"
+    },
+    {
+      "path": "contracts/proxy/utils/UUPSUpgradeable.sol",
+      "sha256": "b5af3bfd79a32c6da2d09b0be38d9b63dcd0d159a1a4a0198431fd00acc1fd52",
+      "bytes": 6323,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/proxy/utils/UUPSUpgradeable.sol"
+    },
+    {
+      "path": "contracts/token/ERC1155/IERC1155Receiver.sol",
+      "sha256": "3df310870e0187a59020ea48e910ed2693778b1f758b57b97a47365d74b92af5",
+      "bytes": 2599,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC1155/IERC1155Receiver.sol"
+    },
+    {
+      "path": "contracts/token/ERC1155/utils/ERC1155Holder.sol",
+      "sha256": "ee184c9620ae770a9ccf9d21d1e6fd1177eed668f4e92707b51e9ef36d7c9469",
+      "bytes": 1343,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC1155/utils/ERC1155Holder.sol"
+    },
+    {
+      "path": "contracts/token/ERC20/IERC20.sol",
+      "sha256": "01b6f5c4fa45fd38822b286ecef6daf983d27306dd6362496fa71b3e4600b72c",
+      "bytes": 2781,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC20/IERC20.sol"
+    },
+    {
+      "path": "contracts/token/ERC20/extensions/IERC20Metadata.sol",
+      "sha256": "0b7132f17d14d1d84b41b0bb429be62dafdff00fd3470f68724d8018eb07f57a",
+      "bytes": 684,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC20/extensions/IERC20Metadata.sol"
+    },
+    {
+      "path": "contracts/token/ERC20/utils/SafeERC20.sol",
+      "sha256": "93685e4e976be584a5e6abfc37376fe17c99bee53e07610efcc1ce51868e90d1",
+      "bytes": 13961,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC20/utils/SafeERC20.sol"
+    },
+    {
+      "path": "contracts/token/ERC721/IERC721Receiver.sol",
+      "sha256": "eafee3ffdc7cb2fba4bf6bd16fb28f8e5b4679742e81c2ad42a1b1df5c179feb",
+      "bytes": 997,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC721/IERC721Receiver.sol"
+    },
+    {
+      "path": "contracts/token/ERC721/utils/ERC721Holder.sol",
+      "sha256": "2d50f70b857cae57572c0139e3d9d84cbe3edcc18492581af36befa15c36cb3f",
+      "bytes": 819,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/token/ERC721/utils/ERC721Holder.sol"
+    },
+    {
+      "path": "contracts/utils/Address.sol",
+      "sha256": "73e54e15285455f0e01e136c3663732641537614723ae5dbd820eb3cb036b1fd",
+      "bytes": 6803,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/Address.sol"
+    },
+    {
+      "path": "contracts/utils/Context.sol",
+      "sha256": "847fda5460fee70f56f4200f59b82ae622bb03c79c77e67af010e31b7e2cc5b6",
+      "bytes": 963,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/Context.sol"
+    },
+    {
+      "path": "contracts/utils/Errors.sol",
+      "sha256": "0704b9d6c032cca8512a3bc3f30f49f86f1f03102d2896a3d23e794b82efea66",
+      "bytes": 896,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/Errors.sol"
+    },
+    {
+      "path": "contracts/utils/LowLevelCall.sol",
+      "sha256": "e128cbe9c6c406d5a42c26e4079c0a95b369ce552f2d0c3dfd2fcb836c5708f2",
+      "bytes": 5547,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/LowLevelCall.sol"
+    },
+    {
+      "path": "contracts/utils/ReentrancyGuard.sol",
+      "sha256": "94e409e8f6e3184236651a6cc2b1a6a3ea0f0a25eb85b71e524ad5791bb2fbc8",
+      "bytes": 4766,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/ReentrancyGuard.sol"
+    },
+    {
+      "path": "contracts/utils/StorageSlot.sol",
+      "sha256": "75704538dcb223239280c6726d9a31cf769a7816718517c997fc7d63bdb70778",
+      "bytes": 4182,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/StorageSlot.sol"
+    },
+    {
+      "path": "contracts/utils/cryptography/ECDSA.sol",
+      "sha256": "e3758f08ce5e53ada22c743450d3b61d965c92d4c76fcc8633a7eebd0455eb7c",
+      "bytes": 12126,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/cryptography/ECDSA.sol"
+    },
+    {
+      "path": "contracts/utils/introspection/ERC165.sol",
+      "sha256": "61a2b12c96857aaa35f48aeda67a4281637a42494c0b3795be0ae976aa7b3793",
+      "bytes": 879,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/introspection/ERC165.sol"
+    },
+    {
+      "path": "contracts/utils/introspection/IERC165.sol",
+      "sha256": "9055c2994b37dea1a41b7b7926dcb510f05dbe2540b0aafc5fbee9558fffd0ca",
+      "bytes": 871,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/introspection/IERC165.sol"
+    },
+    {
+      "path": "contracts/utils/math/SafeCast.sol",
+      "sha256": "5779bc848bde39f1ad7bc02b4f708a0040888e0083b1a33f119cd94639350134",
+      "bytes": 34940,
+      "source": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/cab19933c33c2ad1d4c7a84864a3601dddfd16f3/contracts/utils/math/SafeCast.sol"
+    }
+  ]
+}

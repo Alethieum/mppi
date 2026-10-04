@@ -1,0 +1,17 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Preserve the selected mppi.v1 service paths and shared Control envelope.
+    - SERVICE_SUFFIX
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    # PauseLevel.NONE = 0 matches the contract; presence distinguishes omission.
+    - ENUM_ZERO_VALUE_SUFFIX
+breaking:
+  use:
+    - FILE

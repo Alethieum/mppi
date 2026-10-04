@@ -1,0 +1,40 @@
+# Illustrative declarations, addresses and provider-chosen timings.
+# This file loads without making network calls or publishing prices.
+[provider]
+name = "Example Inference"
+description = "Provider-operated inference"
+public_origin = "https://mppi.provider.example"
+recipient = "0x2222222222222222222222222222222222222222"
+
+[identity]
+provider_id = "42"
+wallet_address = "0x1111111111111111111111111111111111111111"
+
+[chain]
+network = "testnet"
+max_age_ms = 1000
+
+[upstream]
+url = "http://127.0.0.1:8080/v1"
+# api_key_env = "PROVIDER_INTERNAL_API_KEY"
+
+[[models]]
+model = "example-org/example-model"
+description = "Provider-declared text model"
+context_window = 128000
+max_output = 8192
+modalities = ["text"]
+embeddings = false
+streaming = true
+tools = true
+structured_output = true
+rates = { input = "300000", output = "1200000", cache = "30000" }
+
+[payment]
+output_buffer_tokens = 1000
+suggest_session_tokens = 1000000
+collection_margin_ms = 60000
+authorization_wait_ms = 10000
+
+[settlement]
+interval_ms = 30000

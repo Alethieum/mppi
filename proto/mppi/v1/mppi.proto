@@ -1,0 +1,351 @@
+syntax = "proto3";
+
+package mppi.v1;
+
+// Binary protobuf is the v1 transport. Semantic requirements, including scalar
+// presence, widths, directions and accounting rules, are in docs/protocol.md.
+// A successfully parsed message is not proof of payment authority.
+
+service Chat {
+  // One request, provider JSON payloads, then one definitive final record when
+  // available. Cancellation and transport failure may prevent final delivery.
+  rpc Completions(CompleteRequest) returns (stream ChatChunk);
+}
+
+service Control {
+  // The actual authenticated stream owns one session attachment. No prompts or
+  // inference output travel on this stream. Vouchers have no per-message ACK.
+  rpc Session(stream ControlMessage) returns (stream ControlMessage);
+}
+
+message CompleteRequest {
+  optional string model = 1;
+  optional bool stream = 2;
+  optional bytes session_id = 3;
+  optional bytes run_id = 4;
+  optional uint64 control_generation = 5;
+  optional bytes rate_card_hash = 6;
+  optional bytes auth_signature = 7;
+  // Original UTF-8 JSON object bytes; never coerce its numbers through double.
+  optional bytes payload = 8;
+}
+
+message ChatChunk {
+  oneof kind {
+    bytes payload = 1;
+    Terminal terminal = 2;
+    UpstreamError upstream_error = 3;
+  }
+}
+
+message Terminal {
+  optional uint64 input_tokens = 1;
+  optional uint64 cache_tokens = 2;
+  optional uint64 output_tokens = 3;
+  // Informational floor of this run's exact numerator; not additive billing.
+  optional uint64 amount = 4;
+  optional bytes session_id = 5;
+  optional bytes run_id = 6;
+  optional string model = 7;
+  optional bytes rate_card_hash = 8;
+  optional RunStatus status = 9;
+  optional uint64 final_meter_seq = 10;
+  // Optional actual session-wide Settled event, never a per-run payment claim.
+  ConfirmedSettlementRef settlement_reference = 11;
+}
+
+message ControlMessage {
+  oneof kind {
+    ChallengeRequest challenge_request = 1;
+    Challenge challenge = 2;
+    SessionOpen session_open = 3;
+    ReconnectChallenge reconnect_challenge = 4;
+    ReconnectRequest reconnect_request = 5;
+    SessionState session_state = 6;
+    Voucher voucher = 7;
+    Meter meter = 8;
+    TopUpNotice top_up_notice = 9;
+    LowCredit low_credit = 10;
+    Drain drain = 11;
+    Receipt receipt = 12;
+    CloseRequest close_request = 13;
+    CloseResult close_result = 14;
+  }
+}
+
+// Agent -> provider, unpaid; request_id is unique within this Control stream.
+message ChallengeRequest {
+  optional bytes request_id = 1;
+  optional string model = 2;
+}
+
+// Provider -> agent; request_id/model echo the same-stream request.
+message Challenge {
+  optional bytes request_id = 1;
+  optional string model = 2;
+  optional bytes rate_card_hash = 3;
+  // ERC-8004 uint256: exactly 32 unsigned big-endian bytes.
+  optional bytes provider_id = 4;
+  optional bytes contract = 5;
+  optional uint64 chain_id = 6;
+  optional bytes operator = 7;
+  // Actual output tokens; distinct from the scalar funding-token suggestion.
+  optional uint64 cover_output_tokens = 8;
+  optional uint64 suggest_session_tokens = 9;
+}
+
+// Agent -> provider. A transaction notice does not authenticate attachment.
+message SessionOpen {
+  optional bytes session_id = 1;
+  optional bytes open_tx = 2;
+  // Truly optional; when present an ERC-8004 uint256 encoded in 32 bytes.
+  optional bytes agent_id = 3;
+}
+
+// Provider -> agent. Fresh, single-use and bound to the issuing stream.
+message ReconnectChallenge {
+  optional bytes nonce = 1;
+}
+
+// Agent -> provider. Same authenticated handshake for first attach/reconnect.
+message ReconnectRequest {
+  optional bytes session_id = 1;
+  optional bytes nonce = 2;
+  optional bytes signature = 3;
+  Voucher latest_voucher = 4;
+  optional uint64 last_meter_seq = 5;
+  repeated bytes pending_run_ids = 6;
+}
+
+// Provider -> agent. This complete snapshot replaces accounting through its
+// cursor; its run totals must never be added again to usage_by_price.
+message SessionState {
+  optional bytes session_id = 1;
+  optional bytes nonce = 2;
+  optional uint64 control_generation = 3;
+  optional bool ready = 4;
+  optional bool close_pending = 5;
+  SessionDescriptor descriptor = 6;
+  Voucher accepted_voucher = 7;
+  optional uint64 meter_seq = 8;
+  repeated PricedUsage usage_by_price = 9;
+  repeated RunState run_states = 10;
+  repeated CatalogVersion catalogs = 11;
+  optional bytes initial_rate_card_hash = 12;
+  // Absent if no valid current offering is known. Historical prices remain.
+  optional bytes current_rate_card_hash = 13;
+  optional uint64 deposit = 14;
+  optional uint64 settled_cumulative = 15;
+  optional SessionStatus status = 16;
+  optional uint64 chain_block_number = 17;
+  optional bytes chain_block_hash = 18;
+}
+
+// Exact contract descriptor order. Protobuf serialization is not Solidity ABI.
+message SessionDescriptor {
+  optional bytes agent = 1;
+  optional bytes session_signer = 2;
+  optional bytes provider_id = 3;
+  optional bytes recipient = 4;
+  optional bytes operator = 5;
+  optional bytes token = 6;
+  optional bytes salt = 7;
+}
+
+// Agent -> provider. Cumulative authorization, never usage or delivery ACK.
+message Voucher {
+  optional bytes session_id = 1;
+  optional uint64 cumulative = 2;
+  optional bytes signature = 3;
+}
+
+// Provider -> agent. Cumulative counts for one run; seq is session-wide.
+message Meter {
+  optional bytes session_id = 1;
+  optional bytes run_id = 2;
+  optional uint64 seq = 3;
+  optional uint64 input_tokens = 4;
+  optional uint64 cache_tokens = 5;
+  optional uint64 output_tokens = 6;
+}
+
+// Agent -> provider. The optional provenance triple is all present or absent.
+// The notice supplies no proof that the deposit increased.
+message TopUpNotice {
+  optional bytes session_id = 1;
+  optional bytes tx = 2;
+  optional string model = 3;
+  optional bytes rate_card_hash = 4;
+  optional uint64 tokens = 5;
+}
+
+// Provider -> agent. Funding suggestions never authorize a funding transaction.
+message LowCredit {
+  optional bytes session_id = 1;
+  optional string model = 2;
+  optional bytes rate_card_hash = 3;
+  // Both present for a positive greatest model rate; both absent for zero.
+  optional uint64 remaining_tokens = 4;
+  optional uint64 suggest_top_up_tokens = 5;
+  CoverageRequest coverage_request = 6;
+}
+
+message CoverageRequest {
+  optional bytes run_id = 1;
+  optional uint64 control_generation = 2;
+  // Complete target: actual usage + all admitted remaining bounds + candidate.
+  repeated RequiredTokens required_by_price = 3;
+}
+
+message RequiredTokens {
+  optional string model = 1;
+  optional bytes rate_card_hash = 2;
+  optional uint64 input_tokens = 3;
+  optional uint64 cache_tokens = 4;
+  optional uint64 output_tokens = 5;
+}
+
+// Provider -> agent. run_id absent scopes the notice to the whole session.
+message Drain {
+  optional bytes session_id = 1;
+  optional bytes run_id = 2;
+  optional DrainReason reason = 3;
+}
+
+// Provider -> agent. Same definitive final report as Terminal, with an observed
+// session-wide chain total. Receipt delivery never charges counts again.
+message Receipt {
+  optional bytes session_id = 1;
+  optional bytes run_id = 2;
+  optional string model = 3;
+  optional bytes rate_card_hash = 4;
+  optional uint64 input_tokens = 5;
+  optional uint64 output_tokens = 6;
+  optional uint64 amount = 7;
+  optional uint64 settled_cumulative = 8;
+  optional uint64 cache_tokens = 9;
+  optional RunStatus status = 10;
+  optional uint64 final_meter_seq = 11;
+  ChainObservation chain_observation = 12;
+  ConfirmedSettlementRef settlement_reference = 13;
+}
+
+// Agent -> provider. CloseAuth uses the fixed session signer, not a voucher.
+message CloseRequest {
+  optional bytes session_id = 1;
+  optional bytes signature = 2;
+}
+
+// Provider -> agent, only after verified canonical closing evidence.
+message CloseResult {
+  optional bytes session_id = 1;
+  optional bytes tx_hash = 2;
+  optional uint64 capture_amount = 3;
+  optional uint64 refunded = 4;
+}
+
+message CatalogVersion {
+  optional bytes rate_card_hash = 1;
+  optional bytes catalog = 2;
+}
+
+// One unique model/catalog row and its original RunAuth acceptance evidence.
+message PricedUsage {
+  optional string model = 1;
+  optional bytes rate_card_hash = 2;
+  optional uint64 input_tokens = 3;
+  optional uint64 cache_tokens = 4;
+  optional uint64 output_tokens = 5;
+  optional bytes acceptance_run_id = 6;
+  optional uint64 acceptance_control_generation = 7;
+  optional bytes acceptance_signature = 8;
+}
+
+message RunState {
+  optional bytes run_id = 1;
+  // Required even for NOT_ADMITTED, where the value is the empty string.
+  optional string model = 2;
+  optional bytes rate_card_hash = 3;
+  optional uint64 control_generation = 4;
+  optional bytes auth_signature = 5;
+  optional RunStatus status = 6;
+  optional uint64 input_tokens = 7;
+  optional uint64 cache_tokens = 8;
+  optional uint64 output_tokens = 9;
+}
+
+message ChainObservation {
+  optional uint64 chain_id = 1;
+  optional bytes contract_address = 2;
+  optional uint64 block_number = 3;
+  optional bytes block_hash = 4;
+}
+
+// Actual canonical session-wide Settled event. No-op captures have no event.
+message ConfirmedSettlementRef {
+  ChainObservation observation = 1;
+  optional bytes tx_hash = 2;
+  optional bytes session_id = 3;
+  optional uint64 settled_cumulative = 4;
+  optional uint64 delta = 5;
+}
+
+message UpstreamError {
+  // Present only when an upstream HTTP error status exists (400..599).
+  optional uint32 http_status = 1;
+  // Required original UTF-8 JSON object. Not placed into gRPC metadata.
+  optional bytes body = 2;
+}
+
+// In google.rpc.Status.details, type URL:
+// type.googleapis.com/mppi.v1.PaymentError. Never a Control payload.
+message PaymentError {
+  optional PaymentErrorCode code = 1;
+  optional bytes session_id = 2;
+  optional bytes run_id = 3;
+  optional string reason = 4;
+  optional bytes requested_rate_card_hash = 5;
+  optional bytes current_rate_card_hash = 6;
+  optional PauseLevel pause_level = 7;
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_COMPLETED = 1;
+  RUN_STATUS_FAILED = 2;
+  RUN_STATUS_CANCELLED = 3;
+  RUN_STATUS_NOT_ADMITTED = 4;
+}
+
+// Explicit mapping required: contract status numbers are Open=0, Closing=1,
+// Closed=2. Do not cast between contract and wire enum representations.
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_OPEN = 1;
+  SESSION_STATUS_CLOSING = 2;
+  SESSION_STATUS_CLOSED = 3;
+}
+
+enum DrainReason {
+  DRAIN_REASON_UNSPECIFIED = 0;
+  DRAIN_REASON_DEPOSIT_EXHAUSTED = 1;
+  DRAIN_REASON_AUTHORIZATION_EXHAUSTED = 2;
+  DRAIN_REASON_PROVIDER_INITIATED = 3;
+}
+
+enum PaymentErrorCode {
+  PAYMENT_ERROR_CODE_UNSPECIFIED = 0;
+  PAYMENT_ERROR_CODE_INSUFFICIENT_DEPOSIT = 1;
+  PAYMENT_ERROR_CODE_SESSION_NOT_FOUND = 2;
+  // Reserved semantic code; verified duplicate/lower vouchers are valid no-ops.
+  PAYMENT_ERROR_CODE_VOUCHER_STALE = 3;
+  PAYMENT_ERROR_CODE_SESSION_NOT_READY = 4;
+}
+
+// Preserve the contract values. NONE is valid; field presence distinguishes
+// its explicit observation from an absent diagnostic. No sentinel is added.
+enum PauseLevel {
+  PAUSE_LEVEL_NONE = 0;
+  PAUSE_LEVEL_PAYMENTS = 1;
+  PAUSE_LEVEL_ALL = 2;
+}

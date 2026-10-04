@@ -1,0 +1,123 @@
+{
+  "caseNotes": {
+    "run_auth_utf8": "EIP-712 UTF-8 hashing only; this model does not satisfy MPPI's admissible catalog model syntax."
+  },
+  "cases": [
+    {
+      "digest": "0xfbb9b9b69652deb3942db443f898af5cd349b8fea06d79df20b808b2d58978cf",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "Voucher",
+      "message": {
+        "cumulativeAmount": "5510000",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "voucher",
+      "signature": "0xe350ee8fa647b858469923d708f8ff100ee708e332a459b9eea88c37089b1c3079933c915aad68d3cb8587a3d8c32386bc64cb1509a375b6be982974e6d5e1f81c",
+      "structHash": "0xba6944729fb9b21047f9144955aba23720742781057606b7617dd2ef2747a956",
+      "typeString": "Voucher(bytes32 sessionId,uint64 cumulativeAmount)"
+    },
+    {
+      "digest": "0x8fe85001d9f4db29f701e2c21aa8e94ee8b8a963c0ba244359be25ef8f0138e2",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "Voucher",
+      "message": {
+        "cumulativeAmount": "0",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "voucher_zero",
+      "signature": "0x3656c13bae7d3c620e16ea2e8f794d7ba2b3a6a9517effbe24b29483f21765ba17294f695bd87aa210b8abc8ecfc1dc4119190a074622aa51fe487553465a5371c",
+      "structHash": "0x4477b519b26f2a9982f899aba640305b74dd611fa4ebb88c061aa24485aefa64",
+      "typeString": "Voucher(bytes32 sessionId,uint64 cumulativeAmount)"
+    },
+    {
+      "digest": "0x400cb36d6edda5b4a7538bc6027e61598e3cd3b2e70e83f54f1effdb429f809b",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "Voucher",
+      "message": {
+        "cumulativeAmount": "18446744073709551615",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "voucher_max",
+      "signature": "0xb26690ac96af4e83aed90d96d3bcede68f9e717ea095b55175a0f2d557022124617bc6255e2ea375a882381d5cbaf20f39bf0709d429455e88f5d670d776a80d1b",
+      "structHash": "0xaeadeaa7af98d789b1a5410b98e1a1df3fc950c13376c1bae37beb4e1f58dc9a",
+      "typeString": "Voucher(bytes32 sessionId,uint64 cumulativeAmount)"
+    },
+    {
+      "digest": "0x2f4170cbd51aad286f9776e1c2785a11db106a820af5f258ee6831bdb33bf56c",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "RunAuth",
+      "message": {
+        "controlGeneration": "7",
+        "model": "example-org/example-model",
+        "rateCardHash": "0x6666666666666666666666666666666666666666666666666666666666666666",
+        "runId": "0x5555555555555555555555555555555555555555555555555555555555555555",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "run_auth",
+      "signature": "0xa544c57e0af60aca32df59b012ce4e6536e6d72a693edaec6ac083c7a7b4d5c82e3a56f6e0a1830cf4b8560c31b46a16529b9020a3b610055a094243aca76fe31c",
+      "structHash": "0xfcd518b08d58db974363060756ed7ae510287d01fae20d466b0444e6ff55eca2",
+      "typeString": "RunAuth(bytes32 sessionId,uint64 controlGeneration,bytes32 runId,string model,bytes32 rateCardHash)"
+    },
+    {
+      "digest": "0x520769a54cac681feb0eb97de8b9781851e2a744ba0e25456a52eac5178dbaba",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "RunAuth",
+      "message": {
+        "controlGeneration": "7",
+        "model": "example/模型",
+        "rateCardHash": "0x6666666666666666666666666666666666666666666666666666666666666666",
+        "runId": "0x5555555555555555555555555555555555555555555555555555555555555555",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "run_auth_utf8",
+      "signature": "0x1fcd83f3fd2f32da9fec03a56497062b9badf65f6dcaefc2fbfb9ac204b9fdee29f66932b1a94a7b196e5f0341661c77246fda130ed3643952c99c7c2bae3b351c",
+      "structHash": "0x419568e2b16d56607181e3fee180e017c73ad5ca2c6ed68d0125a70483444260",
+      "typeString": "RunAuth(bytes32 sessionId,uint64 controlGeneration,bytes32 runId,string model,bytes32 rateCardHash)"
+    },
+    {
+      "digest": "0x50b0991820ad4fbd161b1fa9007991af0bfcd39cbb5752656582a40a32a79c99",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "ReconnectAuth",
+      "message": {
+        "nonce": "0x7777777777777777777777777777777777777777777777777777777777777777",
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "reconnect_auth",
+      "signature": "0xc83e9ce0867f5424b3fe4f85bf7a9b965652abc993c9be320b82b46fcc410dc2021dae25cf083b244f1b47134fabb049cd272ecfea94502bf1c55a13711d48f91b",
+      "structHash": "0xe9aa9f483eb67d78334447fccfbe5ef1597489084a04b8643e6fafcc5ec8abcc",
+      "typeString": "ReconnectAuth(bytes32 sessionId,bytes32 nonce)"
+    },
+    {
+      "digest": "0x5367568e72592669a5747e0c0c061b00550399b65085a43ac11fbae4df812422",
+      "expectedSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "kind": "CloseAuth",
+      "message": {
+        "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70"
+      },
+      "name": "close_auth",
+      "signature": "0x10a9182cb828e90689faebde8d3dc63c951ffd425064147669ded5e8816179c05e1725640b7424a572fd4e589f99beaab9bb05e67a23e79c5a1dac2b1f7db46a1c",
+      "structHash": "0x23307e6b2232ba60988575d68deb8c1f82060131972c724bbddabf743685b9df",
+      "typeString": "CloseAuth(bytes32 sessionId)"
+    }
+  ],
+  "descriptor": {
+    "agent": "0x1111111111111111111111111111111111111111",
+    "operator": "0x3333333333333333333333333333333333333333",
+    "providerId": "9007199254740993",
+    "recipient": "0x2222222222222222222222222222222222222222",
+    "salt": "0x4444444444444444444444444444444444444444444444444444444444444444",
+    "sessionSigner": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+    "token": "0x3600000000000000000000000000000000000000"
+  },
+  "domain": {
+    "chainId": "5042002",
+    "name": "MPPI",
+    "verifyingContract": "0x9999999999999999999999999999999999999999",
+    "version": "1"
+  },
+  "domainSeparator": "0x7bd637fe88678868d05350494c7a5da6fbead795b45482fe387198d13726a236",
+  "privateKey": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "schemaVersion": 1,
+  "sessionId": "0x9e28e15e2f8001dcd84a752185fd89adb537e3082a5f22d676503355a467bb70",
+  "testKeyWarning": "Public insecure test-only private key. Never fund this key or use it for a real session."
+}

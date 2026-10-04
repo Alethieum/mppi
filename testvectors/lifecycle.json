@@ -1,0 +1,394 @@
+{
+  "schemaVersion": 1,
+  "suite": "lifecycle",
+  "cases": [
+    {
+      "name": "consume-prefill-once",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "0",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "5000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "0"
+      ],
+      "status": null,
+      "expect": {
+        "deltaNumerator": "1000000",
+        "releasedNumerator": "0",
+        "remainingNumerator": "4000000",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "duplicate-usage",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "4000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "0"
+      ],
+      "status": null,
+      "expect": {
+        "deltaNumerator": "0",
+        "releasedNumerator": "0",
+        "remainingNumerator": "4000000",
+        "duplicate": true
+      }
+    },
+    {
+      "name": "consume-output",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "4000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": null,
+      "expect": {
+        "deltaNumerator": "2000000",
+        "releasedNumerator": "0",
+        "remainingNumerator": "2000000",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "short-completion-releases-unused",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "4000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": "COMPLETED",
+      "expect": {
+        "deltaNumerator": "2000000",
+        "releasedNumerator": "2000000",
+        "remainingNumerator": "0",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "zero-usage-cancel",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "0",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "4000000",
+        "status": null
+      },
+      "counts": [
+        "0",
+        "0",
+        "0"
+      ],
+      "status": "CANCELLED",
+      "expect": {
+        "deltaNumerator": "0",
+        "releasedNumerator": "4000000",
+        "remainingNumerator": "0",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "final-duplicate",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "1"
+        ],
+        "remainingNumerator": "0",
+        "status": "COMPLETED"
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": "COMPLETED",
+      "expect": {
+        "deltaNumerator": "0",
+        "releasedNumerator": "0",
+        "remainingNumerator": "0",
+        "duplicate": true
+      }
+    },
+    {
+      "name": "final-conflict",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "1"
+        ],
+        "remainingNumerator": "0",
+        "status": "COMPLETED"
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": "FAILED",
+      "error": "INCONSISTENT_USAGE"
+    },
+    {
+      "name": "over-reservation",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "1000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": null,
+      "error": "UNCOVERED_USAGE"
+    },
+    {
+      "name": "counter-regression",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "1"
+        ],
+        "remainingNumerator": "1000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "0"
+      ],
+      "status": null,
+      "error": "INCONSISTENT_USAGE"
+    },
+    {
+      "name": "cache-cost-regression",
+      "rates": {
+        "input": "1000000",
+        "output": "1",
+        "cache": "100000"
+      },
+      "previous": {
+        "counts": [
+          "100",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "1000000",
+        "status": null
+      },
+      "counts": [
+        "100",
+        "50",
+        "0"
+      ],
+      "status": null,
+      "error": "INCONSISTENT_USAGE"
+    },
+    {
+      "name": "cache-unpriced",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "0",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "1000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "1",
+        "0"
+      ],
+      "status": null,
+      "error": "INCONSISTENT_USAGE"
+    },
+    {
+      "name": "explicit-free-cache",
+      "rates": {
+        "input": "1000000",
+        "output": "1",
+        "cache": "0"
+      },
+      "previous": {
+        "counts": [
+          "0",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "0",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "1",
+        "0"
+      ],
+      "status": "COMPLETED",
+      "expect": {
+        "deltaNumerator": "0",
+        "releasedNumerator": "0",
+        "remainingNumerator": "0",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "subunit-cache-cost-regression",
+      "rates": {
+        "input": "2",
+        "output": "0",
+        "cache": "1"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "100",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "1",
+        "0"
+      ],
+      "status": null,
+      "error": "INCONSISTENT_USAGE"
+    },
+    {
+      "name": "failed-final-includes-last-usage",
+      "rates": {
+        "input": "1000000",
+        "output": "1000000"
+      },
+      "previous": {
+        "counts": [
+          "0",
+          "0",
+          "0"
+        ],
+        "remainingNumerator": "3000000",
+        "status": null
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": "FAILED",
+      "expect": {
+        "deltaNumerator": "2000000",
+        "releasedNumerator": "1000000",
+        "remainingNumerator": "0",
+        "duplicate": false
+      }
+    },
+    {
+      "name": "nonfinal-after-final-rejects",
+      "rates": {
+        "input": "1000000",
+        "output": "2000000"
+      },
+      "previous": {
+        "counts": [
+          "1",
+          "0",
+          "1"
+        ],
+        "remainingNumerator": "0",
+        "status": "COMPLETED"
+      },
+      "counts": [
+        "1",
+        "0",
+        "1"
+      ],
+      "status": null,
+      "error": "INCONSISTENT_USAGE"
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "suite": "catalog",
+  "accept": [
+    {
+      "name": "basic",
+      "utf8": "[{\"input\":\"1000000\",\"model\":\"example/model\",\"output\":\"3000000\"}]",
+      "keccak256": "0x3116024b0b95a2c9c23a1d2c06474dd3319f6a7383a1c83f209ee57763d36653"
+    },
+    {
+      "name": "zero-cache",
+      "utf8": "[{\"cache\":\"0\",\"input\":\"1\",\"model\":\"x/y\",\"output\":\"2\"}]",
+      "keccak256": "0x605803e388332aebc8ef1d04cb4d88e29bbca4b73cdd73f8b56e2b1fc7afb7a4"
+    },
+    {
+      "name": "absent-cache",
+      "utf8": "[{\"input\":\"1\",\"model\":\"x/y\",\"output\":\"2\"}]",
+      "keccak256": "0x87df07353bee67cfcbcc410c19929cbd8a285d6e34ad0a7297ded51437bf3505"
+    },
+    {
+      "name": "wide-rates",
+      "utf8": "[{\"cache\":\"9007199254740993\",\"input\":\"18446744073709551615\",\"model\":\"x/y\",\"output\":\"9007199254740992\"}]",
+      "keccak256": "0xb0fae42f4dd8ba7ca692f0d28ec31613feb9a38f50579a9c2e42f07468e591d9"
+    },
+    {
+      "name": "zero-rates",
+      "utf8": "[{\"input\":\"0\",\"model\":\"x/y\",\"output\":\"0\"}]",
+      "keccak256": "0xfd90acaeea8ccd820cbe73938ffffacd3353f70942b05200477d12d40d81dccb"
+    },
+    {
+      "name": "case-sensitive-order",
+      "utf8": "[{\"input\":\"1\",\"model\":\"A/model\",\"output\":\"2\"},{\"input\":\"3\",\"model\":\"a/model\",\"output\":\"4\"}]",
+      "keccak256": "0xfe3b363ebf282504240b882fa7b3417bff447e3df55c6bcc8bfc279718fb088a"
+    },
+    {
+      "name": "long-qualified-model",
+      "utf8": "[{\"input\":\"1\",\"model\":\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\",\"output\":\"2\"}]",
+      "keccak256": "0x831f8dc736521701ddca7e358f2b93177022a29224c5c6f2ccf96358c640eb55"
+    }
+  ],
+  "reject": [
+    {
+      "name": "empty",
+      "rawHex": "",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "empty-array",
+      "rawHex": "5b5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "object",
+      "rawHex": "7b7d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "null",
+      "rawHex": "6e756c6c",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "missing",
+      "rawHex": "5b7b226d6f64656c223a22782f79222c22696e707574223a2231227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "unknown",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f79222c226f7574707574223a2232222c226578747261223a2230227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "wrong-row",
+      "rawHex": "5b6e756c6c5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-utf8",
+      "rawHex": "ff",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "surrogate",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f5c7564383030222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "numeric",
+      "rawHex": "5b7b22696e707574223a312c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "nan",
+      "rawHex": "5b7b22696e707574223a4e614e2c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "duplicate-key",
+      "rawHex": "5b7b22696e707574223a2231222c22696e707574223a2232222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "DUPLICATE_KEY"
+    },
+    {
+      "name": "escaped-duplicate",
+      "rawHex": "5b7b22696e707574223a2231222c225c75303036396e707574223a2232222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "DUPLICATE_KEY"
+    },
+    {
+      "name": "bad-rate-01",
+      "rawHex": "5b7b22696e707574223a223031222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate--1",
+      "rawHex": "5b7b22696e707574223a222d31222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-+1",
+      "rawHex": "5b7b22696e707574223a222b31222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-1.0",
+      "rawHex": "5b7b22696e707574223a22312e30222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-1e0",
+      "rawHex": "5b7b22696e707574223a22316530222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate- 1",
+      "rawHex": "5b7b22696e707574223a222031222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-1 ",
+      "rawHex": "5b7b22696e707574223a223120222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-\u0661",
+      "rawHex": "5b7b22696e707574223a225c7530363631222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-rate-18446744073709551616",
+      "rawHex": "5b7b22696e707574223a223138343436373434303733373039353531363136222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a2278222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-/y",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a222f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/y/z",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f792f7a222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/-y",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f2d79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/y.",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f792e222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/y--z",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f792d2d7a222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/y..z",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f792e2e7a222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/y.git",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f792e676974222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-x/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f72727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "bad-model-\u00e9/y",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a225c75303065392f79222c226f7574707574223a2232227d5d",
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "row-order",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a227a2f79222c226f7574707574223a2232227d2c7b22696e707574223a2231222c226d6f64656c223a22612f79222c226f7574707574223a2232227d5d",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "duplicate-model",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f79222c226f7574707574223a2232227d2c7b22696e707574223a2231222c226d6f64656c223a22782f79222c226f7574707574223a2232227d5d",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "key-order",
+      "rawHex": "5b7b226d6f64656c223a22782f79222c22696e707574223a2231222c226f7574707574223a2232227d5d",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "newline",
+      "rawHex": "5b7b22696e707574223a2231303030303030222c226d6f64656c223a226578616d706c652f6d6f64656c222c226f7574707574223a2233303030303030227d5d0a",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "leading-space",
+      "rawHex": "205b7b22696e707574223a2231303030303030222c226d6f64656c223a226578616d706c652f6d6f64656c222c226f7574707574223a2233303030303030227d5d",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "escaped-model",
+      "rawHex": "5b7b22696e707574223a2231222c226d6f64656c223a22782f5c7530303739222c226f7574707574223a2232227d5d",
+      "error": "NON_CANONICAL"
+    },
+    {
+      "name": "bom",
+      "rawHex": "efbbbf5b7b22696e707574223a2231303030303030222c226d6f64656c223a226578616d706c652f6d6f64656c222c226f7574707574223a2233303030303030227d5d",
+      "error": "INVALID_VALUE"
+    }
+  ]
+}

@@ -1,0 +1,349 @@
+{
+  "schemaVersion": 1,
+  "suite": "amounts",
+  "cases": [
+    {
+      "name": "max-rate-1000000",
+      "operation": "funding",
+      "input": {
+        "tokens": "1000000",
+        "rates": {
+          "input": "1000000",
+          "output": "3000000",
+          "cache": "100000"
+        }
+      },
+      "expect": "3000000"
+    },
+    {
+      "name": "max-rate-10000",
+      "operation": "funding",
+      "input": {
+        "tokens": "10000",
+        "rates": {
+          "input": "1000000",
+          "output": "3000000",
+          "cache": "100000"
+        }
+      },
+      "expect": "30000"
+    },
+    {
+      "name": "max-rate-1",
+      "operation": "funding",
+      "input": {
+        "tokens": "1",
+        "rates": {
+          "input": "1000000",
+          "output": "3000000",
+          "cache": "100000"
+        }
+      },
+      "expect": "3"
+    },
+    {
+      "name": "input-higher",
+      "operation": "funding",
+      "input": {
+        "tokens": "1",
+        "rates": {
+          "input": "1600000",
+          "output": "1"
+        }
+      },
+      "expect": "2"
+    },
+    {
+      "name": "cache-higher",
+      "operation": "funding",
+      "input": {
+        "tokens": "1000000",
+        "rates": {
+          "input": "1",
+          "output": "2",
+          "cache": "3000000"
+        }
+      },
+      "expect": "3000000"
+    },
+    {
+      "name": "zero-tokens",
+      "operation": "funding",
+      "input": {
+        "tokens": "0",
+        "rates": {
+          "input": "1",
+          "output": "1"
+        }
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "zero-derived",
+      "operation": "funding",
+      "input": {
+        "tokens": "1",
+        "rates": {
+          "input": "0",
+          "output": "0"
+        }
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "funding-overflow",
+      "operation": "funding",
+      "input": {
+        "tokens": "18446744073709551615",
+        "rates": {
+          "input": "18446744073709551615",
+          "output": "0"
+        }
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "aggregate-floor",
+      "operation": "usage",
+      "input": {
+        "numerators": [
+          "1600000",
+          "1600000"
+        ]
+      },
+      "expect": "3"
+    },
+    {
+      "name": "aggregate-ceiling",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "1600000",
+          "1600000"
+        ]
+      },
+      "expect": "4"
+    },
+    {
+      "name": "zero-floor",
+      "operation": "usage",
+      "input": {
+        "numerators": [
+          "0"
+        ]
+      },
+      "expect": "0"
+    },
+    {
+      "name": "subunit-ceiling",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "1"
+        ]
+      },
+      "expect": "1"
+    },
+    {
+      "name": "exact-ceiling",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "1000000"
+        ]
+      },
+      "expect": "1"
+    },
+    {
+      "name": "wide-valid",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "18446744073709551615000000"
+        ]
+      },
+      "expect": "18446744073709551615"
+    },
+    {
+      "name": "wide-one-over",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "18446744073709551615000000",
+          "1"
+        ]
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "positive-topup",
+      "operation": "top_up",
+      "input": {
+        "deposit": "1",
+        "amount": "1"
+      },
+      "expect": "2"
+    },
+    {
+      "name": "cumulative-topup-overflow",
+      "operation": "top_up",
+      "input": {
+        "deposit": "18446744073709551615",
+        "amount": "1"
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "zero-topup",
+      "operation": "top_up",
+      "input": {
+        "deposit": "1",
+        "amount": "0"
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "headroom-exact",
+      "operation": "remaining",
+      "input": {
+        "deposit": "10",
+        "usageNumerator": "1600000",
+        "reservations": [
+          "1600000"
+        ],
+        "rates": {
+          "input": "1000000",
+          "output": "2000000"
+        }
+      },
+      "expect": "3"
+    },
+    {
+      "name": "headroom-saturates-only-estimate",
+      "operation": "remaining",
+      "input": {
+        "deposit": "18446744073709551615",
+        "usageNumerator": "0",
+        "reservations": [],
+        "rates": {
+          "input": "1",
+          "output": "0"
+        }
+      },
+      "expect": "18446744073709551615"
+    },
+    {
+      "name": "zero-rate-no-estimate",
+      "operation": "remaining",
+      "input": {
+        "deposit": "1",
+        "usageNumerator": "0",
+        "reservations": [],
+        "rates": {
+          "input": "0",
+          "output": "0"
+        }
+      },
+      "expect": null
+    },
+    {
+      "name": "wide-floor-final-fraction",
+      "operation": "usage",
+      "input": {
+        "numerators": [
+          "18446744073709551615000000",
+          "999999"
+        ]
+      },
+      "expect": "18446744073709551615"
+    },
+    {
+      "name": "uint256-boundary-usage-rejects",
+      "operation": "usage",
+      "input": {
+        "numerators": [
+          "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        ]
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "aggregate-overflows-uint256-rejects",
+      "operation": "coverage",
+      "input": {
+        "numerators": [
+          "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+          "1"
+        ]
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "largest-valid-funding",
+      "operation": "funding",
+      "input": {
+        "tokens": "1000000",
+        "rates": {
+          "input": "18446744073709551615",
+          "output": "0"
+        }
+      },
+      "expect": "18446744073709551615"
+    },
+    {
+      "name": "zero-deposit-topup-rejects",
+      "operation": "top_up",
+      "input": {
+        "deposit": "0",
+        "amount": "1"
+      },
+      "error": "INVALID_VALUE"
+    },
+    {
+      "name": "headroom-at-exact-bound",
+      "operation": "remaining",
+      "input": {
+        "deposit": "3",
+        "usageNumerator": "1600000",
+        "reservations": [
+          "1400000"
+        ],
+        "rates": {
+          "input": "1",
+          "output": "2"
+        }
+      },
+      "expect": "0"
+    },
+    {
+      "name": "headroom-below-bound",
+      "operation": "remaining",
+      "input": {
+        "deposit": "3",
+        "usageNumerator": "1600000",
+        "reservations": [
+          "1400001"
+        ],
+        "rates": {
+          "input": "1",
+          "output": "2"
+        }
+      },
+      "expect": "0"
+    },
+    {
+      "name": "zero-deposit-headroom",
+      "operation": "remaining",
+      "input": {
+        "deposit": "0",
+        "usageNumerator": "0",
+        "reservations": [],
+        "rates": {
+          "input": "1",
+          "output": "2"
+        }
+      },
+      "expect": "0"
+    }
+  ]
+}
