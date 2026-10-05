@@ -1,10 +1,14 @@
 # MPPI agent SDK for Python
 
+Version `0.1.1` adds built-in Circle CLI onboarding and
+`Client.from_config(...)`. See the
+[agent quickstart](../../../docs/agent-quickstart.md).
+
 Version `0.1.0` includes a synchronous `Client` with an owning background
 asyncio thread for native TLS gRPC Complete and Control. It verifies discovery,
 positive funding, fixed-signer attachment, signed run prices, cumulative vouchers,
-provider usage reports and canonical settlement/close evidence. The release is
-under development. The package includes resumable ERC-8004 onboarding and a
+provider usage reports and canonical settlement/close evidence. Version `0.1.0`
+is published for official Arc testnet. The package includes resumable ERC-8004 onboarding and a
 Circle Agent Wallet adapter tested through live Arc testnet onboarding, funding,
 payment, authenticated reconnect and cooperative close.
 

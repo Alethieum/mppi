@@ -1,4 +1,4 @@
-"""Minimal agent onboarding CLI; wallet login and credentials stay with the caller."""
+"""Onboard a supplied wallet and prepare the installed MPPI inference client."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from mppi_protocol.registry import RegistryReader
 from mppi_protocol.types import uint256
 
 from .onboarding import OnboardingError, onboard
+from .setup import DEFAULT_CONFIG, DEFAULT_RPC_ENV, onboard_circle
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,30 +29,58 @@ def main(argv: list[str] | None = None) -> int:
         "onboard", help="check funding and complete ERC-8004 registration"
     )
     command.add_argument(
-        "--profile", type=Path, required=True, help="verified deployment profile JSON"
+        "--profile", type=Path, help="verified deployment profile for a custom wallet factory"
     )
     command.add_argument(
-        "--config", type=Path, required=True, help="reusable non-secret agent configuration"
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="reusable agent configuration (default: .mppi/agent.json)",
     )
     command.add_argument(
         "--wallet-factory",
-        required=True,
         metavar="MODULE:FUNCTION",
         help="your trusted integration; function(profile) returns the selected wallet",
     )
     command.add_argument(
-        "--rpc-env", default="MPPI_RPC_URL", help="environment variable containing the Arc RPC URL"
+        "--wallet", help="address of your authenticated, funded Circle Agent Wallet"
     )
+    command.add_argument("--rpc-env", help="environment variable containing the Arc RPC URL")
     command.add_argument(
         "--testnet",
         action="store_true",
-        help="require Arc testnet in the supplied trusted profile; RPC remains explicit",
+        help="select built-in Arc testnet setup, or require testnet in a custom trusted profile",
     )
     command.add_argument(
         "--agent-id", help="adopt an existing identity owned by the selected wallet"
     )
     args = parser.parse_args(argv)
+    if args.wallet_factory is not None and args.profile is None:
+        parser.error("--wallet-factory requires --profile")
     try:
+        if args.wallet_factory is None:
+            if not args.testnet or args.wallet is None or args.profile is not None:
+                raise OnboardingError(
+                    "use onboard --testnet --wallet ADDRESS for built-in Circle setup; custom profiles require --wallet-factory"
+                )
+            selected_id = None
+            if args.agent_id is not None:
+                if re.fullmatch(r"0|[1-9][0-9]{0,77}", args.agent_id) is None:
+                    raise OnboardingError("agent id must be a canonical uint256 decimal string")
+                selected_id = uint256(int(args.agent_id), field="agent_id")
+            setup = onboard_circle(
+                args.wallet,
+                config_path=args.config,
+                rpc_env=args.rpc_env or DEFAULT_RPC_ENV,
+                agent_id=selected_id,
+            )
+            _print_result(setup.onboarding, setup.wallet_address, config=str(setup.config_path))
+            return 0 if setup.onboarding.complete else 2
+        if args.wallet is not None or args.profile is None:
+            raise OnboardingError(
+                "custom wallet factories require --profile and do not accept --wallet"
+            )
+        args.rpc_env = args.rpc_env or "MPPI_RPC_URL"
         if (
             re.fullmatch(
                 r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*",
@@ -82,26 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
             agent_id=identity,
         )
-        operation = result.operation
-        print(
-            json.dumps(
-                {
-                    "complete": result.complete,
-                    "agent_id": str(result.identity.agent_id)
-                    if result.identity is not None
-                    else None,
-                    "wallet": address_hex(wallet.address),
-                    "usdc_balance": str(result.balance),
-                    "submitted": result.submitted,
-                    "operation_ref": operation.operation_ref if operation is not None else None,
-                    "operation_state": operation.state.value if operation is not None else None,
-                    "tx_hash": "0x" + operation.tx_hash.hex()
-                    if operation is not None and operation.tx_hash is not None
-                    else None,
-                },
-                separators=(",", ":"),
-            )
-        )
+        _print_result(result, wallet.address)
         return 0 if result.complete else 2
     except OnboardingError as error:
         print(str(error), file=sys.stderr)
@@ -112,6 +122,28 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     return 1
+
+
+def _print_result(result: object, wallet_address: bytes, *, config: str | None = None) -> None:
+    from .onboarding import OnboardingResult
+
+    selected = cast(OnboardingResult, result)
+    operation = selected.operation
+    value = {
+        "complete": selected.complete,
+        "agent_id": str(selected.identity.agent_id) if selected.identity is not None else None,
+        "wallet": address_hex(wallet_address),
+        "usdc_balance": str(selected.balance),
+        "submitted": selected.submitted,
+        "operation_ref": operation.operation_ref if operation is not None else None,
+        "operation_state": operation.state.value if operation is not None else None,
+        "tx_hash": "0x" + operation.tx_hash.hex()
+        if operation is not None and operation.tx_hash is not None
+        else None,
+    }
+    if config is not None:
+        value["config"] = config
+    print(json.dumps(value, separators=(",", ":")))
 
 
 if __name__ == "__main__":

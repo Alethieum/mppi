@@ -2,6 +2,9 @@
 
 An Alethieum research project.
 
+Agent onboarding improvements are tracked in the
+[agent quickstart](docs/agent-quickstart.md), including their release status.
+
 MPPI lets agents authorize inference payments and providers capture reported
 usage through funded USDC sessions on Arc. ERC-8004 supplies identity and
 discovery. Each admitted run retains its accepted prices.

@@ -1,5 +1,9 @@
 # Connect a Python provider and agent
 
+For the new built-in Circle agent setup, see the
+[agent quickstart and its release status](agent-quickstart.md). This guide
+documents the explicit composition interface and provider integration.
+
 This walkthrough installs version `0.1.0` from PyPI and composes two independent
 applications against the official Arc testnet deployment. Start in your own
 application directory. Python 3.12+ is required; the agent's checkpoint locking
@@ -284,7 +288,7 @@ and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 | Result | Next action |
 | --- | --- |
 | `CONFIRMED` operation | Matching canonical chain evidence is available; retain its original reference. |
-| `PENDING` / `UNKNOWN` | Reconcile the original operation; do not replace its funding or submission. Agent method: `sessions.reconcile(operation_ref)`. |
+| `PENDING` / `UNKNOWN` | Reconcile the original wallet operation with `sessions.reconcile(operation_ref)`; for cooperative close, repeat `sessions.close(session_id)` to inspect that same close. Do not replace funding or replay inference. |
 | `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. |
 | Missing final inference accounting | Retain the original run and reservation; do not invent token usage or replay inference. |
 | Provider unavailable | Agent `requestClose`, then eligible `withdraw`, provide the contract exit path. `releaseIdle` has its own eligibility. |

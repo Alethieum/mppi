@@ -1,5 +1,8 @@
 # Python onboarding and wallets
 
+The [agent quickstart](agent-quickstart.md) covers built-in Circle setup and its
+release status. This page documents custom wallet and application composition.
+
 The Python packages include agent onboarding, ERC-8004 registration helpers and
 wallet adapters. Live Arc testnet checks have verified Circle Agent Wallet
 CLI 1.1.4 and Circle developer-controlled SCA integration with separately

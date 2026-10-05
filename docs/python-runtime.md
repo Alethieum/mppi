@@ -2,8 +2,8 @@
 
 Version `0.1.0` contains the native Python agent `Client`,
 provider `Mppi` payment services and shared chain observer described below.
-Onboarding and wallet-service adapters are implemented; release acceptance
-remains in progress. These packages are not a production release.
+Version `0.1.0` is published for official Arc testnet. The new agent setup path
+and its separate release status are recorded in the [agent quickstart](agent-quickstart.md).
 Start with the [installation and composition walkthrough](python-quickstart.md).
 The caller supplies its wallet capabilities and verified deployment
 profile; an audit deployment address is never a default.

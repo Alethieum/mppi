@@ -7,8 +7,8 @@ listener, TLS, inference gateway, token counts and retained payment history.
 
 The runtime implements live-session payment handling, supplied-history recovery
 and ordered batch collection. Start with the ordered
-[installation and onboarding walkthrough](rust-cli.md). The crate is unpublished;
-this is not a production release or a bundled inference gateway.
+[installation and onboarding walkthrough](rust-cli.md). Version `0.1.0` is
+published for official Arc testnet. Providers supply their inference integration.
 
 ## Compose a provider host
 

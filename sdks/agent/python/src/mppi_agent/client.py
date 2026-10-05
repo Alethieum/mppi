@@ -45,7 +45,11 @@ from mppi_protocol.errors import ValidationError
 from mppi_protocol.follower import ChainFollower
 from mppi_protocol.http import HttpTransport
 from mppi_protocol.operations import reconcile_operation, submit_operation
-from mppi_protocol.signing import verify_close_auth, verify_reconnect_auth, verify_run_auth
+from mppi_protocol.signing import (
+    verify_close_auth,
+    verify_reconnect_auth,
+    verify_run_auth,
+)
 from mppi_protocol.types import (
     ChainObservation,
     ConfirmedSettlementRef,
@@ -273,6 +277,25 @@ class Client:
     supplies only its recoverable reference here. macOS and Linux are supported.
     The supplied ChainFollower is exclusively owned by this Client's loop.
     """
+
+    @classmethod
+    def from_config(
+        cls,
+        provider: str | int,
+        *,
+        config_path: Path = Path(".mppi/agent.json"),
+        initial_session_tokens: int | None = None,
+        ca_file: str | None = None,
+    ) -> Client:
+        """Use completed CLI onboarding; funding still requires an explicit choice."""
+        from .setup import client_from_config
+
+        return client_from_config(
+            provider,
+            config_path=config_path,
+            initial_session_tokens=initial_session_tokens,
+            ca_file=ca_file,
+        )
 
     def __init__(
         self,
