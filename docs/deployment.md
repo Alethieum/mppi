@@ -1,6 +1,8 @@
 # MPPI Arc testnet deployment
 
-Version `0.1.0` targets only the official Arc testnet deployment, chain ID **5042002**:
+The official MPPI deployment is Arc testnet, chain ID **5042002**. It was
+published with contract release `0.1.0`; SDK onboarding updates use the same
+verified deployment:
 
 | Contract | Deployed address |
 | --- | --- |
@@ -34,9 +36,15 @@ Provider endpoint availability is independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Both SDK roles require an explicitly trusted deployment profile. Obtain it with
-the selected release's verified deployment record, independently of provider
-discovery and RPC responses. Download the
+Agent `0.1.1` and provider `0.1.1` built-in setup package the verified official
+Arc testnet profile. `--testnet` selects it without a separate download. The
+provider composition helpers use those same pins; they still verify chain ID,
+runtime code, proxy implementation slots and the signing domain before use.
+The packaged profile's trust comes from the installed official artifact,
+independently of provider discovery and RPC responses.
+
+Explicit integrations and older `0.1.0` CLI installations can use a separate
+trusted file. Download the
 [v0.1.0 Arc testnet profile](https://github.com/Alethieum/mppi/releases/download/v0.1.0/arc-testnet.json)
 from the official release and save it as `arc-profile.json`. Its SHA-256 is:
 
@@ -53,9 +61,8 @@ shasum -a 256 arc-profile.json
 The digest must match exactly. Establish trust in the release record itself;
 a matching digest supplied by a provider does not establish that trust. The same
 profile is included at [deployments/arc-testnet.json](../deployments/arc-testnet.json)
-in the release source. Select your verified local copy explicitly with
-`load_profile(path)` or the CLI's `--profile` argument. SDKs do not download or
-select it automatically.
+in the release source. `load_profile(path)` and the CLI's `--profile` argument
+select your verified local copy explicitly. No profile is downloaded at runtime.
 An address supplied by a provider, successful RPC call or matching chain ID does
 not establish the profile's provenance.
 
@@ -96,8 +103,9 @@ accompanying release record; the strict profile parser rejects extra fields.
 `load_profile(path)` parses the supplied file. The chain reader subsequently
 checks observed code, implementation slots and domain against those pins. These
 are distinct checks: parsing does not establish trust, and reading a chain does
-not choose trusted pins for the caller. `--testnet` additionally requires the
-testnet chain ID; it does not download a profile or select an audit deployment.
+not choose trusted pins for the caller. For built-in setup, `--testnet` selects
+the packaged official profile when no override is given, and requires the
+testnet chain ID when an explicit profile is supplied.
 
 Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/deployment.py),
 [Python chain checks](../proto/python/src/mppi_protocol/chain.py),
@@ -106,10 +114,10 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 
 ## SDK installation inputs
 
-Install the `0.1.0` Python role packages from PyPI or the `mppi-provider` Rust
-crate from crates.io, following the walkthrough for that role. Both Python roles
-depend on `mppi-protocol==0.1.0`. Use the release record to identify the reviewed
-source revision and exact artifact digests. For development, the
+The provider quickstart uses `mppi-provider==0.1.1` from PyPI and native
+`mppi-provider` version `0.1.1`. The agent quickstart uses `mppi-agent==0.1.1`.
+Both Python roles depend on `mppi-protocol==0.1.0`. Use the release record to
+identify the reviewed source revision and exact artifact digests. For development, the
 [public source tree can be built independently](build.md).
 
 | Input | How the application uses it |
@@ -124,9 +132,9 @@ source revision and exact artifact digests. For development, the
 Record source revision, package versions and package SHA-256 digests before
 distribution. A filename or matching version is not an artifact identity.
 Private test deployments and their profiles are not official release inputs.
-See the [Python walkthrough](python-quickstart.md), [Rust CLI walkthrough](rust-cli.md)
-and [build instructions](build.md) for exact entry points. Release verification
-and security results belong to the exact artifacts identified in the release
+See the [provider quickstart](provider-quickstart.md),
+[agent quickstart](agent-quickstart.md) and [build instructions](build.md) for
+exact entry points. Release verification and security results belong to the exact artifacts identified in the release
 record.
 
 ## Verified inputs before any broadcast

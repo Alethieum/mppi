@@ -1,72 +1,25 @@
-# Connect a Python provider and agent
+# Python application composition reference
 
-For the new built-in Circle agent setup, see the
-[agent quickstart and its release status](agent-quickstart.md). This guide
-documents the explicit composition interface and provider integration.
+For the usual setup, start with the [provider quickstart](provider-quickstart.md)
+or [agent quickstart](agent-quickstart.md). This reference documents explicit
+application composition and a complete agent exchange using supplied wallet and
+signer capabilities. Python 3.12+ is required.
 
-This walkthrough installs version `0.1.0` from PyPI and composes two independent
-applications against the official Arc testnet deployment. Start in your own
-application directory. Python 3.12+ is required; the agent's checkpoint locking
-supports macOS and Linux.
-
-The [official Arc testnet contracts](deployment.md) are deployed; configuration
-and Python/Rust SDK profile checks passed, including the scoped
-configuration/profile security review. Internal acceptance with frozen release
-artifacts passed fresh Rust provider and Python agent onboarding in separate
-Apple containers, two real inference completions, and independently verified
-exact settlement and refund accounting with zero remaining liability. The
-[v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
-identifies the exact artifacts, published-install verification status and security
-review scope and results. Supply the deployment profile explicitly.
-The provider builds and hosts its own testnet service and supplies its URL or
-ERC-8004 ID to agent developers. This walkthrough uses that provider's URL and
-the official profile. Provider endpoint availability is independent of the SDK
-release.
-
-## 1. Install independent roles
-
-With [uv installed](https://docs.astral.sh/uv/getting-started/installation/), create
-an environment for each role you operate. On the provider host:
+Install the role your application uses:
 
 ```sh
-uv venv --python 3.12 .venv-provider
-uv pip install --python .venv-provider/bin/python 'mppi-provider==0.1.0'
+# Provider environment
+uv pip install 'mppi-provider==0.1.1'
+
+# Separate agent environment
+uv pip install 'mppi-agent==0.1.1'
 ```
 
-On the agent host:
+Each role installs its required `mppi-protocol==0.1.0` dependency. The applications
+communicate through the provider's HTTPS origin; neither needs the other role's
+package. Source development uses the [local build guide](build.md).
 
-```sh
-uv venv --python 3.12 .venv-agent
-uv pip install --python .venv-agent/bin/python 'mppi-agent==0.1.0'
-```
-
-Each role package installs its required `mppi-protocol==0.1.0` dependency.
-The provider process uses `.venv-provider/bin/python`; the agent process uses
-`.venv-agent/bin/python`. They communicate over the provider's HTTPS origin.
-The commands follow uv's [package installation](https://docs.astral.sh/uv/pip/packages/#installing-a-package)
-and [environment selection](https://docs.astral.sh/uv/pip/environments/#using-arbitrary-python-environments)
-interfaces. Source development uses the separate [local build guide](build.md).
-
-Record the installed dependency versions and import locations on each host.
-For the provider:
-
-```sh
-uv pip freeze --python .venv-provider/bin/python > provider-packages.txt
-.venv-provider/bin/python -I -c 'import mppi_provider, mppi_protocol; print(mppi_provider.__file__, mppi_protocol.__file__)'
-```
-
-For the agent:
-
-```sh
-uv pip freeze --python .venv-agent/bin/python > agent-packages.txt
-.venv-agent/bin/python -I -c 'import mppi_agent, mppi_protocol; print(mppi_agent.__file__, mppi_protocol.__file__)'
-```
-
-The printed import paths must point into their respective environments. Retain
-these records with the source revision and artifact digests from the release
-record.
-
-## 2. Supply the integration inputs
+## Explicit integration inputs
 
 | Input | Provider application | Agent application |
 | --- | --- | --- |
@@ -88,7 +41,8 @@ Download the [v0.1.0 Arc testnet profile](https://github.com/Alethieum/mppi/rele
 as `arc-profile.json` and verify its SHA-256 using the
 [trusted-profile instructions](deployment.md#trusted-profile-file). Pass that
 verified file's path to `chain_bindings` below for each role. Install a copy with
-each application. The SDK does not automatically select or download a profile.
+each application. The explicit composition below uses this file. The built-in
+provider and agent setup paths instead use their packaged official profile.
 
 Create the common chain bindings once per application. Supply verified token
 domain strings explicitly; the MPPI signing domain is distinct from USDC's.
@@ -128,68 +82,34 @@ agent owns a separate follower and its background event loop. Do not share one
 follower between roles. Canonical RPC support and freshness requirements are
 documented in [Fresh chain state](python-runtime.md#fresh-chain-state).
 
-## 3. Onboard and attach the provider SDK
+## Compose the provider
 
-Use the shared native [provider onboarding CLI](rust-cli.md#3-register-and-retain-the-result)
-to create/check the operator wallet, register ERC-8004, bind the separate payout
-recipient and publish the catalog last. The CLI supports Python integrations;
-its output is applied `mppi.toml`, setup records and the confirmed provider ID.
-Keep its sidecars. Rerunning checks completed steps and reconciles pending ones.
-Python-only applications can implement the same sequence with the public
-[registry helpers](python-onboarding.md#provider-registration-and-publication).
+Use the [provider quickstart](provider-quickstart.md) to generate declarations,
+onboard the operator and recipient, and attach `await Mppi.from_config(...)` to
+your host. That helper replaces the manual provider chain/wallet wiring above.
+It creates no inference adapter, listener or provider storage.
 
-Load `ProviderConfig.from_file(Path("mppi.toml"))`. The
-[example configuration](../examples/provider/mppi.toml) contains illustrative
-addresses and declarations; replace them with your confirmed setup. Supply the
-operator wallet described in [Provider wallet integration](python-onboarding.md#provider-wallet-integration).
-
-Your host creates its `grpc.aio.server(options=GRPC_OPTIONS)` on the serving
-event loop, supplies coverage/execution implementations, and calls:
+For a custom wallet or chain integration, the explicit constructor remains:
 
 ```python
 from mppi_provider import Mppi
-from mppi_protocol.wire import GRPC_OPTIONS
 
-
-async def attach_mppi(server, config, chain, contract, operator_wallet, coverage, execution):
-    sdk = Mppi(
-        config,
-        chain=chain,
-        contract=contract,
-        wallet=operator_wallet,
-        coverage=coverage,
-        execution=execution,
-    )
-    sdk.register_grpc(server)  # Before the host starts its gRPC server.
-    readiness = await sdk.start()
-    return sdk, readiness
+sdk = Mppi(
+    config,
+    chain=chain_follower,
+    contract=contract_calls,
+    wallet=operator_wallet,
+    coverage=coverage,
+    execution=execution,
+)
 ```
 
-The host starts its own listener and maps `sdk.discovery(path)` responses to
-`GET /discover`, `GET /.well-known/agent-registration.json` and `GET /models`
-on the configured HTTPS origin. Return the supplied status, headers and body
-unchanged. A `None` response provides no document. Check `readiness.ready`;
-unavailable chain evidence does not make the endpoint payment-ready. See the
-[runtime reference](python-runtime.md#provider-composition) for retrying chain
-observations and host lifecycle.
+Construct this runtime on the serving event loop. Its follower freshness and
+collection-margin values must equal the validated configuration. Follow the
+[provider runtime reference](python-runtime.md#provider-composition) for gRPC
+registration, discovery hosting, callbacks, readiness and shutdown.
 
-The integration signatures are:
-
-| Integration | Obligation |
-| --- | --- |
-| `await coverage(request, context) -> TokenCounts` | Prepare required input/cache/output counts before paid execution; include at least the configured output buffer. |
-| `execution(request, context, runs, stop_requested) -> AsyncIterator[bytes]` | Execute admitted work and yield original JSON objects after removing upstream framing. |
-| `await runs.require_coverage(context, remaining_tokens)` | Obtain a granted result before consuming the next complete remaining bound. |
-| `await runs.report_usage(context, cumulative_counts)` | Supply cumulative counts early enough for voucher renewal. |
-| `await runs.report_terminal(context, final_counts, status)` | Report definitive actual termination and final counts. |
-
-The provider owns counting, cache policy, engine calls and stopping its job.
-MPPI validates payment coverage and supplied accounting. Stop work when coverage
-is denied; later vouchers cannot restart that run. Missing final usage stays
-unresolved. Network EOF and a cancellation signal are not definitive finals.
-The SDK supplies no database, worker coordinator or inference gateway.
-
-## 4. Onboard the agent and make one paid request
+## Compose the agent and make one paid request
 
 Supply the selected [agent wallet and fixed signer](python-onboarding.md#agent-setup).
 The funding wallet's ERC-8004 ID is required; the session signer has no separate
@@ -283,7 +203,7 @@ inspect its operation result. Ordinary voucher renewal remains automatic within
 confirmed funding. See [agent composition](python-runtime.md#agent-composition)
 and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 
-## 5. Confirm outcomes and retain uncertain work
+## Confirm outcomes and retain uncertain work
 
 | Result | Next action |
 | --- | --- |

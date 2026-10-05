@@ -13,6 +13,7 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import grpc
@@ -34,7 +35,7 @@ from mppi_protocol.amounts import (
 )
 from mppi_protocol.capabilities import TransactionWallet
 from mppi_protocol.catalog import Catalog, parse_catalog
-from mppi_protocol.chain import ChainEvidenceError, OpeningEvidence
+from mppi_protocol.chain import ChainEvidenceError, DeploymentProfile, OpeningEvidence
 from mppi_protocol.contract import ContractCalls, OperationKind, PreparedOperation
 from mppi_protocol.errors import ValidationCode, ValidationError
 from mppi_protocol.follower import ChainFollower, ChainSnapshot
@@ -300,6 +301,54 @@ class Mppi:
         self._tasks: set[asyncio.Task[None]] = set()
         self._documents: DiscoveryDocuments | None = None
         self._collecting: set[bytes] = set()
+
+    @classmethod
+    async def from_config(
+        cls,
+        config_path: str | Path = "mppi.toml",
+        *,
+        coverage: CoverageProvider,
+        execution: ExecutionProvider,
+        testnet: bool = False,
+        profile: DeploymentProfile | None = None,
+        rpc_env: str | None = None,
+        control_auth_timeout: float = 60.0,
+        hooks: Hooks | None = None,
+    ) -> Mppi:
+        """Compose verified SDK adapters on the host's serving event loop.
+
+        ``testnet=True`` selects the packaged official Arc testnet profile when
+        ``profile`` is omitted. Mainnet requires an explicitly trusted profile.
+        Network selection must match both the profile and confirmed TOML config.
+        Circle credentials come from CIRCLE_API_KEY and CIRCLE_ENTITY_SECRET
+        (64 hex characters). ``rpc_env`` selects an RPC URL from the provider's
+        secret environment; otherwise the validated config's RPC URL is used.
+
+        Only configuration and remote reads occur. Call ``start`` explicitly
+        from the host lifecycle; the provider owns hosting, execution,
+        usage reports, termination and retained state. Remote reads run in a
+        worker thread, then loop-owned objects are constructed on this loop:
+        https://docs.python.org/3.12/library/asyncio-task.html#asyncio.to_thread
+        """
+        from .setup import _prepare
+
+        config, reader, wallet, contract = await asyncio.to_thread(
+            _prepare, config_path, testnet=testnet, profile=profile, rpc_env=rpc_env
+        )
+        return cls(
+            config,
+            chain=ChainFollower(
+                reader,
+                max_age_ms=config.chain.max_age_ms,
+                collection_margin_ms=config.payment.collection_margin_ms,
+            ),
+            contract=contract,
+            wallet=wallet,
+            coverage=coverage,
+            execution=execution,
+            control_auth_timeout=control_auth_timeout,
+            hooks=hooks,
+        )
 
     @property
     def hook_stats(self) -> ObserverStats:

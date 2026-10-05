@@ -2,9 +2,6 @@
 
 An Alethieum research project.
 
-Agent onboarding improvements are tracked in the
-[agent quickstart](docs/agent-quickstart.md), including their release status.
-
 MPPI lets agents authorize inference payments and providers capture reported
 usage through funded USDC sessions on Arc. ERC-8004 supplies identity and
 discovery. Each admitted run retains its accepted prices.
@@ -17,11 +14,14 @@ discovery. Each admitted run retains its accepted prices.
 | [Provider SDK](sdks/provider/) | Python and Rust | Provider payment types, protocol services and integration interfaces |
 | [Smart contracts](contracts/) | Solidity | MPPI's contract interface and payment authority |
 
-Install version `0.1.0` from PyPI using the
-[Python provider and agent walkthrough](docs/python-quickstart.md), or from
-crates.io using the [Rust provider walkthrough](docs/rust-cli.md). Both use explicit
-[trusted deployment and artifact inputs](docs/deployment.md#trusted-profile-file)
-and the provider's existing gateway. The [API map](docs/sdk-interfaces.md#api-reference-map)
+Start with the [agent quickstart](docs/agent-quickstart.md) to onboard a wallet
+and make paid inference requests. Providers start with the
+[provider quickstart](docs/provider-quickstart.md) to initialize declarations,
+onboard and attach MPPI to their existing gateway. Agent and provider SDKs are
+version `0.1.1`; the shared protocol package remains `0.1.0`. Both quickstarts
+select the packaged official Arc testnet profile. Explicit
+[trusted deployment profiles](docs/deployment.md#trusted-profile-file) remain
+supported. The [API map](docs/sdk-interfaces.md#api-reference-map)
 links the implemented interfaces, lifecycle hooks and public conformance tests.
 
 The provider supplies required tokens, actual counts and final outcomes. The

@@ -1,6 +1,6 @@
 # MPPI provider — Rust
 
-Version `0.1.0` provides exact payment arithmetic, canonical price catalogs,
+Version `0.1.1` provides exact payment arithmetic, canonical price catalogs,
 immutable validation of provider usage reports, generated `mppi.v1` tonic types
 and typed session/proof hashing and verification. It also provides validated
 configuration and integration traits, discovery documents, bounded HTTP/RPC,
@@ -8,19 +8,23 @@ canonical chain evidence, freshness checks and explicit contract operations.
 `runtime::Mppi` adds native paid services, authenticated attachments, run
 admission, provider reports, supplied-history recovery, ordered batch capture
 and cooperative close. The native CLI adds provider onboarding, explicit updates,
-provider-host launch and endpoint verification. Live Arc testnet acceptance
-has exercised an independent Python agent, including capture/refund and explicit
-updates. Version `0.1.0` targets only the official Arc testnet deployment. See the
+provider-host launch and endpoint verification. `provider init` generates fresh
+declarations; `--testnet` selects the packaged official profile.
+`setup::runtime_from_config` composes the runtime with the existing Circle
+operator. Earlier `0.1.0` live Arc testnet acceptance exercised an independent
+Python agent, including capture/refund and explicit updates. The official deployment remains Arc testnet. See the
 [v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0) for
 the exact artifact digests, published-install verification status and security
 review scope and results.
 
 ## Install from crates.io
 
-Use Rust 1.95.0. Install the native CLI:
+Start with the [provider quickstart](../../../docs/provider-quickstart.md) for
+the complete setup and Linux ARM64 binary installation. To build the native CLI
+from crates.io, use Rust 1.95.0:
 
 ```sh
-cargo install mppi-provider --version 0.1.0 --locked --bin mppi
+cargo install mppi-provider --version 0.1.1 --locked --bin mppi
 mppi --help
 ```
 
@@ -29,7 +33,7 @@ provider application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-mppi-provider = "=0.1.0"
+mppi-provider = "=0.1.1"
 ```
 
 Build that application using its own committed lockfile. The CLI uses the
@@ -53,10 +57,10 @@ cargo install --path sdks/provider/rust --locked --bin mppi
 mppi --help
 ```
 
-The [ordered provider walkthrough](../../../docs/rust-cli.md) covers the trusted
+The [provider quickstart](../../../docs/provider-quickstart.md) covers the trusted
 deployment profile, private configuration/artifacts, operator and recipient
 wallets, registration, host startup and verification. The
-[composition function](../../../docs/rust-runtime.md#compose-a-provider-host)
+[composition helper](../../../docs/rust-runtime.md#compose-a-provider-host)
 connects the saved configuration to the runtime. Supply your inference gateway,
 coverage/count callbacks, definitive job outcomes and retained history; the
 crate does not provide an inference engine or provider storage.
@@ -114,8 +118,10 @@ cargo run --manifest-path sdks/provider/rust/Cargo.toml --locked --example payme
 
 ## Configuration and integration
 
-For installation, Circle setup, recipient proofs and all four commands, see
-[the Rust CLI guide](../../../docs/rust-cli.md).
+For installation and Circle setup, see the
+[provider quickstart](../../../docs/provider-quickstart.md). The
+[native CLI reference](../../../docs/rust-cli.md) covers recipient proofs and
+all five commands.
 
 For native service composition and callback responsibilities, see
 [the Rust runtime guide](../../../docs/rust-runtime.md).
@@ -156,9 +162,12 @@ with a fixed producer wait deadline.
 
 ## Chain evidence and wallet calls
 
-Supply an explicit deployment manifest to `deployment::load_profile`. There
-is no built-in audit deployment address. The caller establishes the manifest's
-provenance and selects a trusted RPC.
+Use `deployment::official_testnet_profile()` for the packaged verified official
+Arc testnet pins, or `deployment::load_profile(path)` for an explicit trusted
+manifest. The CLI selects the packaged profile with `--testnet`; without that
+selection an explicit profile is required. A supplied manifest needs independent
+provenance. The chain reader verifies the observed deployment against either
+profile, using the selected trusted RPC.
 
 `http::HttpTransport::new(timeout_ms, max_bytes, ca_pem)` uses verified TLS,
 no redirects, no implicit proxy, no retries and no decompression. A supplied

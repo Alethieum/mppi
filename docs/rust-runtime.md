@@ -7,85 +7,59 @@ listener, TLS, inference gateway, token counts and retained payment history.
 
 The runtime implements live-session payment handling, supplied-history recovery
 and ordered batch collection. Start with the ordered
-[installation and onboarding walkthrough](rust-cli.md). Version `0.1.0` is
-published for official Arc testnet. Providers supply their inference integration.
+[provider quickstart](provider-quickstart.md). The `0.1.1` composition helper
+uses the packaged official Arc testnet profile or an explicit trusted profile.
 
 ## Compose a provider host
 
 After onboarding, your executable loads the saved configuration using
-`cli::host_configuration(std::env::args_os().skip(1))`. That accepts the arguments
-forwarded by `mppi provider serve`, including the explicit trusted profile and
-RPC environment-variable name. Keep a clone of the validated listener settings
-before moving the configuration into the runtime.
+`cli::host_configuration(std::env::args_os().skip(1))`. It accepts the arguments
+forwarded by `mppi provider serve`, including `--testnet` for the packaged official
+profile, an optional explicit `--profile`, and the RPC environment-variable name.
+Keep the validated listener settings before moving the host configuration.
 
-The following composition function uses only the SDK and Rust's standard
-library. Add `mppi-provider` as a [path dependency](../sdks/provider/rust/README.md#use-locally)
-in your host crate. The host supplies the arguments, secret loading, callbacks,
-Tokio application lifecycle and the private path for its wallet operation record.
-The function checks the established Circle wallet; it provisions no new wallet.
+Use the SDK's composition helper in your provider host:
 
 ```rust
-use std::{error::Error, io, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use mppi_provider::{
-    circle::{CircleClient, CircleCredentials, CircleDeveloperWallet},
+    circle::CircleCredentials,
     cli::HostConfiguration,
-    contract::ContractCalls,
-    follower::ChainFollower,
     interfaces::{CoverageProvider, ExecutionProvider},
     runtime::Mppi,
+    setup::{self, SetupError},
 };
 
 pub async fn compose(
     host: HostConfiguration,
     credentials: CircleCredentials,
     operation_record: &Path,
-    usdc_domain_name: &str,
-    usdc_domain_version: &str,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
-) -> Result<Arc<Mppi>, Box<dyn Error + Send + Sync>> {
-    let client = Arc::new(CircleClient::new(credentials, 30_000)?);
-    let wallet_id = host.config.identity().wallet_id().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "onboarding wallet ID required")
-    })?;
-    let identity = client
-        .wallet(wallet_id, host.config.chain().chain_id())
-        .await?;
-    if identity.address() != host.config.identity().wallet_address() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput, "operator wallet mismatch"
-        ).into());
-    }
-    client.verify_credentials(&identity).await?;
-    let wallet = Arc::new(CircleDeveloperWallet::new(
-        client, identity, operation_record,
-    )?);
-    let follower = Arc::new(ChainFollower::new(
-        host.chain.as_ref().clone(),
-        host.config.chain().max_age_ms(),
-        host.config.payment().collection_margin_ms(),
-        None,
-    )?);
-    let calls = ContractCalls::new(
-        *host.profile.domain(), usdc_domain_name.into(), usdc_domain_version.into(),
-    )?;
-    Ok(Arc::new(Mppi::new(
-        host.config, follower, calls, wallet, coverage, execution,
-    )?))
+) -> Result<Arc<Mppi>, SetupError> {
+    Ok(Arc::new(setup::runtime_from_config(
+        host, credentials, operation_record, coverage, execution,
+    ).await?))
 }
 ```
 
-Construct `CircleCredentials` using the secret manager's API-key value and
-decoded 32-byte registered entity secret. Supply the USDC signing-domain name
-and version verified for the selected deployment; they are explicit inputs to
-`ContractCalls`, separate from the MPPI domain in the profile.
-Do not place credential values in the
-configuration, command arguments or application logs. The composition function
-performs Circle access checks and opens the supplied operation record;
-`Mppi::new` itself starts no network work. The SDK owns payment validation. Your
-coverage and execution implementations own upstream calls, token measurements,
-job termination and final outcome reports; declaring `upstream.url` alone does
-not install an inference adapter.
+Construct `CircleCredentials` using your secret manager's API-key value and
+decoded 32-byte registered entity secret. Use the retained onboarding wallet
+operation record: for `mppi.toml`, this is `mppi.toml.wallet-operations.json`.
+Do not select a new record to replace an unresolved operation. Keep credentials
+out of configuration, command arguments and logs.
+
+The helper checks the existing Circle operator against the saved identity,
+verifies deployment and USDC domain evidence, constructs the chain follower with
+the configuration's freshness and collection margin, and supplies contract calls.
+It creates no wallet and starts neither the runtime nor a listener. Advanced
+integrations can still construct `Mppi::new` with their own wallet and chain capabilities.
+`setup::runtime_from_config_with_options(..., RuntimeOptions)` accepts explicit
+Circle timeouts, follower polling, runtime limits and lifecycle hooks.
+
+Your coverage and execution implementations supply upstream calls, token
+measurements, job termination and final reports. Declaring `upstream.url` alone
+does not install an inference adapter.
 
 For the SDK-owned listener, pass the composed runtime, validated `ListenerConfig`,
 your shutdown `CancellationToken` and an explicit `ServePolicy` to
@@ -96,12 +70,16 @@ contain that report through `shutdown()`. Keep the report and any session
 checkpoints through your existing retention system. Provider infrastructure is
 supplied by your application; the SDK has no database or job supervisor.
 
-The composition uses the packaged [host configuration](../sdks/provider/rust/src/cli.rs),
+The composition uses the packaged [setup helper](../sdks/provider/rust/src/setup.rs),
+[host configuration](../sdks/provider/rust/src/cli.rs),
 [Circle adapter](../sdks/provider/rust/src/circle.rs),
 [runtime constructor](../sdks/provider/rust/src/runtime/mod.rs) and
 [listener lifecycle](../sdks/provider/rust/src/standalone.rs).
 
 ## Embed the SDK
+
+The setup helper can also compose an embedded runtime. To supply your own wallet
+and chain capabilities, use the explicit construction sequence:
 
 1. Validate `config::ProviderConfig` and an explicit deployment manifest. Build
    `chain::ChainReader` with the selected RPC and deployment pins.

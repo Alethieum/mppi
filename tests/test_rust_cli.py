@@ -10,12 +10,14 @@ import json
 import os
 import subprocess
 import tarfile
+import tomllib
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 CRATE = ROOT / "sdks/provider/rust"
+VERSION = tomllib.loads((CRATE / "Cargo.toml").read_text())["package"]["version"]
 
 
 @pytest.fixture(scope="module")
@@ -33,13 +35,13 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
             ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], cwd=CRATE
         )
     )
-    archive = Path(metadata["target_directory"]) / "package/mppi-provider-0.1.0.crate"
+    archive = Path(metadata["target_directory"]) / f"package/mppi-provider-{VERSION}.crate"
     with tarfile.open(archive) as package:
-        license_file = package.extractfile("mppi-provider-0.1.0/LICENSE")
+        license_file = package.extractfile(f"mppi-provider-{VERSION}/LICENSE")
         assert license_file is not None
         assert license_file.read() == (ROOT / "LICENSE").read_bytes()
         package.extractall(work / "source", filter="data")
-    source = work / "source/mppi-provider-0.1.0"
+    source = work / f"source/mppi-provider-{VERSION}"
     # Reuse compiled dependencies, but compile the installed executable from the
     # extracted package. The source path is outside the original checkout.
     subprocess.run(
@@ -82,7 +84,7 @@ def run(binary: Path, directory: Path, *arguments: str) -> subprocess.CompletedP
 
 def test_installed_commands_reject_before_credentials_and_redact_arguments(installed) -> None:
     binary, work = installed
-    assert run(binary, work, "--version").stdout.strip() == "mppi 0.1.0"
+    assert run(binary, work, "--version").stdout.strip() == f"mppi {VERSION}"
     for command in ("onboard", "serve", "update", "verify"):
         help_result = run(binary, work, "provider", command, "--help")
         assert help_result.returncode == 0

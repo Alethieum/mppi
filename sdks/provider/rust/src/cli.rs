@@ -5,7 +5,7 @@ use crate::{
     chain::{Block, ChainReader, DeploymentProfile},
     circle::{CircleClient, CircleCredentials, CircleDeveloperWallet, CircleWalletIdentity},
     config::{MAX_CONFIG_BYTES, ProviderConfig, ProviderDeclarations},
-    deployment::load_profile,
+    deployment::{load_profile, official_testnet_profile},
     http::{HttpJsonRpc, HttpTransport, MAX_RPC_RESPONSE_BYTES},
     local_state::LocalState,
     onboarding::{OnboardingOptions, OnboardingProgress, SignedRecipientProof, onboard},
@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-const HELP: &str = "MPPI provider SDK\n\nUsage: mppi provider COMMAND [OPTIONS]\n\nCommands: onboard, update, serve, verify\n\nCommon: --config PATH (default mppi.toml), --profile PATH (required), --testnet,\n        --rpc-env NAME (RPC secret reference), --timeout-ms N (default 30000)\n\nOnboard: --declarations PATH (initial provider TOML without identity),\n         --wallet-id UUID (existing Circle SCA), --provider-id UINT256 (adopt identity),\n         --wallet-set-id UUID (resolve an interrupted wallet-set creation),\n         --recipient-proof PATH (JSON request and signature).\n         Missing recipient proof is emitted as JSON; sign with the recipient wallet\n         and rerun. Pending operations are checked on the same command.\nUpdate:  --changes PATH (explicit JSON changes), --recipient-proof PATH.\nServe:   --host ABSOLUTE_EXECUTABLE (your trusted SDK integration),\n         --upstream URL (this process only). Host receives config/profile references.\nVerify:  --ca PATH (explicit TLS trust bundle; defaults to system roots).\n\nSecrets: CIRCLE_API_KEY, CIRCLE_ENTITY_SECRET. Never put secret values in flags.\nExit: 0 complete; 1 invalid/unavailable; 2 pending or recipient proof required.\n";
+const HELP: &str = "MPPI provider SDK\n\nUsage: mppi provider COMMAND [OPTIONS]\n\nCommands: init, onboard, update, serve, verify\n\nCommon: --config PATH (default mppi.toml), --profile PATH (required unless --testnet), --testnet,\n        --rpc-env NAME (RPC secret reference), --timeout-ms N (default 30000)\n\nInit:    --testnet [--declarations PATH] (default provider-declarations.toml).\n         Creates an editable template without identity; never overwrites a file.\nOnboard: --declarations PATH (initial provider TOML without identity),\n         --wallet-id UUID (existing Circle SCA), --provider-id UINT256 (adopt identity),\n         --wallet-set-id UUID (resolve an interrupted wallet-set creation),\n         --recipient-proof PATH (JSON request and signature).\n         Missing recipient proof is emitted as JSON; sign with the recipient wallet\n         and rerun. Pending operations are checked on the same command.\nUpdate:  --changes PATH (explicit JSON changes), --recipient-proof PATH.\nServe:   --host ABSOLUTE_EXECUTABLE (your trusted SDK integration),\n         --upstream URL (this process only). Host receives config/profile references.\nVerify:  --ca PATH (explicit TLS trust bundle; defaults to system roots).\n\nSecrets: CIRCLE_API_KEY, CIRCLE_ENTITY_SECRET. Never put secret values in flags.\nExit: 0 complete; 1 invalid/unavailable; 2 pending or recipient proof required.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CliError(&'static str);
@@ -50,6 +50,7 @@ impl Arguments {
             .and_then(|s| s.into_string().ok())
             .ok_or(CliError("missing provider command"))?;
         let specific: &[&str] = match command.as_str() {
+            "init" => &["--declarations"],
             "onboard" => &[
                 "--declarations",
                 "--wallet-id",
@@ -73,8 +74,9 @@ impl Arguments {
                 testnet = true;
                 continue;
             }
-            if !["--config", "--profile", "--rpc-env", "--timeout-ms"].contains(&name)
-                && !specific.contains(&name)
+            if !(specific.contains(&name)
+                || command != "init"
+                    && ["--config", "--profile", "--rpc-env", "--timeout-ms"].contains(&name))
             {
                 return Err(CliError("unknown option; use --help"));
             }
@@ -86,7 +88,10 @@ impl Arguments {
                 return Err(CliError("duplicate option"));
             }
         }
-        if !flags.contains_key("--profile") {
+        if command == "init" && !testnet {
+            return Err(CliError("init requires --testnet"));
+        }
+        if !testnet && !flags.contains_key("--profile") {
             return Err(CliError(
                 "--profile must select the verified deployment profile",
             ));
@@ -139,6 +144,32 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
         return Err(CliError("input file exceeds its size limit"));
     }
     Ok(raw)
+}
+
+fn initialize_declarations(path: &Path) -> Result<()> {
+    // create_new atomically rejects existing files and dangling symlinks:
+    // https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| CliError("declarations output must be a new file in an existing directory"))?;
+    file.write_all(include_bytes!("provider-declarations.toml"))
+        .and_then(|_| file.sync_all())
+        .map_err(|_| CliError("declarations write incomplete; inspect the selected file"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| CliError("declarations durability uncertain; inspect the selected file"))?;
+    Ok(())
 }
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -222,10 +253,11 @@ fn load_config(args: &Arguments) -> Result<ProviderConfig> {
     ProviderConfig::from_file(args.config_path(), Some(&overrides)).map_err(|_| CliError("invalid provider configuration; check fields, exact quoted amounts and selected network"))
 }
 fn profile(args: &Arguments, chain_id: u64) -> Result<DeploymentProfile> {
-    let profile = load_profile(
-        args.path("--profile")
-            .ok_or(CliError("missing deployment profile"))?,
-    )
+    let profile = match args.path("--profile") {
+        Some(path) => load_profile(path),
+        None if args.testnet => official_testnet_profile(),
+        None => return Err(CliError("missing deployment profile")),
+    }
     .map_err(|_| CliError("invalid deployment profile"))?;
     if profile.domain().chain_id() != chain_id {
         return Err(CliError(
@@ -282,22 +314,7 @@ fn launch_host(args: &Arguments) -> Result<()> {
             "serve requires explicit listener and TLS configuration",
         ));
     }
-    let mut command = std::process::Command::new(host);
-    command
-        .arg("--config")
-        .arg(absolute(&args.config_path())?)
-        .arg("--profile")
-        .arg(absolute(
-            &args.path("--profile").ok_or(CliError("missing profile"))?,
-        )?);
-    for key in ["--rpc-env", "--upstream", "--timeout-ms"] {
-        if let Some(value) = args.flags.get(key) {
-            command.arg(key).arg(value);
-        }
-    }
-    if args.testnet {
-        command.arg("--testnet");
-    }
+    let mut command = host_command(args, &host)?;
     // Exec before creating a Tokio runtime. Signals and exit status belong to
     // the actual provider host, and there is no hidden child supervisor.
     #[cfg(unix)]
@@ -313,6 +330,23 @@ fn launch_host(args: &Arguments) -> Result<()> {
             "standalone host launch currently requires Unix; embed the SDK on this platform",
         ))
     }
+}
+
+fn host_command(args: &Arguments, host: &Path) -> Result<std::process::Command> {
+    let mut command = std::process::Command::new(host);
+    command.arg("--config").arg(absolute(&args.config_path())?);
+    if let Some(path) = args.path("--profile") {
+        command.arg("--profile").arg(absolute(&path)?);
+    }
+    for key in ["--rpc-env", "--upstream", "--timeout-ms"] {
+        if let Some(value) = args.flags.get(key) {
+            command.arg(key).arg(value);
+        }
+    }
+    if args.testnet {
+        command.arg("--testnet");
+    }
+    Ok(command)
 }
 
 fn signed_proof(args: &Arguments) -> Result<Option<SignedRecipientProof>> {
@@ -355,6 +389,14 @@ pub fn main() -> i32 {
     }
     let result = (|| -> Result<i32> {
         let args = Arguments::parse(args.into_iter())?;
+        if args.command == "init" {
+            let path = args
+                .path("--declarations")
+                .unwrap_or_else(|| PathBuf::from("provider-declarations.toml"));
+            initialize_declarations(&path)?;
+            println!("Created provider declarations; edit the placeholders before onboarding.");
+            return Ok(0);
+        }
         if args.command == "serve" {
             launch_host(&args)?;
             return Ok(0);
@@ -975,6 +1017,120 @@ mod tests {
     use super::*;
     fn parse(raw: &[&str]) -> Result<Arguments> {
         Arguments::parse(raw.iter().map(OsString::from))
+    }
+    fn edited_template() -> String {
+        include_str!("provider-declarations.toml")
+            .replace("REPLACE_HTTPS_PROVIDER_ORIGIN", "https://provider.example")
+            .replace("REPLACE_MODEL_ID", "provider/model")
+            .replace(
+                "REPLACE_RECIPIENT_EVM_ADDRESS",
+                "0x2222222222222222222222222222222222222222",
+            )
+            .replace("REPLACE_INPUT_RATE", "300000")
+            .replace("REPLACE_OUTPUT_RATE", "1200000")
+    }
+    #[test]
+    fn testnet_uses_packaged_profile_and_other_networks_require_explicit_pins() {
+        for command in ["onboard", "update", "serve", "verify"] {
+            let args = parse(&["provider", command, "--testnet"]).unwrap();
+            assert_eq!(
+                profile(&args, 5_042_002).unwrap(),
+                official_testnet_profile().unwrap()
+            );
+            assert!(profile(&args, 5042).is_err());
+            assert!(parse(&["provider", command]).is_err());
+            let explicit = parse(&[
+                "provider",
+                command,
+                "--testnet",
+                "--profile",
+                "missing-profile.json",
+            ])
+            .unwrap();
+            // An explicit profile never silently falls back to bundled pins.
+            assert!(profile(&explicit, 5_042_002).is_err());
+        }
+    }
+
+    #[test]
+    fn standalone_host_receives_same_implicit_or_explicit_profile_selection() {
+        let directory = std::env::temp_dir().join(format!("mppi-host-{}", random_key().unwrap()));
+        fs::create_dir(&directory).unwrap();
+        let config = directory.join("mppi.toml");
+        let mut content = edited_template().replace("max_age_ms = 60000", "max_age_ms = 1000");
+        content.push_str("\n[identity]\nprovider_id = \"42\"\nwallet_address = \"0x1111111111111111111111111111111111111111\"\n");
+        fs::write(&config, content).unwrap();
+        for explicit in [false, true] {
+            let mut input = vec![
+                OsString::from("provider"),
+                OsString::from("serve"),
+                OsString::from("--testnet"),
+                OsString::from("--config"),
+                config.as_os_str().to_owned(),
+            ];
+            if explicit {
+                let pins = directory.join("deployment.json");
+                fs::write(&pins, include_bytes!("arc-testnet.json")).unwrap();
+                input.extend([OsString::from("--profile"), pins.as_os_str().to_owned()]);
+            }
+            let args = Arguments::parse(input.into_iter()).unwrap();
+            let command = host_command(&args, Path::new("/provider/host")).unwrap();
+            let forwarded: Vec<_> = command.get_args().map(|s| s.to_os_string()).collect();
+            assert_eq!(forwarded.iter().any(|s| s == "--profile"), explicit);
+            let host = host_configuration(forwarded).unwrap();
+            assert_eq!(host.profile, official_testnet_profile().unwrap());
+            assert_eq!(host.chain.profile(), &host.profile);
+            assert_eq!(host.config.chain().max_age_ms(), 1000);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn init_is_local_explicit_and_never_overwrites() {
+        assert!(parse(&["provider", "init"]).is_err());
+        assert!(parse(&["provider", "init", "--testnet", "--config", "mppi.toml"]).is_err());
+        assert!(parse(&["provider", "init", "--testnet", "--profile", "pins.json"]).is_err());
+        let directory = std::env::temp_dir().join(format!("mppi-init-{}", random_key().unwrap()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("provider-declarations.toml");
+        initialize_declarations(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert_eq!(original, include_bytes!("provider-declarations.toml"));
+        let template = String::from_utf8(original.clone()).unwrap();
+        let mapping: toml::Value = toml::from_str(&template).unwrap();
+        assert!(mapping.get("identity").is_none());
+        assert!(
+            crate::config::ProviderDeclarations::from_mapping(
+                &serde_json::to_value(&mapping).unwrap()
+            )
+            .is_err()
+        );
+        let edited = edited_template();
+        let mapping: toml::Value = toml::from_str(&edited).unwrap();
+        let declarations =
+            ProviderDeclarations::from_mapping(&serde_json::to_value(mapping).unwrap()).unwrap();
+        assert_eq!(declarations.chain().max_age_ms(), 60_000);
+        assert_eq!(
+            declarations.to_mapping()["payment"]["suggest_session_tokens"],
+            10_000
+        );
+        assert!(initialize_declarations(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked = directory.join("linked.toml");
+            symlink(&path, &linked).unwrap();
+            assert!(initialize_declarations(&linked).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let missing = directory.join("missing.toml");
+            let dangling = directory.join("dangling.toml");
+            symlink(&missing, &dangling).unwrap();
+            assert!(initialize_declarations(&dangling).is_err());
+            assert!(!missing.exists());
+        }
+        assert!(!directory.join("mppi.toml").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn command_fields_are_explicit_and_secret_values_never_diagnosed() {

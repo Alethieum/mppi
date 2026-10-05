@@ -1,7 +1,7 @@
 # Python SDK interfaces
 
 The two role packages are **`mppi-agent`** and **`mppi-provider`**, version
-`0.1.0`, requiring Python 3.12 or newer. They share one support distribution,
+`0.1.1`, requiring Python 3.12 or newer. They share one support distribution,
 `mppi-protocol`, containing generated wire bindings and exact payment primitives.
 The support library is not an additional role SDK.
 
@@ -16,9 +16,11 @@ checks with the wallet products and prerequisites documented there.
 The interface classes below are Python `Protocol` declarations;
 `Client` and `Mppi` provide the concrete implemented entry points.
 
-Start with the [Python installation/composition walkthrough](python-quickstart.md).
-The [Rust walkthrough](rust-cli.md) covers the provider CLI and host integration.
-Both require an independently trusted [deployment profile](deployment.md#trusted-profile-file).
+Start with the [provider quickstart](provider-quickstart.md) or
+[agent quickstart](agent-quickstart.md). Built-in setup uses the packaged official
+Arc testnet [deployment profile](deployment.md#trusted-profile-file). The
+[Python composition reference](python-quickstart.md) covers explicit capabilities;
+the [native CLI reference](rust-cli.md) covers provider commands for both languages.
 
 ## API reference map
 
@@ -32,7 +34,7 @@ surface; constructing a type does not establish a successful payment.
 | API family | Integration reference | Public checks |
 | --- | --- | --- |
 | Agent `Client`, completions, streams, session methods and errors | [Agent composition and session operations](python-runtime.md#agent-composition) | [Agent component tests](../sdks/agent/python/tests/), [independent roles](../tests/paid_loop/) |
-| Provider `Mppi`, coverage/execution interfaces, reports, sessions and recovery | [Provider composition](python-runtime.md#provider-composition), report/session contracts below | [Provider component tests](../sdks/provider/python/tests/), [independent roles](../tests/paid_loop/) |
+| Provider `Mppi`, `Mppi.from_config`, coverage/execution interfaces, reports, sessions and recovery | [Provider composition](python-runtime.md#provider-composition), report/session contracts below | [Provider component tests](../sdks/provider/python/tests/), [independent roles](../tests/paid_loop/) |
 | `Hooks`, `HookError`, `ObserverStats` and payloads | [Lifecycle callbacks, bounds and repeat semantics](lifecycle-hooks.md) | Both role component suites; Rust runtime tests |
 | Agent discovery/onboarding and provider configuration/registration | [Python wallet/onboarding reference](python-onboarding.md), [provider CLI](rust-cli.md) | Both role component suites, [CLI package checks](../tests/test_rust_cli.py) |
 | Catalogs, rates, counts, exact arithmetic and report transitions | Payment primitives below, [wire/accounting profile](protocol.md) | [Shared Python tests](../proto/python/tests/), [cross-language vectors](../testvectors/) |

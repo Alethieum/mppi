@@ -167,7 +167,7 @@ fn name(value: &str) -> Result<(), CircleError> {
 }
 
 #[tonic::async_trait]
-trait CircleTransport: Send + Sync {
+pub(crate) trait CircleTransport: Send + Sync {
     async fn request(
         &self,
         method: Method,
@@ -341,6 +341,13 @@ impl fmt::Debug for CircleClient {
     }
 }
 impl CircleClient {
+    #[cfg(test)]
+    pub(crate) fn with_test_transport(transport: Arc<dyn CircleTransport>) -> Self {
+        Self {
+            transport,
+            entity_secret: Zeroizing::new([0; 32]),
+        }
+    }
     pub fn new(credentials: CircleCredentials, timeout_ms: u64) -> Result<Self, CircleError> {
         Ok(Self {
             transport: Arc::new(CircleHttp::new(credentials.api_key, timeout_ms)?),
@@ -729,10 +736,34 @@ impl CircleDeveloperWallet {
         identity: CircleWalletIdentity,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self, CircleError> {
-        let journal_path = journal_path.as_ref().to_owned();
+        Self::open(client, identity, journal_path.as_ref(), true)
+    }
+    /// Resume an existing operation record. Missing records fail without creating
+    /// replacement wallet history; retain the path selected during onboarding.
+    pub fn open_existing(
+        client: Arc<CircleClient>,
+        identity: CircleWalletIdentity,
+        journal_path: impl AsRef<Path>,
+    ) -> Result<Self, CircleError> {
+        let path = journal_path.as_ref();
+        if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(CircleError::Journal);
+        }
+        Self::open(client, identity, path, false)
+    }
+    fn open(
+        client: Arc<CircleClient>,
+        identity: CircleWalletIdentity,
+        journal_path: &Path,
+        create: bool,
+    ) -> Result<Self, CircleError> {
+        let journal_path = journal_path.to_owned();
         let mut journal =
             LocalState::open(&journal_path, MAX_JOURNAL).map_err(|_| CircleError::Journal)?;
         if journal.read().map_err(|_| CircleError::Journal)?.is_none() {
+            if !create {
+                return Err(CircleError::Journal);
+            }
             Journal::new(&identity).write(&mut journal)?;
         }
         Journal::read(&journal, &identity)?;

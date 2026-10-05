@@ -1,0 +1,43 @@
+# Edit every REPLACE value before onboarding. No identity is assigned by init.
+# Publish only models and capabilities your own serving application supports.
+[provider]
+name = "REPLACE_PROVIDER_NAME"
+description = "REPLACE_PROVIDER_DESCRIPTION"
+public_origin = "REPLACE_HTTPS_PROVIDER_ORIGIN"
+recipient = "REPLACE_RECIPIENT_EVM_ADDRESS"
+
+[chain]
+network = "testnet"
+# Illustrative operational timings: select these for your RPC and integration.
+max_age_ms = 60000
+
+[upstream]
+url = "http://127.0.0.1:8080/v1"
+# api_key_env = "PROVIDER_INTERNAL_API_KEY"
+
+[[models]]
+model = "REPLACE_MODEL_ID"
+description = "REPLACE_MODEL_DESCRIPTION"
+# Replace these illustrative limits and capabilities with your model's values.
+context_window = 8192
+max_output = 1024
+modalities = ["text"]
+embeddings = false
+streaming = true
+tools = false
+structured_output = false
+# Quoted integer micro-USDC per million tokens. Set your own exact prices.
+rates = { input = "REPLACE_INPUT_RATE", output = "REPLACE_OUTPUT_RATE" }
+
+[payment]
+output_buffer_tokens = 1000
+suggest_session_tokens = 10000
+# Provider-selected timing policy; these values are illustrative, not defaults.
+collection_margin_ms = 30000
+authorization_wait_ms = 10000
+
+[settlement]
+interval_ms = 30000
+
+# Embedded hosts own their existing listener and routing. For standalone serve,
+# explicitly configure [listen] and TLS or ingress termination before launching.

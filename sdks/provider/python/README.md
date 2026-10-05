@@ -1,18 +1,27 @@
 # MPPI provider SDK for Python
 
-Version `0.1.0` supplies validated configuration, discovery, exact payment
+Version `0.1.1` supplies validated configuration, discovery, exact payment
 arithmetic, canonical chain evidence and native Complete/Control services.
-The Python runtime supports the paid request loop described below. Production
-release remains pending. Shared registry
-helpers and the Circle developer-controlled wallet adapter support provider
-setup and submission, verified through live Arc testnet registration, recipient
-binding, catalog publication, capture and close. The shared native
-[provider CLI](../../../docs/rust-cli.md) ships in the Rust package and supports
-Python integrations.
+`await Mppi.from_config(...)` composes these services from the native CLI's saved
+configuration, the packaged official Arc testnet profile and the existing Circle
+operator. The provider owns its inference integration and hosting.
 
-Start with the [Python installation and paid-exchange walkthrough](../../../docs/python-quickstart.md).
-See [onboarding and wallets](../../../docs/python-onboarding.md) for the operator
-wallet, recipient proof, publication sequence and completed-rerun checks.
+```sh
+uv pip install 'mppi-provider==0.1.1'
+```
+
+Start with the [provider quickstart](../../../docs/provider-quickstart.md) to
+install the native CLI, generate declarations, onboard and attach the SDK.
+Linux ARM64 has a native CLI release binary; Python providers use that same CLI
+for wallet setup, recipient binding and catalog publication. The quickstart also
+covers a locked Cargo source build. The shared protocol dependency installs
+automatically with this Python package.
+
+The [wallet reference](../../../docs/python-onboarding.md) covers custom adapters
+and registry operations. Earlier `0.1.0` integrations passed live Arc testnet
+registration, recipient binding, catalog publication, capture and close. See the
+[official release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
+for that evidence's exact artifact and security scope.
 
 ```python
 from mppi_provider import CatalogRow, Rates, publish_catalog
@@ -34,6 +43,31 @@ HTTP host integration and evidence requirements.
 
 ## Embedded provider runtime
 
+The usual Circle composition is:
+
+```python
+from mppi_provider import Mppi
+
+sdk = await Mppi.from_config(
+    "mppi.toml",
+    testnet=True,
+    rpc_env="ARC_RPC_URL_TESTNET",
+    coverage=prepare_required_tokens,
+    execution=execute_and_report,
+)
+```
+
+Run this on the serving event loop. The helper verifies the saved operator and
+selected deployment, reads `CIRCLE_API_KEY` and `CIRCLE_ENTITY_SECRET` from the
+environment, and constructs the wallet, chain follower and contract calls.
+`rpc_env="ARC_RPC_URL_TESTNET"` selects a trusted RPC environment variable;
+`profile=load_profile(Path("trusted-profile.json"))` selects an explicit
+trusted profile using `mppi_protocol.deployment.load_profile`. With
+`testnet=True`, the default profile is packaged official testnet; the RPC comes
+from the validated configuration unless `rpc_env` is supplied. It starts no
+listener or inference job. The host owns runtime startup, its server and shutdown.
+
+For custom integrations, the explicit constructor remains available.
 Construct `mppi_provider.runtime.Mppi(config, chain=..., contract=..., wallet=...,
 coverage=..., execution=...)` on the serving event-loop thread. Supply:
 

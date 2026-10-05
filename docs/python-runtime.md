@@ -1,12 +1,11 @@
 # Python payment runtime
 
-Version `0.1.0` contains the native Python agent `Client`,
-provider `Mppi` payment services and shared chain observer described below.
-Version `0.1.0` is published for official Arc testnet. The new agent setup path
-and its separate release status are recorded in the [agent quickstart](agent-quickstart.md).
-Start with the [installation and composition walkthrough](python-quickstart.md).
-The caller supplies its wallet capabilities and verified deployment
-profile; an audit deployment address is never a default.
+The native Python agent `Client`, provider `Mppi` payment services and shared
+chain observer implement the paid request loop below. Start with the
+[provider quickstart](provider-quickstart.md) or [agent quickstart](agent-quickstart.md)
+for `0.1.1` built-in setup with the packaged official Arc testnet profile.
+The [Python composition reference](python-quickstart.md) covers custom wallet
+and explicit chain capabilities.
 
 ## Native paid request loop
 
@@ -49,6 +48,14 @@ terminates its jobs when further coverage is denied. Missing final usage leaves
 the reservation unresolved.
 
 ### Provider composition
+
+The built-in Circle path uses `await Mppi.from_config("mppi.toml", testnet=True,
+coverage=..., execution=...)` on the serving event loop. It verifies the saved
+configuration, deployment and existing operator, then constructs the wallet,
+chain follower and contract calls. It starts no listener or inference job.
+See the [provider quickstart](provider-quickstart.md#4-attach-the-sdk-to-your-application).
+
+For custom capabilities, construct the runtime explicitly:
 
 ```python
 import grpc
@@ -308,8 +315,9 @@ submissions, redirects or automatic retries. TLS verifies certificate and host;
 individual blocking I/O operations, not an entire SDK operation's lifetime.
 
 `DeploymentProfile` requires explicit Arc chain/proxy/registry identity and
-runtime-code pins for both proxies and implementations. There is no default
-audit address. `verify_deployment(block)` checks code hashes, ERC-1967 slots and
+runtime-code pins for both proxies and implementations. Built-in setup loads
+the packaged official testnet pins; explicit composition supplies its own profile.
+`verify_deployment(block)` checks code hashes, ERC-1967 slots and
 MPPI signing domain. Manifest provenance, initialization and governance checks
 remain deployment release responsibilities. A caller-supplied profile is not
 automatically a trusted release manifest.

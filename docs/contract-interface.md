@@ -5,7 +5,8 @@
 [MPPISigning.sol](../contracts/src/MPPISigning.sol) supplies pure hashing.
 [MPPI.sol](../contracts/src/MPPI.sol) implements payment execution and namespaced
 upgradeable storage; its [full ABI](../contracts/abi/MPPI.json) includes inherited
-OpenZeppelin entries. Deployment and independent production audit remain pending.
+OpenZeppelin entries. The official Arc testnet deployment is [published](deployment.md). Mainnet
+deployment and its independent production audit remain separate requirements.
 No address in the signing fixtures is a deployment announcement.
 
 ## Identity and signatures

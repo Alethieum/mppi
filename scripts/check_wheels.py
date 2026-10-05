@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tarfile
@@ -40,7 +41,9 @@ def main() -> None:
     sdists = sorted(directory.glob("*.tar.gz"))
     if len(wheels) != 3 or len(sdists) != 3:
         raise RuntimeError("Expected two SDK wheels/sdists and one shared support wheel/sdist")
-    license_text = (Path(__file__).resolve().parents[1] / "LICENSE").read_bytes()
+    public = Path(__file__).resolve().parents[1]
+    license_text = (public / "LICENSE").read_bytes()
+    testnet_profile = (public / "deployments/arc-testnet.json").read_bytes()
     for wheel in wheels:
         check_wheel(wheel, license_text)
     for sdist in sdists:
@@ -73,8 +76,10 @@ def main() -> None:
             )
             code = f"""
 from importlib.util import find_spec
+from importlib.resources import files
 assert find_spec('mppi_{opposite}') is None
 import mppi_{role}
+assert files('mppi_{role}').joinpath('arc-testnet.json').read_bytes() == {testnet_profile!r}
 from mppi.v1 import mppi_pb2, mppi_pb2_grpc
 from mppi_protocol.chain import ChainReader, HttpJsonRpc
 from mppi_protocol.follower import ChainFollower
@@ -99,6 +104,8 @@ print('{role} SDK runtime loads and signs independently from rebuilt installed a
             code += f"\nfrom mppi_{role} import {runtime}\nassert callable({runtime})\n"
             if role == "agent":
                 code += "\nfrom mppi_agent import onboard\nfrom mppi_agent.circle import CircleAgentWallet\nassert callable(onboard)\n"
+            else:
+                code += "\nfrom inspect import iscoroutinefunction\nfrom mppi_provider import SetupError\nassert callable(Mppi.from_config) and iscoroutinefunction(Mppi.from_config)\nassert issubclass(SetupError, RuntimeError)\n"
             subprocess.run([str(python), "-I", "-c", code], cwd=root, check=True)
             if role == "agent":
                 subprocess.run(
@@ -116,6 +123,11 @@ print('{role} SDK runtime loads and signs independently from rebuilt installed a
                     "--python-executable",
                     str(python),
                     "--no-incremental",
+                    # --no-incremental still writes a cache; isolated package
+                    # checks need none. Avoid SQLite cache I/O in small tmpfs.
+                    # https://mypy.readthedocs.io/en/stable/command_line.html#cmdoption-mypy-cache-dir
+                    "--cache-dir",
+                    os.devnull,
                     "-c",
                     "from mppi.v1.mppi_pb2 import Voucher; from typing import assert_type; "
                     "from mppi_protocol.signing import LocalSessionSigner; "

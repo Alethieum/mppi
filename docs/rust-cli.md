@@ -1,88 +1,47 @@
-# Rust provider onboarding and operation
+# Native provider CLI reference
 
-The `mppi-provider` crate contains the native `mppi` executable and the provider
-SDK. This walkthrough installs version `0.1.0` from crates.io, registers a
-provider against the official Arc testnet deployment, then runs the provider's
-own SDK integration. The [v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
-identifies the exact artifacts, published-install verification status and security
-review scope and results.
+The `mppi-provider` crate contains the native `mppi` executable used by Python
+and Rust providers. Start with the [provider quickstart](provider-quickstart.md)
+for installation, generated declarations and application composition. This
+reference covers onboarding, host launch, verification and explicit updates.
 
-## 1. Install the CLI and SDK
+Provider `0.1.1` packages the verified official Arc testnet profile. Use
+`--testnet` to select it; the observed chain, code and proxy implementation must
+still match its pins. `--rpc-env NAME` reads your trusted RPC URL from the named
+environment variable. The commands below use `ARC_RPC_URL_TESTNET`; set it through
+your secret environment before running them. Without that flag, the configuration
+selects the RPC, defaulting to `https://rpc.testnet.arc.io` on testnet.
+`--profile FILE` accepts an independently trusted explicit profile.
+`--testnet` selects the testnet configuration override. The resulting network
+and selected profile must agree.
+[Arc connection details](https://docs.arc.io/arc/references/connect-to-arc).
 
-Use Rust 1.95.0. The package includes generated wire source; ordinary
-installation does not need `protoc`.
+## Generate declarations
 
 ```sh
-cargo install mppi-provider --version 0.1.0 --locked --bin mppi
-mppi --version
-mppi --help
+mppi provider init --testnet
 ```
 
-Ensure Cargo's executable directory is on your `PATH`. This installs the setup
-and host-launch CLI. `--version` selects exactly `0.1.0`; `--locked` uses the
-package's included dependency lockfile. See [Cargo installation](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
+This creates `provider-declarations.toml` and refuses to overwrite an existing
+path. It makes no wallet or network call. Use `--declarations PATH` to choose
+another output. Replace every `REPLACE` placeholder and review the illustrative
+model, payment and freshness settings; add listener settings for standalone use.
+The template intentionally has no confirmed identity. Onboarding writes that identity to `mppi.toml`.
 
-Add the SDK to your provider application's `Cargo.toml`:
+## Configuration and credentials
 
-```toml
-[dependencies]
-mppi-provider = "=0.1.0"
-```
-
-Build that application using its own committed lockfile. It supplies the gateway
-callbacks described in the [runtime composition guide](rust-runtime.md#compose-a-provider-host).
-The exact dependency follows [Cargo version requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#comparison-requirements).
-For source development, use the [local build guide](build.md).
-
-## 2. Prepare explicit inputs
-
-Keep the following deployment inputs in your provider application's private
-working directory. The filenames in the remaining commands
-refer to that directory; `mppi.toml` is the output of onboarding.
-
-| Input | Supplied by |
-| --- | --- |
-| `arc-profile.json` | Download the [v0.1.0 Arc testnet profile](https://github.com/Alethieum/mppi/releases/download/v0.1.0/arc-testnet.json) and verify its SHA-256 using the [trusted-profile instructions](deployment.md#trusted-profile-file). |
-| `provider-declarations.toml` | You: provider origin, separate payout recipient, models, rates, upstream API base and payment policy. Start from the example below. |
-| Operator credentials | Your secret environment: `CIRCLE_API_KEY` and the registered `CIRCLE_ENTITY_SECRET` for the same Circle account. |
-| `ARC_RPC_URL_TESTNET` | Your secret environment: the trusted Arc testnet RPC endpoint. Pass its variable name to the CLI. |
-| Recipient signing access | Your recipient wallet, separately controlled from the serving operator; used to sign the exported binding request. |
-| TLS and routing | Your public hostname, certificate/key and HTTP/2 ingress routing to the MPPI services. |
-| Provider host executable | Your built application using the SDK, connected to your inference gateway, counts, final outcomes and retained history. |
-
-Use `--testnet` for Arc testnet; the configuration and profile must agree on the
-network. The SDK verifies the selected deployment before registry operations.
-`--config` selects the saved configuration path; its default is `mppi.toml`.
-The [official Arc testnet contracts](deployment.md) are deployed; configuration
-and Python/Rust SDK profile checks passed. Save the verified profile at the path
-selected by `--profile`. The CLI does not select or download a profile
-automatically. The scoped configuration/profile security review passed.
-Internal acceptance with frozen release artifacts passed fresh Rust provider and
-Python agent onboarding in separate Apple containers, two real inference
-completions, and independently verified exact settlement and refund accounting
-with zero remaining liability. This evidence covers the recorded private testnet
-integration.
-
-A future public testnet provider builds and hosts its own service using this
-SDK and the official profile. It supplies the service URL or ERC-8004 ID to agent
-developers, who use the agent SDK with the same profile. Provider endpoint
-availability is independent of the MPPI SDK release.
+`--config` selects the applied configuration path; its default is `mppi.toml`.
+Keep the configuration and its sidecars in a private durable directory.
+`--timeout-ms` sets the bounded CLI request timeout; the default is 30,000 ms.
 
 The operator is a Circle developer-controlled SCA. Configure `CIRCLE_API_KEY`
 and the registered `CIRCLE_ENTITY_SECRET` through your secret environment.
 Configure Circle Gas Station for that wallet/network. The receive-only payout
 recipient is a different address, with signing custody separate from serving.
-Use `--rpc-env ARC_RPC_URL_TESTNET` to reference an RPC endpoint held in your
-secret environment. Secret values are never command-line options.
+Secret values are never command-line options. The upstream URL is its complete
+API base, including its path prefix; your application supplies its authentication.
 
-Create initial declarations using the [configuration example](../examples/provider/mppi.toml)
-with its `[identity]` section removed. Set your actual provider, model, payment,
-upstream and endpoint declarations. Keep monetary values quoted. The upstream
-URL is its complete API base, including its path prefix.
-
-For the owned listener used below, also add explicit listener settings to the
-declarations. This direct-TLS example uses certificate paths relative to the
-declarations file:
+For a Rust owned listener, add explicit listener settings before onboarding:
 
 ```toml
 [listen]
@@ -92,16 +51,15 @@ tls_cert = "tls/fullchain.pem"
 tls_key = "tls/key.pem"
 ```
 
-The hostname in `provider.public_origin` must match your certificate and public
-route. For existing provider ingress, set `tls_mode = "ingress"`, use your
-private bind address and omit both TLS file fields. Ingress must terminate
-HTTPS and carry native gRPC over HTTP/2 to that listener. The SDK does not
-configure your gateway, DNS, certificates or upstream authentication.
+Certificate chain and key paths are relative to the declarations file. Your
+provider hostname must match the certificate and public route. With
+`tls_mode = "ingress"`, use a private bind address and omit TLS file fields; your ingress terminates HTTPS and carries
+native gRPC over HTTP/2. Python applications configure their own listeners.
 
-## 3. Register and retain the result
+## Register and retain the result
 
 ```sh
-mppi provider onboard --testnet --config mppi.toml --profile arc-profile.json \
+mppi provider onboard --testnet --config mppi.toml \
   --declarations provider-declarations.toml --rpc-env ARC_RPC_URL_TESTNET
 ```
 
@@ -120,7 +78,7 @@ and signature in a JSON file:
 ```
 
 ```sh
-mppi provider onboard --testnet --config mppi.toml --profile arc-profile.json \
+mppi provider onboard --testnet --config mppi.toml \
   --declarations provider-declarations.toml --rpc-env ARC_RPC_URL_TESTNET \
   --recipient-proof signed-recipient-proof.json
 ```
@@ -155,12 +113,13 @@ wallet reference. An unresolved wallet-set creation requires checking Circle
 Console and supplying that existing `--wallet-set-id`. The command does not
 repeatedly create resources while an earlier result is unknown.
 
-## 4. Build and start your integration
+## Build and start your integration
 
 Providers supply measured coverage, cumulative usage, final job outcomes and
 available session history through the existing
-[Rust integration interfaces](rust-runtime.md). Their application constructs
-`runtime::Mppi` with those integrations and the selected wallet.
+[Rust integration interfaces](rust-runtime.md). Use `setup::runtime_from_config`
+to compose `runtime::Mppi` from the saved configuration, selected wallet and those
+integrations.
 
 For an owned listener, the application calls
 `standalone::serve(runtime, listener_config, shutdown, policy)`. The helper starts the
@@ -174,11 +133,11 @@ The installed CLI launches that provider application directly:
 
 ```sh
 mppi provider serve --config /etc/mppi/mppi.toml \
-  --testnet --profile /etc/mppi/arc-profile.json --rpc-env ARC_RPC_URL_TESTNET \
+  --testnet --rpc-env ARC_RPC_URL_TESTNET \
   --host /opt/provider/bin/provider-mppi-host
 ```
 
-The host receives `--config`, `--profile` and any explicit `--rpc-env`,
+The host receives `--config` and any explicit `--profile`, `--rpc-env`,
 `--timeout-ms`, `--testnet` and `--upstream` arguments. Use
 `cli::host_configuration(std::env::args_os().skip(1))` to load the same validated
 configuration, profile and chain reader. It inherits the provider's environment;
@@ -187,20 +146,20 @@ signals and exit status with that application. The application supplies its
 shutdown cancellation token and finite `ServePolicy` limits.
 
 The `/etc/mppi/` and `/opt/provider/` paths above are deployment examples. Install
-your completed configuration, verified profile and built host at your actual
-private paths before running this command. Keep the wallet-operation record at
-the durable path selected by your host. The CLI does not compile that host or
-implement its inference callbacks.
+your completed configuration and built host at your actual private paths before
+running this command. If you select `--profile`, also install that verified file.
+Keep the wallet-operation record at the durable path selected by your host. The
+CLI does not compile that host or implement its inference callbacks.
 
 `--upstream` changes this process's API base without modifying the file.
 Listener startup does not establish public readiness. Providers own DNS,
 certificates, ingress routing, token measurement and job termination. Embedded
 applications can continue to register the native services in their own lifecycle.
 
-## 5. Verify the public endpoint
+## Verify the public endpoint
 
 ```sh
-mppi provider verify --testnet --config mppi.toml --profile arc-profile.json \
+mppi provider verify --testnet --config mppi.toml \
   --rpc-env ARC_RPC_URL_TESTNET
 ```
 
@@ -215,7 +174,7 @@ session. Paid streaming, collection/refund and provider job behavior require
 separate funded acceptance. A successful check describes the observed endpoint
 at that time.
 
-## 6. Apply explicit changes
+## Apply explicit changes
 
 An update file selects only intended changes. For example:
 
@@ -227,7 +186,7 @@ An update file selects only intended changes. For example:
 ```
 
 ```sh
-mppi provider update --testnet --config mppi.toml --profile arc-profile.json \
+mppi provider update --testnet --config mppi.toml \
   --changes changes.json --rpc-env ARC_RPC_URL_TESTNET
 ```
 

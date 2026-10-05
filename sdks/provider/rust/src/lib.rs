@@ -31,6 +31,7 @@ pub mod provider_update;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
+pub mod setup;
 pub mod transport;
 pub mod types;
 pub mod verify;

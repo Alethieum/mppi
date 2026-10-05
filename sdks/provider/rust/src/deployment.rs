@@ -8,6 +8,15 @@ use crate::{
 use serde_json::{Value, json};
 use std::{fs::File, io::Read, path::Path};
 
+/// Exact public release pins from `mppi/deployments/arc-testnet.json`.
+/// These pins are packaged with the SDK; RPC responses never supply trust anchors.
+pub fn official_testnet_profile() -> Result<DeploymentProfile, ValidationError> {
+    profile_from_mapping(&parse_document(
+        include_bytes!("arc-testnet.json"),
+        MAX_DOCUMENT_BYTES,
+    )?)
+}
+
 fn invalid() -> ValidationError {
     ValidationError::new(ValidationCode::InvalidValue, "invalid deployment profile")
 }

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mppi-provider"
-version = "0.1.0"
+version = "0.1.1"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 description = "MPPI provider SDK: typed payment interfaces and exact primitives"

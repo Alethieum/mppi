@@ -1,32 +1,34 @@
 # Python onboarding and wallets
 
-The [agent quickstart](agent-quickstart.md) covers built-in Circle setup and its
-release status. This page documents custom wallet and application composition.
+Start with the [agent quickstart](agent-quickstart.md) or
+[provider quickstart](provider-quickstart.md) for built-in Circle setup. This page
+documents custom wallet and application composition.
 
 The Python packages include agent onboarding, ERC-8004 registration helpers and
 wallet adapters. Live Arc testnet checks have verified Circle Agent Wallet
 CLI 1.1.4 and Circle developer-controlled SCA integration with separately
-installed agent and provider packages. These packages are not yet a production
-release; an official deployment profile must be supplied separately. The full
-provider command line belongs to the Rust package.
+installed agent and provider packages. The official deployment is Arc testnet;
+mainnet has separate release requirements. Built-in setup uses a packaged official
+profile. Explicit integrations below supply their own trusted profile. Python
+and Rust providers use the same native onboarding CLI.
 
 MPPI handles payment messages and evidence. The provider supplies token counts,
 execution, final reports, hosting, TLS and its own state management.
 
-For the complete path from independent package installation to one paid
-exchange, start with the [Python walkthrough](python-quickstart.md).
+The [Python composition reference](python-quickstart.md) shows an exchange using
+explicit capabilities.
 
 ## Install and select a deployment
 
-From this exported public source directory, install the shared package and the
-role you will use into your Python 3.12+ environment:
+Install your role into a Python 3.12+ environment:
 
 ```sh
-uv pip install ./proto/python ./sdks/agent/python
+uv pip install 'mppi-agent==0.1.1'
 ```
 
-The provider environment installs `./proto/python ./sdks/provider/python`.
-Neither role needs the other role's package.
+The provider environment installs `mppi-provider==0.1.1`. The shared protocol
+dependency installs automatically. Neither role needs the other role's package.
+For source development, see the [build guide](build.md).
 
 Obtain a trusted deployment profile for the selected Arc network. MPPI ships no
 temporary audit address as a default. The JSON profile has exactly these fields:
@@ -167,6 +169,11 @@ constructor parameters configure its trusted executable and bounded processing.
 
 ## Provider wallet integration
 
+The built-in `await Mppi.from_config(...)` path loads the confirmed operator from
+`mppi.toml` and reads its Circle credentials from your environment. Use the
+[provider quickstart](provider-quickstart.md) for that path. The explicit adapter
+below supports applications composing their own capabilities.
+
 The provider operator uses a Circle **developer-controlled SCA**, with a separate
 receive-only payout recipient. Circle Agent Wallet login is a different product.
 Follow the [developer-wallet setup](https://developers.circle.com/wallets/dev-controlled/create-your-first-wallet)
@@ -203,6 +210,10 @@ unknown outcome, reconcile; do not create a replacement operation. The adapter
 provides no storage backend, wallet provisioning or automatic transaction retry.
 
 ## Provider registration and publication
+
+The native `mppi provider onboard` command performs this sequence for both
+Python and Rust providers. The following helpers are the lower-level interface
+for custom onboarding integrations.
 
 `RegistryCalls` prepares exact calls; `RegistryReader` verifies deployment,
 identity, recipient proofs and canonical outcomes. These shared helpers are

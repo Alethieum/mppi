@@ -40,6 +40,7 @@ from .interfaces import (
     RecoveryRun,
 )
 from .runtime import Mppi, UpstreamFailure
+from .setup import SetupError
 
 __all__ = [
     "HookError",
@@ -56,6 +57,7 @@ __all__ = [
     "ProviderDetails",
     "ProviderIdentityConfig",
     "SettlementConfig",
+    "SetupError",
     "UpstreamConfig",
     "CatalogRow",
     "CoverageProvider",
