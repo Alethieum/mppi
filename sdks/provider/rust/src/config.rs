@@ -374,33 +374,13 @@ impl ProviderDetails {
 pub struct ProviderIdentityConfig {
     provider_id: U256,
     wallet_address: Address,
-    wallet_id: Option<String>,
 }
 impl ProviderIdentityConfig {
-    pub fn new(
-        provider_id: U256,
-        wallet_address: Address,
-        wallet_id: Option<String>,
-    ) -> Result<Self, ConfigError> {
+    pub fn new(provider_id: U256, wallet_address: Address) -> Result<Self, ConfigError> {
         nonzero_address(wallet_address, "identity.wallet_address")?;
-        if let Some(id) = &wallet_id {
-            text(id, "identity.wallet_id", true)?;
-            let digits = id
-                .replace("urn:", "")
-                .replace("uuid:", "")
-                .trim_matches(['{', '}'])
-                .replace('-', "");
-            if digits.len() != 32 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ConfigError::new(
-                    "identity.wallet_id",
-                    "expected a wallet UUID",
-                ));
-            }
-        }
         Ok(Self {
             provider_id,
             wallet_address,
-            wallet_id,
         })
     }
     pub fn provider_id(&self) -> U256 {
@@ -408,9 +388,6 @@ impl ProviderIdentityConfig {
     }
     pub fn wallet_address(&self) -> Address {
         self.wallet_address
-    }
-    pub fn wallet_id(&self) -> Option<&str> {
-        self.wallet_id.as_deref()
     }
 }
 
@@ -903,10 +880,7 @@ impl ProviderConfig {
             &self.settlement,
             self.listen.as_ref(),
         );
-        let mut identity = json!({"provider_id": self.identity.provider_id().to_string(), "wallet_address": format!("{:#x}", self.identity.wallet_address())});
-        if let Some(id) = self.identity.wallet_id() {
-            identity["wallet_id"] = json!(id);
-        }
+        let identity = json!({"provider_id": self.identity.provider_id().to_string(), "wallet_address": format!("{:#x}", self.identity.wallet_address())});
         value["identity"] = identity;
         value
     }
@@ -1221,7 +1195,7 @@ fn parse_parts(
             let i = object(
                 value,
                 "identity",
-                &["provider_id", "wallet_address", "wallet_id"],
+                &["provider_id", "wallet_address"],
                 &["provider_id", "wallet_address"],
             )?;
             let provider_id = match &i["provider_id"] {
@@ -1234,7 +1208,6 @@ fn parse_parts(
             Some(ProviderIdentityConfig::new(
                 provider_id,
                 address(&i["wallet_address"], "identity.wallet_address")?,
-                optional_string(i, "wallet_id", "identity.wallet_id")?,
             )?)
         }
         None if require_identity => return Err(ConfigError::new("identity", "missing field")),

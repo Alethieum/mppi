@@ -4,13 +4,12 @@ Start with the [agent quickstart](agent-quickstart.md) or
 [provider quickstart](provider-quickstart.md) for built-in Circle setup. This page
 documents custom wallet and application composition.
 
-The Python packages include agent onboarding, ERC-8004 registration helpers and
-wallet adapters. Live Arc testnet checks have verified Circle Agent Wallet
-CLI 1.1.4 and Circle developer-controlled SCA integration with separately
-installed agent and provider packages. The official deployment is Arc testnet;
-mainnet has separate release requirements. Built-in setup uses a packaged official
-profile. Explicit integrations below supply their own trusted profile. Python
-and Rust providers use the same native onboarding CLI.
+Python agent and provider `0.1.2` share the Circle Agent Wallet adapter from
+`mppi-protocol==0.1.1`. Both built-in setup paths select the packaged official
+profile for the requested network. Explicit integrations below supply their own
+trusted profile. Python and Rust providers use the same native onboarding CLI.
+The [versioned testnet release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
+preserves the earlier wallet integrations and their exact acceptance scope.
 
 MPPI handles payment messages and evidence. The provider supplies token counts,
 execution, final reports, hosting, TLS and its own state management.
@@ -23,10 +22,10 @@ explicit capabilities.
 Install your role into a Python 3.12+ environment:
 
 ```sh
-uv pip install 'mppi-agent==0.1.1'
+uv pip install 'mppi-agent==0.1.2'
 ```
 
-The provider environment installs `mppi-provider==0.1.1`. The shared protocol
+The provider environment installs `mppi-provider==0.1.2`. The shared protocol
 dependency installs automatically. Neither role needs the other role's package.
 For source development, see the [build guide](build.md).
 
@@ -123,13 +122,13 @@ pass its recoverable reference to `Client`.
 
 ### Circle Agent Wallet adapter
 
-`mppi_agent.circle.CircleAgentWallet` uses the unmodified Circle CLI `1.1.4`.
+`mppi_protocol.circle.CircleAgentWallet` uses the unmodified Circle CLI `1.1.4`.
 It accepts a `ChainReader`, an explicitly trusted `CodePin` for the funding SCA,
 a second pin for its implementation, and its own local operation journal:
 
 ```python
 from pathlib import Path
-from mppi_agent.circle import CircleAgentWallet
+from mppi_protocol.circle import CircleAgentWallet
 
 wallet = CircleAgentWallet(
     chain=chain_reader,
@@ -151,8 +150,10 @@ The adapter passes the exact target and calldata through the account's
 `execute(address,uint256,bytes)` function with zero native value. It retains a
 stable key and exact intent before invoking the CLI. Funding signatures remain
 the original Circle signature bytes; MPPI's fixed ECDSA signer stays separate.
-This route has passed live Arc testnet registration, funding and payment checks
-through the real Circle service with a deployed, pinned SCA.
+The earlier agent integration passed the versioned live Arc testnet registration,
+funding and payment checks with a deployed, pinned SCA. The
+[supported wallet pins](agent-quickstart.md#supported-wallet-versions) distinguish
+that account generation from mainnet.
 
 CLI reconciliation uses only the original retained transaction ID and matching
 call fields. If the execute response is lost before an ID is saved, the public
@@ -162,52 +163,39 @@ retry. Resolve the original operation with the wallet service first.
 
 The journal permits 4,096 retained operations; exceeding that bound stops new
 submissions. Calls are limited to 60 KiB of calldata to fit the reviewed CLI
-transport. Each command has bounded output and a default 240-second timeout;
-read-only reconciliation examines at most 20 pages. These are adapter limits,
+transport. Each command has bounded output. Read-only commands have a default
+240-second timeout, and reconciliation examines at most 20 pages. Execute and
+sign commands drain to completion without a timeout kill. These are adapter limits,
 not new protocol limits. The `command`, `timeout_seconds` and `max_pages`
 constructor parameters configure its trusted executable and bounded processing.
 
 ## Provider wallet integration
 
 The built-in `await Mppi.from_config(...)` path loads the confirmed operator from
-`mppi.toml` and reads its Circle credentials from your environment. Use the
-[provider quickstart](provider-quickstart.md) for that path. The explicit adapter
-below supports applications composing their own capabilities.
+`mppi.toml`, verifies its selected deployment and account, and restores the native
+onboarding journal at `mppi.toml.wallet-operations.json`. It uses the authenticated
+Circle CLI. Start with the [provider quickstart](provider-quickstart.md).
 
-The provider operator uses a Circle **developer-controlled SCA**, with a separate
-receive-only payout recipient. Circle Agent Wallet login is a different product.
-Follow the [developer-wallet setup](https://developers.circle.com/wallets/dev-controlled/create-your-first-wallet)
-with `accountType: "SCA"`, retain its wallet ID/address, and configure Circle Gas
-Station for the selected network. Supply the API key and registered entity
-secret through environment or secret storage.
+Explicit provider integrations use the same `mppi_protocol.circle.CircleAgentWallet`
+constructor shown above, with the provider operator's pins and journal. Set
+`require_existing=True` when restoring an onboarded wallet. Its operator must
+match the configuration and differ from the receive-only payout recipient.
+Recipient proof signing stays outside the serving process. Separate wallet
+addresses under one Circle account still share account custody.
 
-```python
-import os
-from mppi_protocol.circle import CircleDeveloperWallet
-from mppi_protocol.discovery import parse_address
+Circle owns login and its 28-day session renewal. Agent Wallet transaction gas
+is sponsored subject to caps and fair use; see Circle's
+[authentication](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/authenticate)
+and [fees](https://developers.circle.com/agent-stack/agent-wallets/fees).
 
-wallet = CircleDeveloperWallet(
-    api_key=os.environ["CIRCLE_API_KEY"],
-    entity_secret=bytes.fromhex(os.environ["CIRCLE_ENTITY_SECRET"]),
-    wallet_id=os.environ["CIRCLE_WALLET_ID"],
-    address=parse_address(os.environ["CIRCLE_WALLET_ADDRESS"]),
-    chain_id=5042002,
-)
-wallet.verify_wallet()  # Read-only SCA, network, custody and address checks.
-```
-
-Pass this wallet to `Mppi`. It sends exact raw calldata through Circle's
-[contract-execution API](https://developers.circle.com/api-reference/wallets/developer-controlled-wallets/create-developer-transaction-contract-execution),
-using a stable idempotency key and reference derived from the retained operation
-reference. Each authorized request uses fresh entity-secret ciphertext.
-Credentials are excluded from its representation and error messages.
-
-Service acceptance is pending evidence, including Circle `COMPLETE`. The MPPI
-runtime independently reconciles the intended contract events and state.
-`reconcile(operation_ref=...)` only reads Circle records. Preserve operation
-references and returned handles through your existing integration. After an
-unknown outcome, reconcile; do not create a replacement operation. The adapter
-provides no storage backend, wallet provisioning or automatic transaction retry.
+`execute` sends exact calldata through the supported SCA using the official
+[contract execution command](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/execute-contract).
+The shared journal retains exact intent before submission and uses only the
+original returned transaction ID for read-only reconciliation. Circle service
+state alone does not confirm MPPI payment; the runtime independently verifies
+canonical contract events and state. An unknown outcome remains attached to its
+original operation. The adapter provides no provider storage service or automatic
+transaction retry.
 
 ## Provider registration and publication
 

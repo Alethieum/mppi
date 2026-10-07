@@ -18,8 +18,10 @@ Start with the [agent quickstart](docs/agent-quickstart.md) to onboard a wallet
 and make paid inference requests. Providers start with the
 [provider quickstart](docs/provider-quickstart.md) to initialize declarations,
 onboard and attach MPPI to their existing gateway. Agent and provider SDKs are
-version `0.1.1`; the shared protocol package remains `0.1.0`. Both quickstarts
-select the packaged official Arc testnet profile. Explicit
+version `0.1.2`, sharing Python protocol package `0.1.1`. The built-in wallet
+integration uses Circle Agent Wallet for both roles.
+Both quickstarts select the packaged official Arc testnet profile and document
+explicit mainnet selection. Explicit
 [trusted deployment profiles](docs/deployment.md#trusted-profile-file) remain
 supported. The [API map](docs/sdk-interfaces.md#api-reference-map)
 links the implemented interfaces, lifecycle hooks and public conformance tests.
@@ -47,8 +49,8 @@ calls and canonical evidence. The Python SDKs implement native paid request
 services, chain freshness, provider reporting, agent streaming and actual-usage
 capture/close, supplied-history recovery and ordered batch collection. The MPPI
 contract and its Foundry suites are implemented. Python onboarding, registry
-bindings and wallet adapters have passed live Arc testnet onboarding and payment
-checks with Circle Agent Wallet and developer-controlled wallets. Rust provides
+bindings and wallet adapters in the versioned `0.1.0` release passed live Arc
+testnet onboarding and payment checks with that release's Circle wallet integrations. Rust provides
 the same exact amount, catalog and provider-report calculations, validated
 configuration/discovery, chain evidence and explicit contract operations. Its
 native paid runtime supports authenticated admission, provider reports and

@@ -24,8 +24,7 @@ fn setup_declarations_are_valid_without_an_identity_and_zero_remains_valid() {
     values.as_object_mut().unwrap().remove("identity");
     let declarations = ProviderDeclarations::from_mapping(&values).unwrap();
     assert!(ProviderConfig::from_mapping(&values, None).is_err());
-    let identity =
-        ProviderIdentityConfig::new(U256::ZERO, Address::repeat_byte(0x31), None).unwrap();
+    let identity = ProviderIdentityConfig::new(U256::ZERO, Address::repeat_byte(0x31)).unwrap();
     let config = declarations.with_identity(identity).unwrap();
     assert_eq!(config.identity().provider_id(), U256::ZERO);
     assert_eq!(

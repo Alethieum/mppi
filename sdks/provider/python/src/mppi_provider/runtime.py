@@ -317,12 +317,14 @@ class Mppi:
     ) -> Mppi:
         """Compose verified SDK adapters on the host's serving event loop.
 
-        ``testnet=True`` selects the packaged official Arc testnet profile when
-        ``profile`` is omitted. Mainnet requires an explicitly trusted profile.
+        An omitted ``profile`` selects the packaged official Arc profile:
+        mainnet when ``testnet=False``, testnet when ``testnet=True``.
+        An explicit ``profile`` is a caller-trusted deployment override.
         Network selection must match both the profile and confirmed TOML config.
-        Circle credentials come from CIRCLE_API_KEY and CIRCLE_ENTITY_SECRET
-        (64 hex characters). ``rpc_env`` selects an RPC URL from the provider's
-        secret environment; otherwise the validated config's RPC URL is used.
+        Circle uses the authenticated official CLI and the original native
+        onboarding wallet-operation record beside the config. ``rpc_env`` selects
+        an RPC URL from the provider's environment; otherwise the validated
+        config's RPC URL is used.
 
         Only configuration and remote reads occur. Call ``start`` explicitly
         from the host lifecycle; the provider owns hosting, execution,

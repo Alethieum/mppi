@@ -147,3 +147,35 @@ def test_testnet_does_not_supply_rpc_or_deployment_defaults(monkeypatch, tmp_pat
         )
     assert error.value.code == 2
     assert "--profile" in capsys.readouterr().err
+
+
+def test_mainnet_requires_matching_profile_before_wallet_or_rpc(monkeypatch, tmp_path, capsys):
+    args, calls = setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli.importlib, "import_module", lambda module: pytest.fail("must not import wallet")
+    )
+    monkeypatch.setattr(cli, "HttpJsonRpc", lambda url: pytest.fail("must not open RPC"))
+    assert cli.main(args + ["--mainnet"]) == 1
+    assert calls == []
+    assert "requires an Arc mainnet deployment profile" in capsys.readouterr().err
+
+
+def test_explicit_mainnet_uses_trusted_profile_and_rpc(monkeypatch, tmp_path, capsys):
+    args, calls = setup(monkeypatch, tmp_path, chain_id=5042)
+    assert cli.main(args + ["--mainnet"]) == 0
+    assert len(calls) == 1 and capsys.readouterr().err == ""
+
+
+def test_network_flags_are_mutually_exclusive_before_wallet_access(monkeypatch, tmp_path, capsys):
+    args, calls = setup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as error:
+        cli.main(args + ["--mainnet", "--testnet"])
+    assert error.value.code == 2 and calls == []
+    assert "not allowed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("network", ["--testnet", "--mainnet"])
+def test_builtin_requires_wallet_before_setup(monkeypatch, capsys, network):
+    monkeypatch.setattr(cli, "onboard_circle", lambda *args, **kw: pytest.fail("must not set up"))
+    assert cli.main(["onboard", network]) == 1
+    assert "--wallet ADDRESS" in capsys.readouterr().err

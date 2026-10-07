@@ -44,6 +44,7 @@ def main() -> None:
     public = Path(__file__).resolve().parents[1]
     license_text = (public / "LICENSE").read_bytes()
     testnet_profile = (public / "deployments/arc-testnet.json").read_bytes()
+    mainnet_profile = (public / "deployments/arc-mainnet.json").read_bytes()
     for wheel in wheels:
         check_wheel(wheel, license_text)
     for sdist in sdists:
@@ -80,11 +81,12 @@ from importlib.resources import files
 assert find_spec('mppi_{opposite}') is None
 import mppi_{role}
 assert files('mppi_{role}').joinpath('arc-testnet.json').read_bytes() == {testnet_profile!r}
+assert files('mppi_{role}').joinpath('arc-mainnet.json').read_bytes() == {mainnet_profile!r}
 from mppi.v1 import mppi_pb2, mppi_pb2_grpc
 from mppi_protocol.chain import ChainReader, HttpJsonRpc
 from mppi_protocol.follower import ChainFollower
 from mppi_protocol.contract import ContractCalls, decode_result, encode_call
-from mppi_protocol.circle import CircleDeveloperWallet
+from mppi_protocol.circle import CircleAgentWallet
 from mppi_protocol.deployment import profile_from_mapping, profile_to_mapping
 from mppi_protocol.registry import RegistryCalls, RegistryReader
 from mppi_protocol.signing import LocalSessionSigner, session_id, verify_voucher

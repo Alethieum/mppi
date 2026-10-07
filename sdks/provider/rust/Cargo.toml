@@ -1,6 +1,6 @@
 [package]
 name = "mppi-provider"
-version = "0.1.1"
+version = "0.1.2"
 license = "Apache-2.0"
 edition = "2024"
 rust-version = "1.95"
@@ -13,9 +13,7 @@ default = []
 codegen = ["dep:tonic-prost-build"]
 
 [dependencies]
-aws-lc-rs = "=1.18.1"
 axum = { version = "=0.8.9", default-features = false }
-base64 = "=0.23.1"
 zeroize = "=1.9.0"
 alloy-primitives = { version = "=1.7.3", features = ["k256"] }
 alloy-sol-types = "=1.7.3"
@@ -25,6 +23,7 @@ serde_json = { version = "=1.0.151", features = ["unbounded_depth", "arbitrary_p
 futures-core = "=0.3.34"
 getrandom = "=0.4.3"
 http-body = "=1.1.0"
+libc = "=0.2.189"
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 tokio = { version = "=1.53.1", features = ["sync", "time", "rt", "macros"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }

@@ -16,6 +16,21 @@ fn official_testnet_profile_is_packaged_with_exact_release_bytes() {
     assert_eq!(official, release);
     assert_eq!(official.domain().chain_id(), 5_042_002);
 }
+#[test]
+fn official_mainnet_profile_is_packaged_with_exact_release_bytes() {
+    assert_eq!(
+        include_bytes!("../src/arc-mainnet.json").as_slice(),
+        include_bytes!("../../../../deployments/arc-mainnet.json").as_slice(),
+    );
+    let official = mppi_provider::deployment::official_mainnet_profile().unwrap();
+    let release = load_profile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../deployments/arc-mainnet.json"
+    ))
+    .unwrap();
+    assert_eq!(official, release);
+    assert_eq!(official.domain().chain_id(), 5042);
+}
 fn profile() -> Value {
     let pin = |n: u8| json!({"address":format!("0x{}",format!("{n:02x}").repeat(20)),"code_hash":format!("0x{}",format!("{:02x}",n+1).repeat(32))});
     json!({"version":1,"chain_id":5042002,"proxy":pin(1),"implementation":pin(3),"registry":pin(5),"registry_implementation":pin(7)})

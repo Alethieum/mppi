@@ -224,7 +224,9 @@ impl Rpc for MockRpc {
                         assert_eq!(params[0]["from"], hx(owner()));
                         assert_eq!(params[0]["value"], "0x0");
                         return Ok(json!(hx(
-                            if raw[..4] == keccak256("register(string)")[..4] {
+                            if raw[..4] == keccak256("register(string)")[..4]
+                                || raw[..4] == keccak256("register()")[..4]
+                            {
                                 word(0u64)
                             } else {
                                 vec![]
@@ -802,7 +804,6 @@ impl TestDir {
     fn options(&self) -> OnboardingOptions {
         OnboardingOptions {
             state_path: self.0.join("setup.json"),
-            wallet_id: None,
             adopted_identity: None,
             recipient_proof: None,
         }
@@ -871,8 +872,9 @@ impl SetupWallet {
     fn apply(&self, call: &WalletCall) {
         let raw = call.data();
         self.rpc.edit(|s|{
-            let events=if raw[..4]==keccak256("register(string)")[..4] {
-                s.wallet=owner();s.uri=URI.as_bytes().to_vec();s.catalog=vec![];registration_logs()
+            let events=if raw[..4]==keccak256("register()")[..4] {
+                s.wallet=owner();s.uri=vec![];s.catalog=vec![];
+                let mut logs=registration_logs();logs[1]["data"]=json!(hx(dynamic(b"")));logs
             } else if raw[..4]==keccak256("setAgentWallet(uint256,address,uint256,bytes)")[..4] {
                 let retained:Value=serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
                 if retained["kind"]=="mppi-provider-onboarding" {assert!(s.catalog.is_empty(),"initial catalog must follow recipient");}
@@ -1052,7 +1054,7 @@ async fn onboarding_registers_then_exports_proof_and_publishes_catalog_last() {
         .await
         .unwrap();
     assert_eq!(complete.progress(), OnboardingProgress::Complete);
-    assert_eq!(wallet.write_count(), 3);
+    assert_eq!(wallet.write_count(), 4);
     assert_eq!(
         complete.config().unwrap().identity().provider_id(),
         U256::ZERO
@@ -1064,7 +1066,7 @@ async fn onboarding_registers_then_exports_proof_and_publishes_catalog_last() {
         .unwrap();
     assert_eq!(rerun.progress(), OnboardingProgress::Complete);
     assert!(!rerun.submitted());
-    assert_eq!(wallet.write_count(), 3);
+    assert_eq!(wallet.write_count(), 4);
     assert_eq!(std::fs::read(dir.options().state_path).unwrap(), before);
 }
 
@@ -1165,7 +1167,7 @@ async fn recipient_proof_must_match_export_and_completed_binding_needs_no_signat
         .await
         .unwrap();
     assert_eq!(complete.progress(), OnboardingProgress::Complete);
-    assert_eq!(wallet.write_count(), 2);
+    assert_eq!(wallet.write_count(), 3);
 }
 
 #[tokio::test]
@@ -1454,7 +1456,7 @@ use mppi_provider::{
 };
 fn configured() -> ProviderConfig {
     declarations()
-        .with_identity(ProviderIdentityConfig::new(U256::ZERO, owner(), None).unwrap())
+        .with_identity(ProviderIdentityConfig::new(U256::ZERO, owner()).unwrap())
         .unwrap()
 }
 fn update_options(dir: &TestDir) -> UpdateOptions {
@@ -1949,7 +1951,7 @@ async fn expired_imported_recipient_proof_cannot_submit_but_bound_recipient_need
         .await
         .unwrap();
     assert_eq!(complete.progress(), OnboardingProgress::Complete);
-    assert_eq!(wallet.write_count(), 2);
+    assert_eq!(wallet.write_count(), 3);
 }
 
 #[tokio::test]

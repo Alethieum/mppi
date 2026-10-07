@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn, cast
 from urllib.parse import urlsplit
-from uuid import UUID
 
 from mppi_protocol import Catalog, CatalogRow, Rates, publish_catalog
 from mppi_protocol.amounts import decimal_uint64, uint64
@@ -243,7 +242,6 @@ class ProviderDetails:
 class ProviderIdentityConfig:
     provider_id: int
     wallet_address: bytes
-    wallet_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -253,11 +251,6 @@ class ProviderIdentityConfig:
         object.__setattr__(
             self, "wallet_address", _address(self.wallet_address, "identity.wallet_address")
         )
-        if self.wallet_id is not None:
-            try:
-                UUID(_text(self.wallet_id, "identity.wallet_id", nonempty=True))
-            except ValueError:
-                _fail("identity.wallet_id", "expected a wallet UUID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,7 +537,7 @@ def _parse_config(values: dict[str, object]) -> ProviderConfig:
     identity = _object(
         values["identity"],
         "identity",
-        {"provider_id", "wallet_address", "wallet_id"},
+        {"provider_id", "wallet_address"},
         {"provider_id", "wallet_address"},
     )
     chain = _object(values["chain"], "chain", {"network", "rpc", "max_age_ms"}, {"max_age_ms"})
@@ -642,7 +635,6 @@ def _parse_config(values: dict[str, object]) -> ProviderConfig:
         identity=ProviderIdentityConfig(
             provider_id=cast(int, identifier),
             wallet_address=_address(identity["wallet_address"], "identity.wallet_address"),
-            wallet_id=cast(str | None, identity.get("wallet_id")),
         ),
         chain=ChainConfig(**chain),  # type: ignore[arg-type]
         upstream=UpstreamConfig(**upstream),  # type: ignore[arg-type]

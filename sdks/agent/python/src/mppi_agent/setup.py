@@ -1,9 +1,13 @@
-"""Installed Circle onboarding and client composition for official Arc testnet.
+"""Installed Circle onboarding and client composition with explicit Arc selection.
 
 The SDK supplies reviewed public deployment/account pins. RPC observations are
 compared with them, never promoted into trust anchors. Wallet custody remains
 with Circle; the separate local session credential authorizes MPPI vouchers.
 Sources and supported account version: docs/agent-quickstart.md.
+Network identifiers and separate Circle login sessions verified 2026-10-06:
+https://developers.circle.com/agent-stack/agent-wallets/supported-blockchains
+https://developers.circle.com/agent-stack/agent-wallets/quickstart
+RPC selections: https://docs.arc.io/arc/references/connect-to-arc
 """
 
 from __future__ import annotations
@@ -16,7 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mppi_protocol.amounts import uint64
-from mppi_protocol.chain import ChainReader, CodePin, HttpJsonRpc
+from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile, HttpJsonRpc
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError, supported_account_pins
 from mppi_protocol.contract import (
     ARC_USDC,
     ContractCalls,
@@ -30,7 +35,6 @@ from mppi_protocol.registry import RegistryReader
 from mppi_protocol.types import uint256
 
 from .checkpoint import Checkpoint
-from .circle import CircleAgentWallet
 from .credentials import create_session_signer, load_session_signer, private_directory
 from .onboarding import OnboardingError, OnboardingResult, onboard
 
@@ -39,39 +43,57 @@ if TYPE_CHECKING:
 
 DEFAULT_CONFIG = Path(".mppi/agent.json")
 DEFAULT_RPC_ENV = "ARC_RPC_URL_TESTNET"
+MAINNET_RPC_ENV = "ARC_RPC_URL_MAINNET"
 # Public endpoint documented at docs.arc.io/arc/references/connect-to-arc.
 DEFAULT_RPC = "https://rpc.blockdaemon.testnet.arc.io"
+_MAINNET_RPC = "https://rpc.blockdaemon.mainnet.arc.io"
 # circle.py:CircleAgentWallet gives each CLI command 240 seconds. Reserve another
 # 60 seconds for wallet/code verification and reconciliation around that command;
 # this operation budget does not extend chain freshness or collection deadlines.
 _CIRCLE_OPERATION_TIMEOUT_MS = 300_000
-_PROXY_HASH = bytes.fromhex("d09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66")
-_IMPLEMENTATION = CodePin(
-    bytes.fromhex("895b96c92d1007872fe1f70606e6b7eeaebd620e"),
-    bytes.fromhex("3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa"),
-)
 
 
 def _path(config: Path, suffix: str) -> Path:
     return config.with_name(config.name + suffix)
 
 
-def _profile() -> dict[str, Any]:
-    return parse_document(files("mppi_agent").joinpath("arc-testnet.json").read_bytes())
+def _profile(*, testnet: bool = True, profile: DeploymentProfile | None = None) -> dict[str, Any]:
+    if type(testnet) is not bool:
+        raise OnboardingError("testnet must be an explicit boolean")
+    if profile is None:
+        name = "arc-testnet.json" if testnet else "arc-mainnet.json"
+        return parse_document(files("mppi_agent").joinpath(name).read_bytes())
+    if not isinstance(profile, DeploymentProfile) or profile.domain.chain_id != (
+        5042002 if testnet else 5042
+    ):
+        raise OnboardingError("deployment profile differs from the selected network")
+    return profile_to_mapping(profile)
 
 
-def _rpc(env_name: str) -> HttpJsonRpc:
+def _account_pins(chain_id: int) -> tuple[bytes, CodePin]:
+    try:
+        return supported_account_pins(chain_id)
+    except CircleAgentWalletError:
+        raise OnboardingError(
+            "verified Circle account pins are unavailable for this network"
+        ) from None
+
+
+def _rpc(env_name: str, *, chain_id: int = 5042002) -> HttpJsonRpc:
     if type(env_name) is not str or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name) is None:
         raise OnboardingError("RPC configuration must name an environment variable")
+    selected_default = DEFAULT_RPC_ENV if chain_id == 5042002 else MAINNET_RPC_ENV
+    if env_name in (DEFAULT_RPC_ENV, MAINNET_RPC_ENV) and env_name != selected_default:
+        raise OnboardingError("RPC environment selection differs from the selected network")
     endpoint = os.environ.get(env_name)
-    if endpoint is None and env_name == DEFAULT_RPC_ENV:
-        endpoint = DEFAULT_RPC
+    if endpoint is None and env_name == selected_default:
+        endpoint = DEFAULT_RPC if chain_id == 5042002 else _MAINNET_RPC
     if not endpoint:
         raise OnboardingError("configure the selected Arc RPC environment variable")
     return HttpJsonRpc(endpoint)
 
 
-def _record(value: object) -> dict[str, Any]:
+def _record(value: object, profile: dict[str, Any]) -> dict[str, Any]:
     if type(value) is not dict or set(value) != {
         "version",
         "kind",
@@ -88,7 +110,7 @@ def _record(value: object) -> dict[str, Any]:
         type(value["version"]) is not int
         or value["version"] != 1
         or value["kind"] != "mppi-agent-setup"
-        or value["profile"] != _profile()
+        or value["profile"] != profile
         or type(value["initialized"]) is not bool
         or type(value["payments_initialized"]) is not bool
     ):
@@ -107,14 +129,16 @@ def _record(value: object) -> dict[str, Any]:
 
 
 def _reader(record: dict[str, Any]) -> ChainReader:
-    return ChainReader(_rpc(record["rpc_env"]), profile_from_mapping(record["profile"]))
+    profile = profile_from_mapping(record["profile"])
+    return ChainReader(_rpc(record["rpc_env"], chain_id=profile.domain.chain_id), profile)
 
 
 def _wallet(record: dict[str, Any], reader: ChainReader, config: Path) -> CircleAgentWallet:
+    proxy_hash, implementation = _account_pins(reader.profile.domain.chain_id)
     return CircleAgentWallet(
         chain=reader,
-        wallet=CodePin(parse_address(record["wallet"]), _PROXY_HASH),
-        implementation=_IMPLEMENTATION,
+        wallet=CodePin(parse_address(record["wallet"]), proxy_hash),
+        implementation=implementation,
         checkpoint_path=_path(config, ".wallet.json"),
         allow_registration_activation=True,
     )
@@ -156,16 +180,26 @@ def onboard_circle(
     wallet_address: str,
     *,
     config_path: Path = DEFAULT_CONFIG,
-    rpc_env: str = DEFAULT_RPC_ENV,
+    rpc_env: str | None = None,
     agent_id: int | None = None,
+    testnet: bool = True,
+    profile: DeploymentProfile | None = None,
 ) -> SetupResult:
     """Prepare one supplied Circle wallet; reruns reconcile its original registration.
 
     Explicit invocation creates a separate private session credential exactly
     once. It never funds escrow, replenishes a wallet, or starts inference.
+    Testnet remains the default. ``testnet=False`` selects the packaged mainnet
+    deployment and mainnet RPC environment. Explicit trusted profiles and RPC
+    overrides remain supported. Each retained setup belongs to one exact
+    deployment; it cannot switch networks.
     """
     address = parse_address(wallet_address)
-    _rpc(rpc_env)  # Validate local selection before creating any retained setup.
+    selected = _profile(testnet=testnet, profile=profile)
+    _account_pins(selected["chain_id"])
+    if rpc_env is None:
+        rpc_env = DEFAULT_RPC_ENV if testnet else MAINNET_RPC_ENV
+    _rpc(rpc_env, chain_id=selected["chain_id"])  # Validate before retained setup.
     if agent_id is not None:
         uint256(agent_id, field="agent identity")
     config = Path(config_path).absolute()
@@ -188,7 +222,7 @@ def onboard_circle(
             saved = {
                 "version": 1,
                 "kind": "mppi-agent-setup",
-                "profile": _profile(),
+                "profile": selected,
                 "wallet": address_hex(address),
                 "rpc_env": rpc_env,
                 "signer_address": None,
@@ -203,7 +237,7 @@ def onboard_circle(
             initial_wallet.verify_registration_wallet()
             _verify_usdc(initial_reader)
             state.save(saved)
-        record = _record(saved)
+        record = _record(saved, selected)
         if record["wallet"] != address_hex(address) or record["rpc_env"] != rpc_env:
             raise OnboardingError("reuse the original wallet and RPC selection for this setup")
         if agent_id is not None:
@@ -269,22 +303,27 @@ def client_from_config(
     config_path: Path = DEFAULT_CONFIG,
     initial_session_tokens: int | None = None,
     ca_file: str | None = None,
+    testnet: bool = True,
+    profile: DeploymentProfile | None = None,
 ) -> Client:
     """Compose the installed client from completed onboarding without new wallet writes.
 
     One stable payment checkpoint belongs to this setup. Its existing provider,
     signer and pending-operation guards apply unchanged. Funding is explicit.
+    Select the same network and trusted deployment used during onboarding.
     """
     from .client import Client
 
     if initial_session_tokens is not None:
         uint64(initial_session_tokens, field="initial_session_tokens", positive=True)
+    selected = _profile(testnet=testnet, profile=profile)
+    _account_pins(selected["chain_id"])
     config = Path(config_path).absolute()
     with private_directory(config.parent):
         pass
     state = Checkpoint(config)
     try:
-        record = _record(state.load())
+        record = _record(state.load(), selected)
         if not record["initialized"] or record["agent_id"] is None:
             raise OnboardingError("complete mppi-agent onboard before creating a client")
         for suffix in (".identity.json", ".wallet.json"):

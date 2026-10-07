@@ -6,11 +6,12 @@ It is not another role SDK.
 
 The implementation validates catalogs and report transitions, computes exact
 amounts, signs and verifies fixed-session proofs, prepares contract calls and
-checks canonical receipt evidence. It also supplies shared discovery validation.
+checks canonical receipt evidence. Version `0.1.1` also supplies shared discovery
+validation and the Circle Agent Wallet adapter used by both Python roles.
 These building blocks do not authorize inference or store provider state.
 
 See [the SDK interfaces](../../docs/sdk-interfaces.md) for the implemented surface
-and the remaining runtime work.
+and runtime integration boundaries.
 
 The [runtime reference](../../docs/python-runtime.md) describes the implemented
 trust boundaries, dependency adapters and evidence limitations.

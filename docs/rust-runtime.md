@@ -7,15 +7,17 @@ listener, TLS, inference gateway, token counts and retained payment history.
 
 The runtime implements live-session payment handling, supplied-history recovery
 and ordered batch collection. Start with the ordered
-[provider quickstart](provider-quickstart.md). The `0.1.1` composition helper
-uses the packaged official Arc testnet profile or an explicit trusted profile.
+[provider quickstart](provider-quickstart.md). Version `0.1.2` selects a packaged
+official mainnet or testnet profile from the resolved configuration network; an
+explicit trusted profile is also supported.
 
 ## Compose a provider host
 
 After onboarding, your executable loads the saved configuration using
 `cli::host_configuration(std::env::args_os().skip(1))`. It accepts the arguments
-forwarded by `mppi provider serve`, including `--testnet` for the packaged official
-profile, an optional explicit `--profile`, and the RPC environment-variable name.
+forwarded by `mppi provider serve`, including optional `--mainnet` / `--testnet`
+network overrides, an optional explicit `--profile`, and the RPC environment-variable
+name. Without a network flag it uses the saved configuration network.
 Keep the validated listener settings before moving the host configuration.
 
 Use the SDK's composition helper in your provider host:
@@ -23,7 +25,6 @@ Use the SDK's composition helper in your provider host:
 ```rust
 use std::{path::Path, sync::Arc};
 use mppi_provider::{
-    circle::CircleCredentials,
     cli::HostConfiguration,
     interfaces::{CoverageProvider, ExecutionProvider},
     runtime::Mppi,
@@ -32,22 +33,20 @@ use mppi_provider::{
 
 pub async fn compose(
     host: HostConfiguration,
-    credentials: CircleCredentials,
     operation_record: &Path,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
 ) -> Result<Arc<Mppi>, SetupError> {
     Ok(Arc::new(setup::runtime_from_config(
-        host, credentials, operation_record, coverage, execution,
+        host, operation_record, coverage, execution,
     ).await?))
 }
 ```
 
-Construct `CircleCredentials` using your secret manager's API-key value and
-decoded 32-byte registered entity secret. Use the retained onboarding wallet
+Use the authenticated Circle Agent Wallet CLI `1.1.4` and the retained onboarding
 operation record: for `mppi.toml`, this is `mppi.toml.wallet-operations.json`.
-Do not select a new record to replace an unresolved operation. Keep credentials
-out of configuration, command arguments and logs.
+Do not select a new record to replace an unresolved operation. Circle login and
+renewal stay with the operator; keep its authentication state outside MPPI config.
 
 The helper checks the existing Circle operator against the saved identity,
 verifies deployment and USDC domain evidence, constructs the chain follower with
@@ -55,7 +54,9 @@ the configuration's freshness and collection margin, and supplies contract calls
 It creates no wallet and starts neither the runtime nor a listener. Advanced
 integrations can still construct `Mppi::new` with their own wallet and chain capabilities.
 `setup::runtime_from_config_with_options(..., RuntimeOptions)` accepts explicit
-Circle timeouts, follower polling, runtime limits and lifecycle hooks.
+`CircleOptions`, follower polling, runtime limits and lifecycle hooks.
+`CircleOptions` selects a trusted executable prefix, read timeout and history-page
+bound. Runtime composition requires an existing wallet-operation record.
 
 Your coverage and execution implementations supply upstream calls, token
 measurements, job termination and final reports. Declaring `upstream.url` alone

@@ -1,19 +1,19 @@
 # MPPI provider SDK for Python
 
-Version `0.1.1` supplies validated configuration, discovery, exact payment
+Version `0.1.2` supports explicit Arc mainnet and testnet selection with validated configuration, discovery, exact payment
 arithmetic, canonical chain evidence and native Complete/Control services.
 `await Mppi.from_config(...)` composes these services from the native CLI's saved
-configuration, the packaged official Arc testnet profile and the existing Circle
-operator. The provider owns its inference integration and hosting.
+configuration, the packaged official Arc profile for the selected network and
+the existing Circle operator. The provider owns its inference integration and hosting.
 
 ```sh
-uv pip install 'mppi-provider==0.1.1'
+uv pip install 'mppi-provider==0.1.2'
 ```
 
 Start with the [provider quickstart](../../../docs/provider-quickstart.md) to
 install the native CLI, generate declarations, onboard and attach the SDK.
 Linux ARM64 has a native CLI release binary; Python providers use that same CLI
-for wallet setup, recipient binding and catalog publication. The quickstart also
+for wallet selection, recipient binding and catalog publication. The quickstart also
 covers a locked Cargo source build. The shared protocol dependency installs
 automatically with this Python package.
 
@@ -58,8 +58,9 @@ sdk = await Mppi.from_config(
 ```
 
 Run this on the serving event loop. The helper verifies the saved operator and
-selected deployment, reads `CIRCLE_API_KEY` and `CIRCLE_ENTITY_SECRET` from the
-environment, and constructs the wallet, chain follower and contract calls.
+selected deployment, uses the authenticated Circle Agent Wallet CLI and the
+original onboarding wallet-operation record, and constructs the wallet, chain
+follower and contract calls.
 `rpc_env="ARC_RPC_URL_TESTNET"` selects a trusted RPC environment variable;
 `profile=load_profile(Path("trusted-profile.json"))` selects an explicit
 trusted profile using `mppi_protocol.deployment.load_profile`. With
@@ -159,9 +160,9 @@ creates generation one; generation-zero snapshots are never valid on Control.
 
 Wallet adapters must durably bind an operation reference to its exact intended
 call and retain available wallet/transaction identifiers. These requirements do
-not add a provider database. The agent SDK supplies its own local checkpoint.
-The shared Circle developer-controlled wallet adapter and registry helpers
-provide the implemented onboarding and submission integration described above.
+not add a provider database. The shared Circle Agent Wallet adapter retains its
+wallet-operation record, while each application owns its payment-state retention.
+The native CLI and registry helpers provide onboarding and submission.
 
 ## Lifecycle observers
 

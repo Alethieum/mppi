@@ -40,6 +40,10 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
         license_file = package.extractfile(f"mppi-provider-{VERSION}/LICENSE")
         assert license_file is not None
         assert license_file.read() == (ROOT / "LICENSE").read_bytes()
+        for network in ("mainnet", "testnet"):
+            profile = package.extractfile(f"mppi-provider-{VERSION}/src/arc-{network}.json")
+            assert profile is not None
+            assert profile.read() == (ROOT / f"deployments/arc-{network}.json").read_bytes()
         package.extractall(work / "source", filter="data")
     source = work / f"source/mppi-provider-{VERSION}"
     # Reuse compiled dependencies, but compile the installed executable from the
@@ -96,59 +100,33 @@ def test_installed_commands_reject_before_credentials_and_redact_arguments(insta
     assert not list(work.glob("*.json"))
 
 
-def test_installed_serve_directly_executes_explicit_provider_host(installed) -> None:
+@pytest.mark.parametrize("network", ["mainnet", "testnet"])
+@pytest.mark.parametrize("explicit_profile", [False, True])
+@pytest.mark.parametrize("network_override", [False, True])
+def test_installed_serve_directly_executes_explicit_provider_host(
+    installed, network: str, explicit_profile: bool, network_override: bool
+) -> None:
     binary, work = installed
     config = work / "provider config.toml"
-    config.write_text(
-        (ROOT / "examples/provider/mppi.toml").read_text()
-        + '\n[listen]\nbind="127.0.0.1:8443"\ntls_mode="ingress"\n'
-    )
-
-    def pin(value: int) -> dict[str, str]:
-        return {"address": "0x" + f"{value:02x}" * 20, "code_hash": "0x" + "ab" * 32}
-
+    content = (ROOT / "examples/provider/mppi.toml").read_text()
+    content = content.replace('network = "testnet"', f'network = "{network}"')
+    content += '\n[listen]\nbind="127.0.0.1:8443"\ntls_mode="ingress"\n'
+    config.write_text(content)
     profile = work / "profile.json"
-    profile.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "chain_id": 5042002,
-                "proxy": pin(1),
-                "implementation": pin(2),
-                "registry": pin(3),
-                "registry_implementation": pin(4),
-            }
-        )
-    )
+    profile.write_bytes((ROOT / f"deployments/arc-{network}.json").read_bytes())
     host = work / "provider host"
     host.write_text(
         "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(37)\n"
     )
     host.chmod(0o700)
-    result = run(
-        binary,
-        work,
-        "provider",
-        "serve",
-        "--config",
-        str(config),
-        "--profile",
-        str(profile),
-        "--host",
-        str(host),
-        "--upstream",
-        "http://localhost:8000/private/v1",
-        "--testnet",
-    )
+    expected = ["--config", str(config)]
+    if explicit_profile:
+        expected.extend(["--profile", str(profile)])
+    expected.extend(["--upstream", "http://localhost:8000/private/v1"])
+    if network_override:
+        expected.append(f"--{network}")
+    result = run(binary, work, "provider", "serve", *expected, "--host", str(host))
     assert result.returncode == 37
-    assert json.loads(result.stdout) == [
-        "--config",
-        str(config),
-        "--profile",
-        str(profile),
-        "--upstream",
-        "http://localhost:8000/private/v1",
-        "--testnet",
-    ]
-    assert 'url = "http://127.0.0.1:8080/v1"' in config.read_text()
+    assert json.loads(result.stdout) == expected
+    assert config.read_text() == content
     assert not list(work.glob("*.wallet-*.json"))

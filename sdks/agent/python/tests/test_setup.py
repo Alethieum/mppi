@@ -3,10 +3,12 @@
 import asyncio
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
+import mppi_protocol.circle as shared_circle
 import pytest
 from eth_abi import encode
 from eth_account.messages import encode_typed_data
@@ -18,6 +20,7 @@ from mppi_agent.credentials import CredentialError, load_session_signer
 from mppi_agent.onboarding import OnboardingError
 from mppi_protocol.chain import Block, ChainEvidenceError
 from mppi_protocol.contract import ARC_USDC
+from mppi_protocol.deployment import profile_from_mapping, profile_to_mapping
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.follower import ChainFollower
 from mppi_protocol.types import (
@@ -49,6 +52,7 @@ class Boundaries:
         self.rpc_urls = []
         self.reads = []
         self.wallets = []
+        self.wallet_pins = []
         self.usdc_name, self.usdc_version, self.usdc_decimals = "USDC", "2", 6
         self.separator = None
         owner = self
@@ -59,7 +63,10 @@ class Boundaries:
 
             def block(self):
                 return ChainObservation(
-                    5042002, self.profile.domain.verifying_contract, 10, b"b" * 32
+                    self.profile.domain.chain_id,
+                    self.profile.domain.verifying_contract,
+                    10,
+                    b"b" * 32,
                 )
 
             def verify_deployment(self, block):
@@ -76,7 +83,7 @@ class Boundaries:
                     domain_data={
                         "name": "USDC",
                         "version": "2",
-                        "chainId": 5042002,
+                        "chainId": self.profile.domain.chain_id,
                         "verifyingContract": "0x" + ARC_USDC.hex(),
                     },
                     message_types={"Check": [{"name": "value", "type": "uint256"}]},
@@ -138,6 +145,7 @@ class Boundaries:
         class Wallet:
             def __init__(self, *, chain, wallet, implementation, checkpoint_path, **kwargs):
                 owner.wallets.append(wallet.address)
+                owner.wallet_pins.append((wallet.code_hash, implementation))
                 self.chain, self.address, self.path = chain, wallet.address, checkpoint_path
                 self.journal = None
 
@@ -206,7 +214,7 @@ def boundary(monkeypatch, tmp_path):
     [
         ("rpc_env", "BAD-NAME"),
         ("rpc_env", ""),
-        ("rpc_env", None),
+        ("rpc_env", 1),
         ("agent_id", True),
         ("agent_id", -1),
         ("agent_id", 2**256),
@@ -554,15 +562,20 @@ def test_same_setup_excludes_concurrent_clients_and_releases_lock(boundary):
     assert len(boundary.submissions) == 1
 
 
-def test_bundled_profile_exactly_matches_public_deployment():
-    published = Path(__file__).resolve().parents[4] / "deployments" / "arc-testnet.json"
-    assert files("mppi_agent").joinpath("arc-testnet.json").read_bytes() == published.read_bytes()
+@pytest.mark.parametrize("testnet,chain_id", [(True, 5042002), (False, 5042)])
+def test_bundled_profile_exactly_matches_public_deployment(testnet, chain_id):
+    name = "arc-testnet.json" if testnet else "arc-mainnet.json"
+    published = Path(__file__).resolve().parents[4] / "deployments" / name
+    assert files("mppi_agent").joinpath(name).read_bytes() == published.read_bytes()
+    assert setup._profile(testnet=testnet) == json.loads(published.read_bytes())
+    assert setup._profile(testnet=testnet)["chain_id"] == chain_id
 
 
 @pytest.mark.parametrize("complete,exit_code", [(True, 0), (False, 2)])
 @pytest.mark.parametrize("explicit_config", [False, True])
+@pytest.mark.parametrize("testnet", [True, False])
 def test_builtin_cli_needs_no_wallet_factory_and_preserves_status(
-    monkeypatch, tmp_path, capsys, complete, exit_code, explicit_config
+    monkeypatch, tmp_path, capsys, complete, exit_code, explicit_config, testnet
 ):
     calls = []
 
@@ -584,7 +597,9 @@ def test_builtin_cli_needs_no_wallet_factory_and_preserves_status(
     monkeypatch.setattr(
         cli.importlib, "import_module", lambda name: pytest.fail("no factory needed")
     )
-    args = ["onboard", "--testnet", "--wallet", WALLET, "--agent-id", "0"]
+    network = "--testnet" if testnet else "--mainnet"
+    default_rpc_env = setup.DEFAULT_RPC_ENV if testnet else setup.MAINNET_RPC_ENV
+    args = ["onboard", network, "--wallet", WALLET, "--agent-id", "0"]
     selected = tmp_path / "agent.json" if explicit_config else setup.DEFAULT_CONFIG
     if explicit_config:
         args += ["--config", str(selected), "--rpc-env", "CUSTOM_RPC"]
@@ -594,8 +609,10 @@ def test_builtin_cli_needs_no_wallet_factory_and_preserves_status(
             WALLET,
             {
                 "config_path": selected,
-                "rpc_env": "CUSTOM_RPC" if explicit_config else setup.DEFAULT_RPC_ENV,
+                "rpc_env": "CUSTOM_RPC" if explicit_config else default_rpc_env,
                 "agent_id": 0,
+                "testnet": testnet,
+                "profile": None,
             },
         )
     ]
@@ -604,3 +621,141 @@ def test_builtin_cli_needs_no_wallet_factory_and_preserves_status(
     result = json.loads(output.out)
     assert result["complete"] is complete and result["config"] == str(selected)
     assert result["agent_id"] == ("0" if complete else None)
+
+
+def mainnet_selection(monkeypatch):
+    monkeypatch.setenv(setup.MAINNET_RPC_ENV, "https://mainnet.example/selected")
+    return {"testnet": False}
+
+
+@pytest.mark.parametrize("testnet,profile", [(False, "testnet"), (True, "mainnet"), (1, None)])
+def test_network_profile_errors_precede_state_and_wallet(boundary, testnet, profile):
+    if profile is not None:
+        profile = profile_from_mapping(setup._profile(testnet=profile == "testnet"))
+    with pytest.raises(OnboardingError):
+        boundary.onboard(testnet=testnet, profile=profile)
+    assert not list(boundary.config.parent.iterdir())
+    assert not boundary.wallets and not boundary.rpc_urls and not boundary.submissions
+
+
+def test_mainnet_never_infers_account_pins_from_testnet(boundary, monkeypatch):
+    monkeypatch.delitem(shared_circle._ACCOUNT_PINS, 5042, raising=False)
+    profile = profile_from_mapping(setup._profile())
+    profile = replace(profile, domain=replace(profile.domain, chain_id=5042))
+    with pytest.raises(OnboardingError, match="account pins are unavailable"):
+        boundary.onboard(testnet=False, profile=profile, rpc_env=setup.MAINNET_RPC_ENV)
+    assert not list(boundary.config.parent.iterdir())
+    assert not boundary.wallets and not boundary.rpc_urls and not boundary.submissions
+
+
+def test_mainnet_builtin_composition_uses_only_selected_profile_rpc_and_account_pins(
+    boundary, monkeypatch
+):
+    options = mainnet_selection(monkeypatch)
+    expected_profile = profile_from_mapping(setup._profile(testnet=False))
+    assert boundary.onboard(**options).onboarding.complete
+    assert boundary.onboard(**options).onboarding.complete
+    with Client.from_config(PROVIDER, config_path=boundary.config, testnet=False) as client:
+        assert client.contract.domain.chain_id == 5042
+        assert client.chain.reader.profile == expected_profile
+    assert set(boundary.wallet_pins) == {shared_circle._ACCOUNT_PINS[5042]}
+    assert set(boundary.rpc_urls) == {"https://mainnet.example/selected"}
+    assert len(boundary.submissions) == 1
+    record = json.loads(boundary.config.read_bytes())
+    assert record["profile"] == profile_to_mapping(expected_profile)
+    assert record["rpc_env"] == setup.MAINNET_RPC_ENV
+
+
+@pytest.mark.parametrize("testnet", [True, False])
+@pytest.mark.parametrize("custom_endpoint", [False, True])
+def test_omitted_rpc_selects_only_the_network_environment_or_public_default(
+    boundary, monkeypatch, testnet, custom_endpoint
+):
+    selected = setup.DEFAULT_RPC_ENV if testnet else setup.MAINNET_RPC_ENV
+    other = setup.MAINNET_RPC_ENV if testnet else setup.DEFAULT_RPC_ENV
+    endpoint = "https://selected.example/rpc"
+    monkeypatch.setenv(other, "https://wrong-network.example/rpc")
+    if custom_endpoint:
+        monkeypatch.setenv(selected, endpoint)
+    else:
+        monkeypatch.delenv(selected, raising=False)
+        endpoint = (
+            "https://rpc.blockdaemon.testnet.arc.io"
+            if testnet
+            else "https://rpc.blockdaemon.mainnet.arc.io"
+        )
+    assert boundary.onboard(testnet=testnet, rpc_env=None).onboarding.complete
+    with Client.from_config(PROVIDER, config_path=boundary.config, testnet=testnet):
+        pass
+    assert set(boundary.rpc_urls) == {endpoint}
+    assert json.loads(boundary.config.read_bytes())["rpc_env"] == selected
+    assert len(boundary.submissions) == 1
+
+
+@pytest.mark.parametrize("start_mainnet", [False, True])
+def test_existing_setup_and_payment_state_cannot_switch_networks(
+    boundary, monkeypatch, start_mainnet
+):
+    mainnet = mainnet_selection(monkeypatch)
+    first, second = (mainnet, {}) if start_mainnet else ({}, mainnet)
+    boundary.onboard(**first)
+    client_options = {key: value for key, value in first.items() if key != "rpc_env"}
+    with Client.from_config(PROVIDER, config_path=boundary.config, **client_options):
+        pass
+    retained = {path.name: path.read_bytes() for path in boundary.config.parent.iterdir()}
+    with pytest.raises(OnboardingError, match="supported deployment"):
+        boundary.onboard(**second)
+    client_options = {key: value for key, value in second.items() if key != "rpc_env"}
+    with pytest.raises(OnboardingError, match="supported deployment"):
+        Client.from_config(PROVIDER, config_path=boundary.config, **client_options)
+    assert {path.name: path.read_bytes() for path in boundary.config.parent.iterdir()} == retained
+    assert len(boundary.submissions) == 1
+
+
+@pytest.mark.parametrize("testnet", [True, False])
+def test_explicit_rpc_environment_cannot_select_the_other_network(boundary, testnet):
+    options = {
+        "testnet": testnet,
+        "rpc_env": setup.MAINNET_RPC_ENV if testnet else setup.DEFAULT_RPC_ENV,
+    }
+    with pytest.raises(OnboardingError, match="RPC environment selection"):
+        boundary.onboard(**options)
+    assert not boundary.rpc_urls and not boundary.wallets and not boundary.submissions
+    assert not list(boundary.config.parent.iterdir())
+
+
+def test_mainnet_builtin_cli_does_not_require_a_wallet_factory(monkeypatch, tmp_path):
+    profile = profile_from_mapping(setup._profile())
+    profile = replace(profile, domain=replace(profile.domain, chain_id=5042))
+    calls = []
+    monkeypatch.setattr(cli, "load_profile", lambda path: profile)
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: pytest.fail("no factory"))
+
+    def onboard(wallet, **options):
+        calls.append((wallet, options))
+        return setup.SetupResult(
+            options["config_path"],
+            ADDRESS,
+            SimpleNamespace(
+                complete=True,
+                identity=SimpleNamespace(agent_id=77),
+                balance=1_000_000,
+                submitted=False,
+                operation=None,
+            ),
+        )
+
+    monkeypatch.setattr(cli, "onboard_circle", onboard)
+    assert cli.main(["onboard", "--mainnet", "--profile", "trusted.json", "--wallet", WALLET]) == 0
+    assert calls == [
+        (
+            WALLET,
+            {
+                "config_path": setup.DEFAULT_CONFIG,
+                "rpc_env": setup.MAINNET_RPC_ENV,
+                "agent_id": None,
+                "testnet": False,
+                "profile": profile,
+            },
+        )
+    ]

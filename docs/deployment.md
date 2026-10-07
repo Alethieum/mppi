@@ -1,6 +1,34 @@
-# MPPI Arc testnet deployment
+# MPPI Arc deployment
 
-The official MPPI deployment is Arc testnet, chain ID **5042002**. It was
+## Arc mainnet
+
+The MPPI contracts are deployed on Arc mainnet, chain ID **5042**. SDK `0.1.2`
+packages this deployment profile for explicit mainnet selection.
+
+| Contract | Deployed address |
+| --- | --- |
+| MPPI proxy | `0xbDF7c950390316B6091b729F271371984B37deD7` |
+| MPPI implementation | `0x6dE8b8cd1200ffD27C460929c8BF8437E129243b` |
+| Governance timelock | `0x228966CAA1f2b14b6f8d0a86baAB8493EC419D06` |
+
+The [mainnet profile](../deployments/arc-mainnet.json) has SHA-256
+`94a9ea5c146d8a0fd51818a7066df613f1629d1e679b48f32f63b9ac99e8693c`.
+Configuration and independent Python/Rust SDK reads passed at block `0x1760f10`,
+hash `0x7342b32cef7346ad8237c833014906793424925cf43704c81b1a5d3cf8bbf38e`.
+These checks verified the original successful deployment transactions, exact
+runtime bytecode, initialization, custody, signing domains and the
+**86,400-second** governance delay. These deployment checks do not by themselves
+establish an application's onboarding, endpoint or paid exchange.
+
+| Deployment | Transaction hash |
+| --- | --- |
+| Timelock | `0x2df6501a0a4f17d7a663298f4debd11db79f66cb8674dd28c013a558b4dd62b4` |
+| Implementation | `0xe33c98d35d881ce98ca8beb62caef2ac80d4c4a87eb5fd0b38763b4480de9be2` |
+| Proxy | `0x3c7bf2c8b0023178a985ecda73965a618b2f0b9b9803d7994786c9d835258486` |
+
+## Arc testnet
+
+The official MPPI testnet deployment uses Arc testnet, chain ID **5042002**. It was
 published with contract release `0.1.0`; SDK onboarding updates use the same
 verified deployment:
 
@@ -36,8 +64,9 @@ Provider endpoint availability is independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Agent `0.1.1` and provider `0.1.1` built-in setup package the verified official
-Arc testnet profile. `--testnet` selects it without a separate download. The
+Agent `0.1.2` and provider `0.1.2` built-in setup package the verified official
+profiles for both Arc networks. `--testnet` and `--mainnet` select the respective
+profile without a separate download. Version `0.1.1` packages testnet only. The
 provider composition helpers use those same pins; they still verify chain ID,
 runtime code, proxy implementation slots and the signing domain before use.
 The packaged profile's trust comes from the installed official artifact,
@@ -114,9 +143,9 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 
 ## SDK installation inputs
 
-The provider quickstart uses `mppi-provider==0.1.1` from PyPI and native
-`mppi-provider` version `0.1.1`. The agent quickstart uses `mppi-agent==0.1.1`.
-Both Python roles depend on `mppi-protocol==0.1.0`. Use the release record to
+The provider quickstart uses `mppi-provider==0.1.2` from PyPI and native
+`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.2`.
+Both Python roles depend on `mppi-protocol==0.1.1`. Use the release record to
 identify the reviewed source revision and exact artifact digests. For development, the
 [public source tree can be built independently](build.md).
 
@@ -145,10 +174,10 @@ to Foundry separately when an actual deployment is authorized.
 
 | Variable | Required release evidence |
 | --- | --- |
-| `MPPI_REGISTRY` | Verified canonical ERC-8004 identity registry on Arc testnet, implementation/proxy identity and observed block, matching the trusted deployment profile. |
+| `MPPI_REGISTRY` | Verified canonical ERC-8004 identity registry on the selected Arc network, implementation/proxy identity and observed block, matching the trusted deployment profile. |
 | `MPPI_GUARDIAN` | Intended nonzero guardian with reviewed key custody; the protocol permits an EOA. |
 | `MPPI_SAFE` | Verified, initialized governance Safe, including singleton/proxy identity, effective authorization configuration and control of its selected owner. |
-| `MPPI_SAFE_OWNER` | The intended owner of this script's selected testnet 1-of-1 Safe. |
+| `MPPI_SAFE_OWNER` | The intended owner of this script's selected 1-of-1 Safe. |
 | `MPPI_DEPLOYER` | Nonzero broadcaster address, distinct from `MPPI_SAFE_OWNER`; the selected wallet must control this address. This is public configuration, not a private key. |
 | `MPPI_RELEASE_SALT` | Explicit 32-byte release salt, recorded with the exact build and initializer parameters before simulation and broadcast. |
 
@@ -161,11 +190,11 @@ keys, credentials or private custody information in the public manifest.
 [Safe owner query](https://docs.safe.global/reference-smart-account/owners/getOwners),
 [Safe threshold query](https://docs.safe.global/reference-smart-account/owners/getThreshold)
 
-The script rejects every chain except **5042002**, the documented Arc testnet
-ID. The current official explorer is
-[explorer.testnet.arc.io](https://explorer.testnet.arc.io). A matching chain ID
-alone does not authenticate an RPC server. Reverify the actual endpoint and
-chain before release. [Arc connection details, Testnet](https://docs.arc.io/arc/references/connect-to-arc)
+The script's `run()` entry point accepts only Arc testnet **5042002** and its
+`runMainnet()` entry point accepts only Arc mainnet **5042**. The network is
+never selected by guessing from the connected RPC. A matching chain ID alone
+does not authenticate an RPC server. Reverify the endpoint and chain before
+release. [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc)
 
 ## Creation and initialization
 
@@ -174,7 +203,9 @@ dependencies, the script checks nonzero addresses, registry/Safe code and the
 selected Safe's single expected owner and threshold of one before preparing.
 It rejects the Safe owner as deployer and calls `vm.startBroadcast(deployer)`
 with that checked address, binding all three factory transactions to the separate deployment
-wallet. Foundry's selected wallet must supply the corresponding signer.
+wallet. Foundry's selected wallet must supply the corresponding signer. These
+distinct role addresses can share a controlling owner; that arrangement does
+not provide independent signing custody.
 [Pinned broadcaster API](../contracts/lib/forge-std/src/Vm.sol)
 
 It prepares:
@@ -242,9 +273,9 @@ deployment is performed by the local verification suite.
 
 ## Local rehearsal and release verification
 
-The local suite tests this script on an isolated EVM configured with the actual
-testnet chain ID; it does not bypass the chain guard. Negative tests cover
-mainnet/other chains, missing code, zero configuration and invalid Safe owner or
+The local suite tests this script on an isolated EVM configured with the selected
+Arc chain ID; it does not bypass the chain guard. Negative tests cover
+using either entry point on the wrong network, missing code, zero configuration and invalid Safe owner or
 threshold, zero deployer and reuse of the Safe owner as deployer. The tests install
 the canonical factory runtime and cover missing/wrong factory code, deterministic
 address calculation, repeated deployment, existing code and nonce-only collisions.
@@ -269,7 +300,11 @@ proxy. Record receipts and observed blocks. Complete Arc-native USDC, registry,
 wallet and SDK execution checks before publishing a canonical deployment manifest.
 Local Anvil fixtures do not prove those integrations.
 
-This script rejects mainnet. Mainnet preparation requires the accepted initialized
-**3-of-5 Safe with five independent keys**, **86,400-second** timelock, independent
-audit of the exact bytecode and its own verified release evidence. The one-hour
-session dispute window and 24-hour idle timeout are separate from governance delay.
+For mainnet preparation, select `runMainnet()` explicitly with Foundry's
+`--sig 'runMainnet()'`. The existing `run()` entry point continues to enforce
+testnet and its **60-second** timelock. Mainnet uses the selected initialized
+**1-of-1 Safe** and an **86,400-second** timelock. It requires the designated
+Daybreak audit of the exact artifacts and deployment inputs, resolved required
+findings and its own verified release evidence. Preparation is not deployment
+acceptance. The one-hour session dispute window and 24-hour idle timeout are
+separate from governance delay.

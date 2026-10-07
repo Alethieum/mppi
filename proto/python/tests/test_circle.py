@@ -1,337 +1,390 @@
-"""Circle adapter boundaries; no credentials, network or economic transactions."""
+"""Circle CLI adapter boundaries; no credentials, actual CLI or network calls.
 
-from __future__ import annotations
+Subprocess limit checks run a tiny local Python executable in the Apple test
+container. Independent CLI fixtures use the published 1.1.4 output schema.
+"""
 
-import base64
 import copy
 import json
-from typing import Any
-from urllib.parse import parse_qs, urlsplit
-from uuid import UUID
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from uuid import uuid4
 
-import mppi_protocol.circle as circle_module
 import pytest
-from Crypto.Cipher import PKCS1_OAEP
-from Crypto.Hash import SHA256
-from Crypto.PublicKey import RSA
 from eth_abi import encode
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 from mppi_protocol.capabilities import FundingAuthorization, WalletCall
-from mppi_protocol.circle import CircleDeveloperWallet, CircleWalletError, funding_typed_data
+from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.errors import ValidationError
-from mppi_protocol.types import OperationState
+from mppi_protocol.local_state import Checkpoint
+from mppi_protocol.signing import voucher_digest
+from mppi_protocol.types import Domain, OperationState
 
-WALLET_ID = "11111111-1111-4111-8111-111111111111"
-TX_ID = "22222222-2222-4222-8222-222222222222"
-ADDRESS = bytes.fromhex("11" * 20)
-TARGET = bytes.fromhex("22" * 20)
-CALL = WalletCall(5042002, TARGET, bytes.fromhex("12345678") + bytes(128))
-SECRET = bytes.fromhex("34" * 32)
+CHAIN = 5042002
+PROXY = b"\x99" * 20
+IMPLEMENTATION = b"\x98" * 20
+REGISTRY = b"\x97" * 20
+REGISTRY_IMPLEMENTATION = b"\x96" * 20
+WALLET = b"\x11" * 20
+WALLET_IMPLEMENTATION = b"\x12" * 20
+TOKEN = bytes.fromhex("3600000000000000000000000000000000000000")
+HASH = b"\xbb" * 32
+TX = b"\xaa" * 32
+ID = "11111111-2222-4333-8444-555555555555"
+DOMAIN = Domain(CHAIN, PROXY)
+CALL = WalletCall(CHAIN, PROXY, b"\x01\x23\x45\x67")
 
 
-@pytest.fixture(scope="module")
-def rsa_key():
-    return RSA.generate(2048)
+def hx(value):
+    return "0x" + value.hex()
 
 
-class Service:
-    def __init__(self, key):
-        self.key = key
-        self.records: list[dict[str, Any]] = []
-        self.calls: list[tuple[str, str, dict[str, object] | None]] = []
-        self.fail_after_post = False
-        self.fail_before_post = False
-        self.fail_detail = False
-        self.wallet_state = "LIVE"
-
-    def request(self, method: str, path: str, *, body=None):
-        self.calls.append((method, path, copy.deepcopy(body)))
-        if path == "/wallets/" + WALLET_ID:
-            return {
-                "wallet": {
-                    "id": WALLET_ID,
-                    "address": "0x" + ADDRESS.hex(),
-                    "blockchain": "ARC-TESTNET",
-                    "accountType": "SCA",
-                    "custodyType": "DEVELOPER",
-                    "state": self.wallet_state,
-                }
-            }
-        if path == "/config/entity/publicKey":
-            return {"publicKey": self.key.public_key().export_key().decode()}
-        if path.startswith("/transactions?"):
-            query = parse_qs(urlsplit(path).query)
-            assert query["walletIds"] == [WALLET_ID]
-            # Live Circle rejects these individually documented filters when
-            # combined; this fixture models that request-validation boundary.
-            if "walletIds" in query and "blockchain" in query:
-                raise CircleWalletError("incompatible transaction filters")
-            assert query["pageSize"] == ["2"]
-            return {"transactions": copy.deepcopy(self.records)}
-        if method == "POST" and path == "/developer/transactions/contractExecution":
-            if self.fail_before_post:
-                raise CircleWalletError("unavailable")
-            self.records.append(
-                {
-                    "id": TX_ID,
-                    "refId": body["refId"],
-                    "walletId": WALLET_ID,
-                    "blockchain": "ARC-TESTNET",
-                    "custodyType": "DEVELOPER",
-                    "sourceAddress": "0x" + ADDRESS.hex(),
-                    "contractAddress": body["contractAddress"],
-                    "operation": "CONTRACT_EXECUTION",
-                    "transactionType": "OUTBOUND",
-                    "state": "INITIATED",
-                    "txHash": "",
-                }
+class Rpc:
+    def __init__(self):
+        self.calls = []
+        self.code = {
+            address: bytes([i]) + b"runtime"
+            for i, address in enumerate(
+                (
+                    PROXY,
+                    IMPLEMENTATION,
+                    REGISTRY,
+                    REGISTRY_IMPLEMENTATION,
+                    WALLET,
+                    WALLET_IMPLEMENTATION,
+                ),
+                start=1,
             )
-            if self.fail_after_post:
-                raise CircleWalletError("lost response")
-            return {"id": TX_ID, "state": "INITIATED"}
-        if path == "/transactions/" + TX_ID:
-            if self.fail_detail:
-                raise CircleWalletError("unavailable")
-            return {"transaction": copy.deepcopy(self.records[0])}
-        if path == "/developer/sign/typedData":
-            return {"signature": "0x" + "aa" * 140}
-        raise AssertionError((method, path))
+        }
+        self.wallet_implementation = WALLET_IMPLEMENTATION
+        self.chain = CHAIN
 
-    @property
-    def submissions(self):
-        return [
-            b
-            for m, p, b in self.calls
-            if m == "POST" and p == "/developer/transactions/contractExecution"
-        ]
-
-
-def wallet(service: Service) -> CircleDeveloperWallet:
-    result = CircleDeveloperWallet(
-        api_key="TEST_API_KEY:hidden",
-        entity_secret=SECRET,
-        wallet_id=WALLET_ID,
-        address=ADDRESS,
-        chain_id=5042002,
-    )
-    result._request = service.request
-    return result
-
-
-def test_exact_original_call_and_service_reference(rsa_key):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    result = adapter.execute(CALL, operation_ref="settleBatch:original")
-    assert result.state is OperationState.PENDING
-    assert result.wallet_operation_id == TX_ID
-    body = service.submissions[0]
-    assert body["callData"] == "0x" + CALL.data.hex()
-    assert body["contractAddress"] == "0x" + TARGET.hex()
-    assert body["amount"] == "0"
-    assert body["walletId"] == WALLET_ID
-    assert "blockchain" not in body and "abiParameters" not in body
-    assert body["idempotencyKey"] == body["refId"]
-    assert UUID(body["idempotencyKey"]).version == 4
-    assert wallet(service)._reference("settleBatch:original") == body["refId"]
-    assert adapter._reference("settleBatch:another") != body["refId"]
-    ciphertext = base64.b64decode(body["entitySecretCiphertext"])
-    assert PKCS1_OAEP.new(rsa_key, hashAlgo=SHA256).decrypt(ciphertext) == SECRET
-    assert "hidden" not in repr(adapter) and SECRET.hex() not in repr(adapter)
+    def call(self, method, params):
+        self.calls.append((method, copy.deepcopy(params)))
+        if method == "eth_chainId":
+            return hex(self.chain)
+        if method == "eth_getBlockByNumber":
+            return {
+                "number": "0x64",
+                "hash": hx(HASH),
+                "parentHash": hx(b"\xbc" * 32),
+                "timestamp": "0x1234",
+            }
+        assert params[-1] == {"blockHash": hx(HASH), "requireCanonical": True}
+        if method == "eth_getCode":
+            return hx(self.code[bytes.fromhex(params[0][2:])])
+        if method == "eth_getStorageAt":
+            address = bytes.fromhex(params[0][2:])
+            target = {
+                PROXY: IMPLEMENTATION,
+                REGISTRY: REGISTRY_IMPLEMENTATION,
+                WALLET: self.wallet_implementation,
+            }[address]
+            return hx(bytes(12) + target)
+        if method == "eth_call":
+            assert params[0] == {
+                "to": hx(PROXY),
+                "data": hx(
+                    keccak(text="voucherDigest(bytes32,uint64)")[:4]
+                    + encode(["bytes32", "uint64"], [bytes(32), 0])
+                ),
+            }
+            return hx(
+                encode(["bytes32"], [voucher_digest(Domain(self.chain, PROXY), bytes(32), 0)])
+            )
+        raise AssertionError(method)
 
 
-def test_lookup_uses_wallet_filter_without_incompatible_blockchain_filter(rsa_key):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    result = adapter.execute(CALL, operation_ref="filtered-operation")
-    assert result.wallet_operation_id == TX_ID
-    lookups = [path for method, path, _ in service.calls if path.startswith("/transactions?")]
-    assert len(lookups) == 1
-    assert parse_qs(urlsplit(lookups[0]).query) == {
-        "refId": [adapter._reference("filtered-operation")],
-        "walletIds": [WALLET_ID],
-        "operation": ["CONTRACT_EXECUTION"],
-        "custodyType": ["DEVELOPER"],
-        "pageSize": ["2"],
-    }
-    assert len(service.submissions) == 1
+class Cli:
+    def __init__(self, path):
+        self.path = path
+        self.blockchain = "ARC-TESTNET"
+        self.calls = []
+        self.version = b"1.1.4\n"
+        self.wallets = [{"type": "agent", "address": hx(WALLET), "blockchain": "ARC-TESTNET"}]
+        self.execute_error = False
+        self.reply_changes = {}
+        self.pages = [[]]
+        self.signing_response = "0x" + "11" * 140
+        self.signing_data = None
+        self.before_submit = None
 
-
-@pytest.mark.parametrize("returned_chain", ["ARC", "BASE-SEPOLIA", None])
-def test_lookup_rejects_wrong_chain_before_following_or_submitting(rsa_key, returned_chain):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    service.records = [
-        {
-            "id": TX_ID,
-            "refId": adapter._reference("original"),
-            "walletId": WALLET_ID,
-            "blockchain": returned_chain,
-            "custodyType": "DEVELOPER",
+    def transaction(self, **changes):
+        return {
+            "id": ID,
+            "state": "CONFIRMED",
+            "blockchain": self.blockchain,
+            "txHash": hx(TX),
+            "sourceAddress": hx(WALLET),
+            "destinationAddress": hx(WALLET),
             "operation": "CONTRACT_EXECUTION",
             "transactionType": "OUTBOUND",
-            "sourceAddress": "0x" + ADDRESS.hex(),
-            "contractAddress": "0x" + TARGET.hex(),
-            "state": "INITIATED",
+            "abiFunctionSignature": "execute(address,uint256,bytes)",
+            "abiParameters": [hx(PROXY), "0", hx(CALL.data)],
+            "contractAddress": hx(WALLET),
+            "createDate": "2026-09-27T00:00:00Z",
+            **changes,
         }
+
+    def __call__(self, args):
+        self.calls.append(copy.deepcopy(args))
+        if args == ["--version"]:
+            return self.version
+        assert args[-2:] == ["--output", "json"]
+        args = args[:-2]
+        if args[:2] == ["wallet", "list"]:
+            assert args == ["wallet", "list", "--type", "agent", "--chain", self.blockchain]
+            data = {"wallets": self.wallets}
+        elif args[:2] == ["wallet", "execute"]:
+            # Real journal bytes must already exist before the command starts.
+            record = json.loads(self.path.read_text())
+            row = record["operations"]["original-ref"]
+            expected = [
+                "wallet",
+                "execute",
+                "execute(address,uint256,bytes)",
+                hx(PROXY),
+                "0",
+                hx(CALL.data),
+                "--contract",
+                hx(WALLET),
+                "--address",
+                hx(WALLET),
+                "--chain",
+                self.blockchain,
+                "--idempotency-key",
+                row["idempotency_key"],
+            ]
+            assert args == expected
+            assert row["wallet_operation_id"] is None and row["state"] == "unknown"
+            if self.before_submit:
+                self.before_submit(row)
+            if self.execute_error:
+                raise CircleAgentWalletError("mock timeout")
+            data = self.transaction(idempotencyKey=row["idempotency_key"], **self.reply_changes)
+        elif args[:2] == ["transaction", "list"]:
+            expected = [
+                "transaction",
+                "list",
+                "--address",
+                hx(WALLET),
+                "--chain",
+                self.blockchain,
+                "--operation",
+                "execute",
+                "--tx-type",
+                "outbound",
+                "--limit",
+                "50",
+            ]
+            assert args[: len(expected)] == expected
+            cursor = args[-1] if "--cursor" in args else None
+            if cursor is None:
+                data = {"transactions": self.pages[0]}
+            else:
+                prior = next(
+                    i for i, page in enumerate(self.pages) if page and page[-1]["id"] == cursor
+                )
+                data = {"transactions": self.pages[prior + 1]}
+        elif args[:3] == ["wallet", "sign", "typed-data"]:
+            assert args[4:] == ["--address", hx(WALLET), "--chain", self.blockchain]
+            self.signing_data = json.loads(args[3])
+            data = {"signature": self.signing_response}
+        else:
+            raise AssertionError(args)
+        return json.dumps({"data": data}).encode()
+
+
+@pytest.fixture
+def context(tmp_path, monkeypatch):
+    rpc = Rpc()
+    pins = [
+        CodePin(address, keccak(rpc.code[address]))
+        for address in (PROXY, IMPLEMENTATION, REGISTRY, REGISTRY_IMPLEMENTATION)
     ]
-    assert adapter.execute(CALL, operation_ref="original").state is OperationState.UNKNOWN
-    assert wallet(service).reconcile(operation_ref="original").state is OperationState.UNKNOWN
-    assert not service.submissions
-    assert all(path.startswith("/transactions?") for _, path, _ in service.calls)
+    chain = ChainReader(rpc, DeploymentProfile(DOMAIN, REGISTRY, *pins))
+    path = tmp_path / "wallet.json"
+    cli = Cli(path)
+    options = {
+        "chain": chain,
+        "wallet": CodePin(WALLET, keccak(rpc.code[WALLET])),
+        "implementation": CodePin(WALLET_IMPLEMENTATION, keccak(rpc.code[WALLET_IMPLEMENTATION])),
+        "checkpoint_path": path,
+    }
+    wallet = CircleAgentWallet(**options)
+    monkeypatch.setattr(wallet, "_run", cli)
+    return wallet, rpc, cli, options
 
 
-def test_lost_response_reconciles_original_without_resubmission(rsa_key):
-    service = Service(rsa_key)
-    service.fail_after_post = True
-    adapter = wallet(service)
-    assert adapter.execute(CALL, operation_ref="original").state is OperationState.UNKNOWN
-    assert adapter.execute(CALL, operation_ref="original").wallet_operation_id == TX_ID
-    restarted = wallet(service)
-    service.records[0].update(state="COMPLETE", txHash="0x" + "ab" * 32)
-    recovered = restarted.reconcile(operation_ref="original")
-    assert recovered.state is OperationState.PENDING  # Canonical chain verification follows.
-    assert recovered.tx_hash == bytes.fromhex("ab" * 32)
-    assert len(service.submissions) == 1
-
-
-def test_absent_unknown_operation_never_resubmits(rsa_key):
-    service = Service(rsa_key)
-    service.fail_before_post = True
-    adapter = wallet(service)
-    assert adapter.execute(CALL, operation_ref="unknown").state is OperationState.UNKNOWN
-    assert adapter.execute(CALL, operation_ref="unknown").state is OperationState.UNKNOWN
-    assert wallet(service).reconcile(operation_ref="unknown").state is OperationState.UNKNOWN
-    assert len(service.submissions) == 1
-
-
-def test_known_identifier_survives_detail_outage(rsa_key):
-    service = Service(rsa_key)
-    service.fail_detail = True
-    adapter = wallet(service)
-    result = adapter.execute(CALL, operation_ref="original")
-    assert result.state is OperationState.UNKNOWN and result.wallet_operation_id == TX_ID
-    assert adapter.reconcile(operation_ref="original").wallet_operation_id == TX_ID
-    assert len(service.submissions) == 1
-
-
-def test_changed_call_under_existing_reference_is_rejected(rsa_key):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    adapter.execute(CALL, operation_ref="original")
+def test_exact_call_is_journaled_before_single_submit(context):
+    wallet, _, cli, _ = context
+    result = wallet.execute(CALL, operation_ref="original-ref")
+    assert result.state is OperationState.PENDING  # Canonical chain confirmation remains separate.
+    assert result.tx_hash == TX and result.wallet_operation_id == ID
+    cli.pages = [[cli.transaction()]]
+    repeated = wallet.execute(CALL, operation_ref="original-ref")
+    assert repeated == result
+    assert sum(args[:2] == ["wallet", "execute"] for args in cli.calls) == 1
     with pytest.raises(ValidationError, match="reused"):
-        adapter.execute(WalletCall(CALL.chain_id, TARGET, b"changed"), operation_ref="original")
-    assert len(service.submissions) == 1
+        wallet.execute(replace(CALL, data=b"different"), operation_ref="original-ref")
+
+
+def test_restart_recovers_original_resource_with_reads_only(context, monkeypatch):
+    wallet, _, cli, options = context
+    original = wallet.execute(CALL, operation_ref="original-ref")
+    cli.calls.clear()
+    cli.pages = [[cli.transaction(state="COMPLETE")]]
+    reopened = CircleAgentWallet(**options)
+    monkeypatch.setattr(reopened, "_run", cli)
+    assert reopened.execute(CALL, operation_ref="original-ref") == original
+    assert all(args[:2] == ["transaction", "list"] for args in cli.calls)
+
+
+def test_no_returned_handle_remains_unknown_even_with_matching_new_transactions(
+    context, monkeypatch
+):
+    wallet, _, cli, options = context
+    cli.execute_error = True
+    result = wallet.execute(CALL, operation_ref="original-ref")
+    assert result.state is OperationState.UNKNOWN and result.tx_hash is None
+    key = json.loads(cli.path.read_text())["operations"]["original-ref"]["idempotency_key"]
+    cli.calls.clear()
+    cli.execute_error = False
+    cli.pages = [[cli.transaction()]]
+    reopened = CircleAgentWallet(**options)
+    monkeypatch.setattr(reopened, "_run", cli)
+    assert reopened.execute(CALL, operation_ref="original-ref") == result
+    assert reopened.reconcile(operation_ref="original-ref") == result
+    assert cli.calls == []
+    assert json.loads(cli.path.read_text())["operations"]["original-ref"]["idempotency_key"] == key
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "changes",
     [
-        ("walletId", "33333333-3333-4333-8333-333333333333"),
-        ("blockchain", "ARC"),
-        ("refId", "foreign"),
-        ("custodyType", "ENDUSER"),
-        ("operation", "TRANSFER"),
-        ("transactionType", "INBOUND"),
-        ("sourceAddress", "0x" + "33" * 20),
-        ("contractAddress", "0x" + "33" * 20),
-        ("callData", "0xdead"),
-        ("txHash", "0xnothex"),
-        ("state", []),
+        {"sourceAddress": hx(PROXY)},
+        {"blockchain": "ARC"},
+        {"contractAddress": hx(PROXY)},
+        {"destinationAddress": hx(PROXY)},
+        {"operation": "TRANSFER"},
+        {"transactionType": "INBOUND"},
+        {"abiFunctionSignature": "other(address,uint256,bytes)"},
+        {"abiParameters": [hx(PROXY), "1", hx(CALL.data)]},
+        {"abiParameters": [hx(REGISTRY), "0", hx(CALL.data)]},
+        {"abiParameters": [hx(PROXY), "0", "0x1234"]},
+        {"abiParameters": [hx(PROXY), 0, hx(CALL.data)]},
+        {"state": "INVENTED"},
+        {"idempotencyKey": "wrong"},
     ],
 )
-def test_inconsistent_service_record_stays_unknown(rsa_key, field, value):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    adapter.execute(CALL, operation_ref="original")
-    service.records[0][field] = value
-    assert adapter.reconcile(operation_ref="original").state is OperationState.UNKNOWN
-    assert len(service.submissions) == 1
-
-
-def test_duplicate_lookup_fails_closed(rsa_key):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    adapter.execute(CALL, operation_ref="original")
-    service.records.append(copy.deepcopy(service.records[0]))
-    assert wallet(service).reconcile(operation_ref="original").state is OperationState.UNKNOWN
-    assert len(service.submissions) == 1
+def test_execute_response_must_bind_exact_intent(context, changes):
+    wallet, _, cli, _ = context
+    cli.reply_changes = changes
+    result = wallet.execute(CALL, operation_ref="original-ref")
+    assert result.state is OperationState.UNKNOWN
+    assert result.wallet_operation_id is None and result.tx_hash is None
 
 
 @pytest.mark.parametrize(
-    "raw,expected",
+    "problem", ["missing", "foreign_hash", "wrong_call", "duplicate", "malformed"]
+)
+def test_lookup_outage_and_conflicts_preserve_handles(context, problem):
+    wallet, _, cli, _ = context
+    wallet.execute(CALL, operation_ref="original-ref")
+    if problem == "missing":
+        cli.pages = [[]]
+    elif problem == "foreign_hash":
+        cli.pages = [[cli.transaction(txHash=hx(b"\xdd" * 32))]]
+    elif problem == "wrong_call":
+        cli.pages = [[cli.transaction(abiParameters=[hx(PROXY), "0", "0x00"])]]
+    elif problem == "duplicate":
+        cli.pages = [[cli.transaction(), cli.transaction()]]
+    else:
+        cli.pages = [[{"id": ID}]]
+    result = wallet.reconcile(operation_ref="original-ref")
+    assert result.state is OperationState.UNKNOWN
+    assert result.wallet_operation_id == ID and result.tx_hash == TX
+
+
+def test_paginated_known_id_and_no_latest_match_heuristic(context):
+    wallet, _, cli, _ = context
+    wallet.execute(CALL, operation_ref="original-ref")
+    first = [cli.transaction(id=str(uuid4())) for _ in range(50)]
+    cli.pages = [first, [cli.transaction(state="FAILED")]]
+    result = wallet.reconcile(operation_ref="original-ref")
+    assert result.state is OperationState.FAILED and result.wallet_operation_id == ID
+    assert cli.calls[-1][-4:] == ["--cursor", first[-1]["id"], "--output", "json"]
+
+
+def test_page_limit_fails_closed(context):
+    wallet, _, cli, _ = context
+    wallet.execute(CALL, operation_ref="original-ref")
+    wallet._max_pages = 1
+    cli.pages = [[cli.transaction(id=str(uuid4())) for _ in range(50)], [cli.transaction()]]
+    assert wallet.reconcile(operation_ref="original-ref").state is OperationState.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "problem",
     [
-        ("FAILED", OperationState.FAILED),
-        ("DENIED", OperationState.FAILED),
-        ("CANCELLED", OperationState.FAILED),
-        ("QUEUED", OperationState.PENDING),
-        ("STUCK", OperationState.PENDING),
-        ("COMPLETE", OperationState.UNKNOWN),
-        ("NEW_UNKNOWN_STATE", OperationState.UNKNOWN),
+        "version",
+        "account",
+        "network",
+        "duplicate",
+        "code",
+        "implementation",
+        "chain",
+        "malformed_address",
     ],
 )
-def test_service_state_is_not_chain_confirmation(rsa_key, raw, expected):
-    service = Service(rsa_key)
-    adapter = wallet(service)
-    adapter.execute(CALL, operation_ref="original")
-    service.records[0]["state"] = raw
-    assert adapter.reconcile(operation_ref="original").state is expected
+def test_selection_and_pins_rechecked_before_any_write(context, problem):
+    wallet, rpc, cli, _ = context
+    if problem == "version":
+        cli.version = b"1.1.5\n"
+    elif problem == "account":
+        cli.wallets[0]["type"] = "local"
+    elif problem == "network":
+        cli.wallets[0]["blockchain"] = "ARC"
+    elif problem == "duplicate":
+        cli.wallets *= 2
+    elif problem == "code":
+        rpc.code[WALLET] = b"changed"
+    elif problem == "implementation":
+        rpc.wallet_implementation = PROXY
+    elif problem == "chain":
+        rpc.chain = 5042
+    else:
+        cli.wallets[0]["address"] = {}
+    with pytest.raises((CircleAgentWalletError, RuntimeError)):
+        wallet.execute(CALL, operation_ref="original-ref")
+    assert not cli.path.exists()
+    assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
 
 
-def test_disabled_wallet_and_wrong_network_cannot_submit(rsa_key):
-    service = Service(rsa_key)
-    service.wallet_state = "FROZEN"
-    adapter = wallet(service)
-    assert adapter.execute(CALL, operation_ref="original").state is OperationState.UNKNOWN
-    with pytest.raises(ValidationError):
-        adapter.execute(WalletCall(5042, TARGET, CALL.data), operation_ref="other")
-    assert not service.submissions
+def test_journal_failure_prevents_submission(context, monkeypatch):
+    wallet, _, cli, _ = context
+
+    def fail(_self, _):
+        raise OSError("storage failure")
+
+    monkeypatch.setattr(Checkpoint, "save", fail)
+    with pytest.raises(OSError):
+        wallet.execute(CALL, operation_ref="original-ref")
+    assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
 
 
-def test_funding_signature_preserves_exact_token_scope_and_signature(rsa_key):
-    service = Service(rsa_key)
-    adapter = wallet(service)
+def test_funding_signature_bytes_preserved_and_typed_data_independent(context):
+    wallet, _, cli, _ = context
     auth = FundingAuthorization(
-        5042002,
-        bytes.fromhex("36" + "00" * 19),
-        "USD Coin",
-        "2",
-        ADDRESS,
-        TARGET,
-        2**64 - 1,
-        0,
-        2**128,
-        bytes.fromhex("77" * 32),
+        CHAIN, TOKEN, "USDC", "2", WALLET, PROXY, 5_510_000, 10, 20, b"\x33" * 32
     )
-    signature = adapter.sign_funding_authorization(auth)
-    adapter.sign_funding_authorization(auth)
-    assert signature == bytes.fromhex("aa" * 140)
-    requests = [b for _, p, b in service.calls if p == "/developer/sign/typedData"]
-    assert requests[0]["entitySecretCiphertext"] != requests[1]["entitySecretCiphertext"]
-    data = json.loads(requests[0]["data"])
-    assert data["primaryType"] == "ReceiveWithAuthorization"
-    assert data["domain"]["verifyingContract"] == "0x" + auth.token.hex()
-    assert data["domain"]["chainId"] == 5042002
-    assert data["message"]["from"] == "0x" + ADDRESS.hex()
-    assert data["message"]["validBefore"] == str(2**128)
-    assert data["message"]["value"] == str(2**64 - 1)
-    assert not service.submissions
-
-
-def test_shared_funding_json_matches_independent_eip3009_abi_hash():
-    auth = FundingAuthorization(
-        5042002,
-        bytes.fromhex("36" + "00" * 19),
-        "USDC",
-        "2",
-        ADDRESS,
-        TARGET,
-        2**96 + 1,
-        1,
-        2**128,
-        bytes.fromhex("77" * 32),
-    )
-    signable = encode_typed_data(full_message=funding_typed_data(auth))
+    signature = wallet.sign_funding_authorization(auth)
+    assert signature == b"\x11" * 140  # Not an ECDSA 65-byte SessionSigner proof.
+    message = encode_typed_data(full_message=cli.signing_data)
     expected = keccak(
         encode(
             ["bytes32", "address", "address", "uint256", "uint256", "uint256", "bytes32"],
@@ -339,108 +392,227 @@ def test_shared_funding_json_matches_independent_eip3009_abi_hash():
                 keccak(
                     text="ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
                 ),
-                auth.owner,
-                auth.recipient,
-                auth.value,
-                auth.valid_after,
-                auth.valid_before,
-                auth.nonce,
+                WALLET,
+                PROXY,
+                5_510_000,
+                10,
+                20,
+                b"\x33" * 32,
             ],
         )
     )
-    domain = keccak(
-        encode(
-            ["bytes32", "bytes32", "bytes32", "uint256", "address"],
-            [
-                keccak(
-                    text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-                ),
-                keccak(text="USDC"),
-                keccak(text="2"),
-                auth.chain_id,
-                auth.token,
-            ],
-        )
-    )
-    assert signable.body == expected
-    assert signable.header == domain
+    assert message.body == expected
+    assert not cli.path.exists()
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"api_key": "bad\r\nheader"},
-        {"entity_secret": b"short"},
-        {"chain_id": True},
-        {"chain_id": 1},
-        {"timeout_ms": 0},
-    ],
-)
-def test_invalid_configuration_rejected_without_request(kwargs):
-    config = dict(
-        api_key="TEST_API_KEY:hidden",
-        entity_secret=SECRET,
-        wallet_id=WALLET_ID,
-        address=ADDRESS,
-        chain_id=5042002,
-    )
-    config.update(kwargs)
+@pytest.mark.parametrize("field,value", [("chain_id", 5042), ("owner", PROXY), ("token", PROXY)])
+def test_signing_rejects_wrong_funding_authority_before_cli(context, field, value):
+    wallet, _, cli, _ = context
+    auth = FundingAuthorization(CHAIN, TOKEN, "USDC", "2", WALLET, PROXY, 1, 10, 20, b"\x33" * 32)
     with pytest.raises(ValidationError):
-        CircleDeveloperWallet(**config)
+        wallet.sign_funding_authorization(replace(auth, **{field: value}))
+    assert cli.calls == []
+
+
+@pytest.mark.parametrize("signature", ["0x", "0xzz", "0x11 22", "secret", "0x" + "11" * 65537])
+def test_bad_signing_responses_rejected(context, signature):
+    wallet, _, cli, _ = context
+    cli.signing_response = signature
+    auth = FundingAuthorization(CHAIN, TOKEN, "USDC", "2", WALLET, PROXY, 1, 10, 20, b"\x33" * 32)
+    with pytest.raises(CircleAgentWalletError):
+        wallet.sign_funding_authorization(auth)
+
+
+def test_restart_rejects_changed_profile_and_tampered_journal(context):
+    wallet, _, cli, options = context
+    wallet.execute(CALL, operation_ref="original-ref")
+    with pytest.raises(CircleAgentWalletError):
+        CircleAgentWallet(
+            **(options | {"implementation": CodePin(WALLET_IMPLEMENTATION, b"\x01" * 32)})
+        )
+    record = json.loads(cli.path.read_text())
+    record["operations"]["original-ref"]["call"]["chain_id"] = 5042
+    cli.path.write_text(json.dumps(record))
+    with pytest.raises(CircleAgentWalletError):
+        CircleAgentWallet(**options)
 
 
 @pytest.mark.parametrize(
-    "status,encoding,content_type,payload",
+    "chain_id,blockchain,other_chain", [(5042, "ARC", 5042002), (5042002, "ARC-TESTNET", 5042)]
+)
+def test_circle_funding_intent_and_cli_selection_are_isolated_by_network(
+    context, monkeypatch, chain_id, blockchain, other_chain
+):
+    _, rpc, cli, options = context
+    rpc.chain = chain_id
+    profile = options["chain"].profile
+    chain = ChainReader(rpc, replace(profile, domain=replace(profile.domain, chain_id=chain_id)))
+    wallet = CircleAgentWallet(**(options | {"chain": chain}))
+    cli.blockchain = blockchain
+    cli.wallets[0]["blockchain"] = blockchain
+    monkeypatch.setattr(wallet, "_run", cli)
+    authorization = FundingAuthorization(
+        chain_id, TOKEN, "USDC", "2", WALLET, PROXY, 1, 10, 20, b"\x33" * 32
+    )
+    with pytest.raises(ValidationError, match="funding authorization mismatch"):
+        wallet.sign_funding_authorization(replace(authorization, chain_id=other_chain))
+    assert cli.calls == [] and rpc.calls == []
+    assert wallet.sign_funding_authorization(authorization) == b"\x11" * 140
+    assert cli.signing_data["domain"]["chainId"] == chain_id
+    assert cli.calls[-1][-4:] == ["--chain", blockchain, "--output", "json"]
+    assert not cli.path.exists()  # Signing alone does not create an operation or submit it.
+
+
+def test_retained_circle_journal_cannot_be_reused_on_another_network(context):
+    wallet, rpc, cli, options = context
+    wallet.execute(CALL, operation_ref="original-ref")
+    original = cli.path.read_bytes()
+    before = list(rpc.calls), list(cli.calls)
+    profile = options["chain"].profile
+    mainnet = ChainReader(rpc, replace(profile, domain=replace(profile.domain, chain_id=5042)))
+    with pytest.raises(CircleAgentWalletError, match="^Circle journal could not be validated$"):
+        CircleAgentWallet(**(options | {"chain": mainnet}))
+    assert cli.path.read_bytes() == original
+    assert (rpc.calls, cli.calls) == before
+
+
+@pytest.mark.parametrize(
+    "script,expected",
     [
-        (302, "identity", "application/json", b"{}"),
-        (503, "identity", "application/json", b"remote body with secrets"),
-        (200, "gzip", "application/json", b"{}"),
-        (200, "identity", "text/html", b"{}"),
-        (200, "identity", "application/json", b"x" * 1_048_577),
+        ("import sys; sys.stdout.write('x' * 1048577)", "output limit"),
+        ("import sys; sys.stderr.write('private-material-' * 6000)", "error-output limit"),
+        ("import time; time.sleep(5)", "timed out"),
+        ("import sys; sys.stderr.write('private-material'); sys.exit(7)", "success"),
     ],
 )
-def test_http_errors_are_bounded_redacted_and_never_retried(
-    monkeypatch, status, encoding, content_type, payload
-):
-    requests = []
-    closed = []
-
-    class Response:
-        def __init__(self):
-            self.status = status
-
-        def getheader(self, name, default):
-            return {"Content-Encoding": encoding, "Content-Type": content_type}.get(name, default)
-
-        def read(self, size):
-            assert size == 1_048_577
-            return payload[:size]
-
-    class Connection:
-        def __init__(self, host, **kwargs):
-            assert host == "api.circle.com" and kwargs["timeout"] == 10.0
-
-        def request(self, method, path, *, body, headers):
-            assert headers["Authorization"] == "Bearer TEST_API_KEY:hidden"
-            requests.append((method, path, body))
-
-        def getresponse(self):
-            return Response()
-
-        def close(self):
-            closed.append(True)
-
-    monkeypatch.setattr(circle_module.http.client, "HTTPSConnection", Connection)
-    adapter = CircleDeveloperWallet(
-        api_key="TEST_API_KEY:hidden",
-        entity_secret=SECRET,
-        wallet_id=WALLET_ID,
-        address=ADDRESS,
-        chain_id=5042002,
+def test_actual_subprocess_bounds_and_redacted_errors(context, script, expected):
+    _, _, _, options = context
+    bounded = CircleAgentWallet(
+        **(options | {"command": (sys.executable, "-c", script), "timeout_seconds": 0.3})
     )
-    with pytest.raises(CircleWalletError) as failure:
-        adapter._request(
-            "POST", "/developer/transactions/contractExecution", body={"test": "value"}
+    with pytest.raises(CircleAgentWalletError, match=expected) as error:
+        bounded._run([])
+    assert "private-material" not in str(error.value)
+
+
+def test_actual_subprocess_arguments_never_evaluated_by_shell(context):
+    _, _, _, options = context
+    direct = CircleAgentWallet(
+        **(
+            options
+            | {
+                "command": (
+                    sys.executable,
+                    "-c",
+                    "import json,sys; print(json.dumps(sys.argv[1:]))",
+                )
+            }
         )
-    assert "hidden" not in str(failure.value) and "remote body" not in str(failure.value)
-    assert len(requests) == 1 and len(closed) == 1
+    )
+    arguments = ["$(touch /tmp/never-run)", "`echo private`", "; echo bad"]
+    assert json.loads(direct._run(arguments)) == arguments
+
+
+def test_scoped_journal_lock_is_released_between_operations(context):
+    wallet, _, cli, options = context
+    held = Checkpoint(options["checkpoint_path"])
+    try:
+        with pytest.raises(ValidationError):
+            wallet.execute(CALL, operation_ref="original-ref")
+    finally:
+        held.close()
+    assert cli.calls == []
+    assert wallet.execute(CALL, operation_ref="original-ref").wallet_operation_id == ID
+    next_owner = Checkpoint(options["checkpoint_path"])
+    next_owner.close()
+
+
+@pytest.mark.parametrize(
+    "script,needs_kill",
+    [
+        ("print('done')", False),
+        ("import sys; sys.exit(7)", False),
+        ("import time; time.sleep(5)", True),
+        (
+            "import sys,time; sys.stdout.write('x' * 1048577); sys.stdout.flush(); time.sleep(5)",
+            True,
+        ),
+    ],
+)
+def test_process_cleanup_signals_before_reap_only_on_live_failure(
+    context, monkeypatch, script, needs_kill
+):
+    _, _, _, options = context
+    events = []
+    killpg, wait = os.killpg, subprocess.Popen.wait
+
+    def kill(pid, sig):
+        events.append("kill")
+        return killpg(pid, sig)
+
+    def waited(process, *args, **kwargs):
+        events.append("wait")
+        return wait(process, *args, **kwargs)
+
+    monkeypatch.setattr(os, "killpg", kill)
+    monkeypatch.setattr(subprocess.Popen, "wait", waited)
+    process = CircleAgentWallet(
+        **(options | {"command": (sys.executable, "-c", script), "timeout_seconds": 0.3})
+    )
+    try:
+        process._run([])
+    except CircleAgentWalletError:
+        pass
+    if needs_kill:
+        assert events[:2] == ["kill", "wait"]
+    else:
+        assert "kill" not in events and "wait" in events
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_custody_command_finishes_without_timeout_kill(context, monkeypatch, tmp_path, overflow):
+    _, _, _, options = context
+    marker = tmp_path / "original-finished"
+    script = (
+        "import pathlib,sys,time; "
+        + ("sys.stdout.write('x' * 1048577); sys.stdout.flush(); " if overflow else "")
+        + "time.sleep(0.4); pathlib.Path(sys.argv[1]).write_text('finished'); print('done')"
+    )
+
+    def unexpected_kill(*args):
+        pytest.fail("an original custody command must not be killed")
+
+    monkeypatch.setattr(os, "killpg", unexpected_kill)
+    wallet = CircleAgentWallet(
+        **(
+            options
+            | {
+                "command": (sys.executable, "-c", script, str(marker)),
+                "timeout_seconds": 0.1,
+            }
+        )
+    )
+    if overflow:
+        with pytest.raises(CircleAgentWalletError, match="output limit"):
+            wallet._run(["wallet", "execute"])
+    else:
+        assert wallet._run(["wallet", "execute"]) == b"done\n"
+    assert marker.read_text() == "finished"
+
+
+def test_open_existing_requires_original_journal_and_lock(context):
+    _, _, _, options = context
+    with pytest.raises(ValidationError):
+        CircleAgentWallet(**(options | {"require_existing": True}))
+    assert not options["checkpoint_path"].exists()
+
+
+def test_hashless_service_failure_keeps_original_submission_unknown(context):
+    wallet, _, cli, _ = context
+    cli.reply_changes = {"state": "FAILED", "txHash": None}
+    result = wallet.execute(CALL, operation_ref="original-ref")
+    assert result.state is OperationState.UNKNOWN
+    assert result.wallet_operation_id == ID and result.tx_hash is None
+    cli.pages = [[cli.transaction(state="FAILED", txHash=None)]]
+    assert wallet.execute(CALL, operation_ref="original-ref") == result
+    assert sum(args[:2] == ["wallet", "execute"] for args in cli.calls) == 1

@@ -72,7 +72,6 @@ impl std::fmt::Debug for SignedRecipientProof {
 #[derive(Clone, Debug)]
 pub struct OnboardingOptions {
     pub state_path: PathBuf,
-    pub wallet_id: Option<String>,
     pub adopted_identity: Option<U256>,
     pub recipient_proof: Option<SignedRecipientProof>,
 }
@@ -414,7 +413,7 @@ fn check_intent(
         return Err(fail("retained operation belongs to another provider"));
     }
     let matches = match op.kind() {
-        RegistryKind::Register => id.is_none() && op.agent_uri() == Some(&intended_uri),
+        RegistryKind::Register => id.is_none() && op.agent_uri().is_none(),
         RegistryKind::SetAgentWallet => {
             op.new_wallet() == Some(declarations.provider().recipient())
         }
@@ -452,7 +451,7 @@ pub(crate) fn registration_document(
 
 /// Check completed steps and advance only missing payment setup. Rerun the same
 /// record after interruption. Pending writes are queried, never replaced.
-/// Circle wallet provisioning and endpoint readiness are separate CLI steps.
+/// Circle Agent Wallet login and endpoint readiness are separate CLI steps.
 pub async fn onboard(
     declarations: &ProviderDeclarations,
     wallet: Arc<dyn TransactionWallet>,
@@ -462,7 +461,7 @@ pub async fn onboard(
     let owner = wallet.address();
 
     // Validate wallet identifiers without assigning an absent provider identity.
-    ProviderIdentityConfig::new(U256::ZERO, owner, options.wallet_id.clone())
+    ProviderIdentityConfig::new(U256::ZERO, owner)
         .map_err(|_| fail("provider wallet configuration is invalid"))?;
     if declarations.provider().recipient() == owner {
         return Err(fail(
@@ -471,7 +470,7 @@ pub async fn onboard(
     }
     declarations
         .with_identity(
-            ProviderIdentityConfig::new(U256::ZERO, owner, options.wallet_id.clone())
+            ProviderIdentityConfig::new(U256::ZERO, owner)
                 .map_err(|_| fail("provider wallet configuration is invalid"))?,
         )
         .map_err(|_| fail("provider declarations are invalid"))?
@@ -489,7 +488,7 @@ pub async fn onboard(
     let mut store = LocalState::open(&options.state_path, RECORD_LIMIT)
         .map_err(|_| fail("setup record is invalid or another command owns it"))?;
     let mut record=store.read().map_err(|_|fail("setup record is unavailable or invalid"))?.unwrap_or_else(||json!({
-        "version":1,"kind":"mppi-provider-onboarding","profile":profile,"wallet":hx(owner),"wallet_id":options.wallet_id,
+        "version":1,"kind":"mppi-provider-onboarding","profile":profile,"wallet":hx(owner),
         "declarations_hash":declaration_hash,"agent_id":options.adopted_identity.map(|id|id.to_string()),"complete":false,"pending":null,"recipient_proof":null,"registration":null
     }));
     exact(
@@ -499,7 +498,6 @@ pub async fn onboard(
             "kind",
             "profile",
             "wallet",
-            "wallet_id",
             "declarations_hash",
             "agent_id",
             "complete",
@@ -512,7 +510,6 @@ pub async fn onboard(
         || record["kind"] != "mppi-provider-onboarding"
         || record["profile"] != profile
         || record["wallet"] != hx(owner)
-        || record["wallet_id"] != json!(options.wallet_id)
         || record["declarations_hash"] != declaration_hash
         || !record["complete"].is_boolean()
     {
@@ -607,7 +604,7 @@ pub async fn onboard(
             if recipient_matches && uri_matches && catalog_matches {
                 let config = declarations
                     .with_identity(
-                        ProviderIdentityConfig::new(id, owner, options.wallet_id.clone())
+                        ProviderIdentityConfig::new(id, owner)
                             .map_err(|_| fail("provider identity configuration is invalid"))?,
                     )
                     .map_err(|_| fail("completed provider configuration is invalid"))?;
@@ -710,7 +707,7 @@ pub async fn onboard(
             } else {
                 let config = declarations
                     .with_identity(
-                        ProviderIdentityConfig::new(id, owner, options.wallet_id.clone())
+                        ProviderIdentityConfig::new(id, owner)
                             .map_err(|_| fail("provider identity configuration is invalid"))?,
                     )
                     .map_err(|_| fail("provider configuration is invalid"))?;
@@ -725,13 +722,7 @@ pub async fn onboard(
             }
         } else {
             calls
-                .register(
-                    owner,
-                    Some(&format!(
-                        "{}/discover",
-                        declarations.provider().public_origin()
-                    )),
-                )
+                .register(owner, None)
                 .map_err(|_| fail("provider registration is invalid"))?
         };
         registry
@@ -778,7 +769,6 @@ pub async fn refresh_completed_onboarding(
             "kind",
             "profile",
             "wallet",
-            "wallet_id",
             "declarations_hash",
             "agent_id",
             "complete",
@@ -791,7 +781,6 @@ pub async fn refresh_completed_onboarding(
         || record["kind"] != "mppi-provider-onboarding"
         || record["profile"] != profile_to_mapping(registry.chain().profile())
         || record["wallet"] != hx(config.identity().wallet_address())
-        || record["wallet_id"] != json!(config.identity().wallet_id())
         || decimal(&record["agent_id"])? != config.identity().provider_id()
         || record["complete"] != true
         || !record["pending"].is_null()

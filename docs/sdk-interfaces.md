@@ -1,8 +1,9 @@
 # Python SDK interfaces
 
 The two role packages are **`mppi-agent`** and **`mppi-provider`**, version
-`0.1.1`, requiring Python 3.12 or newer. They share one support distribution,
-`mppi-protocol`, containing generated wire bindings and exact payment primitives.
+`0.1.2`, requiring Python 3.12 or newer. They share support distribution
+`mppi-protocol==0.1.1`, containing generated wire bindings, exact payment primitives
+and the Circle Agent Wallet adapter.
 The support library is not an additional role SDK.
 
 The SDK implements the pure functions below, typed integration contracts and
@@ -11,14 +12,15 @@ The SDK implements the pure functions below, typed integration contracts and
 contract call preparation and canonical receipt reconciliation. The Python
 [onboarding and wallet bindings](python-onboarding.md) add resumable agent
 registration, deployment profiles, Circle adapters and shared provider setup
-helpers. These integrations have passed live Arc testnet onboarding and payment
-checks with the wallet products and prerequisites documented there.
+helpers. Earlier live Arc testnet onboarding and payment evidence belongs to
+the exact integrations in the [versioned release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0).
 The interface classes below are Python `Protocol` declarations;
 `Client` and `Mppi` provide the concrete implemented entry points.
 
 Start with the [provider quickstart](provider-quickstart.md) or
 [agent quickstart](agent-quickstart.md). Built-in setup uses the packaged official
-Arc testnet [deployment profile](deployment.md#trusted-profile-file). The
+[deployment profiles](deployment.md#trusted-profile-file) for explicit Arc testnet
+and mainnet selection. The
 [Python composition reference](python-quickstart.md) covers explicit capabilities;
 the [native CLI reference](rust-cli.md) covers provider commands for both languages.
 

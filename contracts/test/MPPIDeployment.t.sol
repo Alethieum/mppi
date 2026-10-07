@@ -89,6 +89,7 @@ contract MPPIDeploymentTest is Test {
         _rejectUninitializedSafe();
         _rejectWrongOwnerAndThreshold();
         _rejectMultipleOwnersForSelectedTestnetProfile();
+        _mainnetDeploymentAndGuards();
     }
 
     function _atomicDeploymentAndFinalRoles() private {
@@ -148,15 +149,17 @@ contract MPPIDeploymentTest is Test {
     }
 
     function _predictTimelock(bytes32 releaseSalt) private view returns (address) {
+        return _predictTimelock(releaseSalt, 60);
+    }
+
+    function _predictTimelock(bytes32 releaseSalt, uint256 delay) private view returns (address) {
         address[] memory proposers = new address[](1);
         proposers[0] = address(safe);
         address[] memory executors = new address[](1);
         return _predict(
             releaseSalt,
             "mppi.timelock",
-            abi.encodePacked(
-                type(TimelockController).creationCode, abi.encode(uint256(60), proposers, executors, address(0))
-            )
+            abi.encodePacked(type(TimelockController).creationCode, abi.encode(delay, proposers, executors, address(0)))
         );
     }
 
@@ -222,7 +225,7 @@ contract MPPIDeploymentTest is Test {
 
     function _rejectUninitializedSafe() private {
         safe.configure(new address[](0), 0);
-        vm.expectRevert(DeployMPPI.InvalidTestnetSafe.selector);
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
         script.run();
     }
 
@@ -244,11 +247,11 @@ contract MPPIDeploymentTest is Test {
         address[] memory owners = new address[](1);
         owners[0] = guardian;
         safe.configure(owners, 1);
-        vm.expectRevert(DeployMPPI.InvalidTestnetSafe.selector);
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
         script.run();
         owners[0] = owner;
         safe.configure(owners, 0);
-        vm.expectRevert(DeployMPPI.InvalidTestnetSafe.selector);
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
         script.run();
     }
 
@@ -257,7 +260,59 @@ contract MPPIDeploymentTest is Test {
         owners[0] = owner;
         owners[1] = guardian;
         safe.configure(owners, 1);
-        vm.expectRevert(DeployMPPI.InvalidTestnetSafe.selector);
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
         script.run();
+    }
+
+    function _mainnetDeploymentAndGuards() private {
+        _environment();
+        vm.chainId(5042002);
+        vm.expectRevert(abi.encodeWithSelector(DeployMPPI.WrongChain.selector, 5042002, 5042));
+        script.runMainnet();
+        vm.chainId(31337);
+        vm.expectRevert(abi.encodeWithSelector(DeployMPPI.WrongChain.selector, 31337, 5042));
+        script.runMainnet();
+        vm.chainId(5042);
+        uint64 beforeNonce = vm.getNonce(deployer);
+        // The preceding case left a two-owner Safe; mainnet requires the selected
+        // single owner too, despite using a different governance delay.
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
+        script.runMainnet();
+        address[] memory owners = new address[](1);
+        owners[0] = owner;
+        safe.configure(owners, 2);
+        vm.expectRevert(DeployMPPI.InvalidGovernanceSafe.selector);
+        script.runMainnet();
+        assertEq(vm.getNonce(deployer), beforeNonce, "invalid mainnet custody rejected before broadcast");
+        safe.configure(owners, 1);
+        bytes32 salt = keccak256("local mainnet deployment verification");
+        vm.setEnv("MPPI_RELEASE_SALT", vm.toString(salt));
+        address expectedTimelock = _predictTimelock(salt, 86_400);
+        address expectedImplementation = _predict(salt, "mppi.implementation", type(MPPI).creationCode);
+        (TimelockController timelock, MPPI implementation, ERC1967Proxy proxy) = script.runMainnet();
+        assertEq(vm.getNonce(deployer), beforeNonce + 3);
+        assertEq(address(timelock), expectedTimelock);
+        assertEq(address(implementation), expectedImplementation);
+        assertEq(timelock.getMinDelay(), 86_400);
+        assertTrue(timelock.hasRole(timelock.PROPOSER_ROLE(), address(safe)));
+        assertTrue(timelock.hasRole(timelock.CANCELLER_ROLE(), address(safe)));
+        assertTrue(timelock.hasRole(timelock.EXECUTOR_ROLE(), address(0)));
+        assertTrue(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), address(timelock)));
+        assertFalse(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), deployer));
+        assertFalse(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), address(safe)));
+        MPPI mppi = MPPI(address(proxy));
+        assertEq(uint8(mppi.pauseLevel()), uint8(IMPPI.PauseLevel.None));
+        vm.expectRevert(bytes4(keccak256("InvalidInitialization()")));
+        mppi.initialize(address(registry), guardian, address(safe), address(timelock));
+        vm.expectRevert(bytes4(keccak256("InvalidInitialization()")));
+        implementation.initialize(address(registry), guardian, address(safe), address(timelock));
+        vm.prank(guardian);
+        mppi.pause();
+        vm.prank(address(safe));
+        mppi.unpause();
+        beforeNonce = vm.getNonce(deployer);
+        vm.expectRevert(abi.encodeWithSelector(DeployMPPI.DeploymentAddressOccupied.selector, address(timelock)));
+        script.runMainnet();
+        assertEq(vm.getNonce(deployer), beforeNonce, "mainnet repeat rejected before broadcast");
     }
 }

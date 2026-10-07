@@ -10,7 +10,7 @@ use alloy_sol_types::{SolCall, SolValue};
 
 use crate::{
     chain::{ChainReader, decode_return},
-    circle::{CircleClient, CircleCredentials, CircleDeveloperWallet},
+    circle::{CircleAgentWallet, CircleOptions},
     cli::HostConfiguration,
     contract::{ARC_USDC, ContractCalls},
     follower::ChainFollower,
@@ -30,38 +30,25 @@ impl std::error::Error for SetupError {}
 /// Optional composition controls. Freshness and collection margin always come
 /// from the provider's saved configuration. Polling defaults to the follower's
 /// existing fraction of freshness; callers may select a shorter interval.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RuntimeOptions {
-    pub circle_timeout_ms: u64,
+    pub circle: CircleOptions,
     pub poll_interval_ms: Option<u64>,
     pub limits: RuntimeLimits,
     pub hooks: Hooks,
 }
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            circle_timeout_ms: 30_000,
-            poll_interval_ms: None,
-            limits: RuntimeLimits::default(),
-            hooks: Hooks::default(),
-        }
-    }
-}
-
 /// Compose the existing payment runtime using the operator saved by onboarding.
 /// `wallet_operation_path` must name its retained wallet operation record (the
 /// CLI uses `<config>.wallet-operations.json`). Missing history is never replaced.
-/// Credentials are supplied by the caller and never saved in provider config.
+/// Circle authentication remains in the official CLI session; no credentials are accepted.
 pub async fn runtime_from_config(
     host: HostConfiguration,
-    credentials: CircleCredentials,
     wallet_operation_path: impl AsRef<Path>,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
 ) -> Result<Mppi, SetupError> {
     runtime_from_config_with_options(
         host,
-        credentials,
         wallet_operation_path,
         coverage,
         execution,
@@ -73,33 +60,26 @@ pub async fn runtime_from_config(
 /// Compose with provider-selected hooks, retention limits and RPC polling.
 pub async fn runtime_from_config_with_options(
     host: HostConfiguration,
-    credentials: CircleCredentials,
     wallet_operation_path: impl AsRef<Path>,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
     options: RuntimeOptions,
 ) -> Result<Mppi, SetupError> {
-    // Client construction performs no network I/O. All local selection checks in
-    // compose precede its read-only Circle account lookup and chain verification.
-    let client = Arc::new(
-        CircleClient::new(credentials, options.circle_timeout_ms)
-            .map_err(|_| SetupError("invalid Circle client configuration"))?,
+    let wallet = Arc::new(
+        CircleAgentWallet::open_existing(
+            host.chain.clone(),
+            host.config.identity().wallet_address(),
+            wallet_operation_path.as_ref(),
+            options.circle.clone(),
+        )
+        .map_err(|_| SetupError("restore the existing Circle Agent Wallet operation record"))?,
     );
-    compose(
-        host,
-        client,
-        wallet_operation_path.as_ref(),
-        coverage,
-        execution,
-        options,
-    )
-    .await
+    compose(host, wallet, coverage, execution, options).await
 }
 
 async fn compose(
     host: HostConfiguration,
-    client: Arc<CircleClient>,
-    wallet_operation_path: &Path,
+    wallet: Arc<CircleAgentWallet>,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
     options: RuntimeOptions,
@@ -114,12 +94,9 @@ async fn compose(
             "provider configuration and deployment profile differ",
         ));
     }
-    let wallet_id = config.identity().wallet_id().ok_or(SetupError(
-        "saved provider configuration needs its Circle wallet id",
-    ))?;
-    if !std::fs::symlink_metadata(wallet_operation_path).is_ok_and(|metadata| metadata.is_file()) {
+    if wallet.address() != config.identity().wallet_address() {
         return Err(SetupError(
-            "restore the existing Circle wallet operation record",
+            "saved provider operator differs from Circle Agent Wallet",
         ));
     }
     let follower = Arc::new(
@@ -131,21 +108,11 @@ async fn compose(
         )
         .map_err(|_| SetupError("invalid provider chain polling policy"))?,
     );
-    let identity = client
-        .wallet(wallet_id, config.chain().chain_id())
-        .await
-        .map_err(|_| SetupError("saved Circle wallet is unavailable on the selected network"))?;
-    if identity.address() != config.identity().wallet_address() {
-        return Err(SetupError(
-            "saved provider operator differs from Circle wallet identity",
-        ));
-    }
+    wallet.verify_wallet().await.map_err(|error| match error {
+        crate::circle::CircleError::Authentication => SetupError("Circle Agent Wallet session missing or expired; run circle wallet login EMAIL (mainnet) or circle wallet login EMAIL --testnet, then rerun"),
+        _ => SetupError("Circle Agent Wallet account, network, CLI version or code pins could not be verified"),
+    })?;
     let contract = verified_usdc_contract(&chain).await?;
-    let wallet = Arc::new(
-        CircleDeveloperWallet::open_existing(client, identity, wallet_operation_path).map_err(
-            |_| SetupError("Circle wallet operation record unavailable or inconsistent"),
-        )?,
-    );
     Mppi::with_limits_and_hooks(
         config,
         follower,

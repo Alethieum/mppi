@@ -10,12 +10,12 @@ It enforces payment authority and bounds; it does not measure inference usage.
 | [IMPPI.sol](src/IMPPI.sol), [application ABI](abi/IMPPI.json) | Stable protocol functions, descriptors, errors and events |
 | [MPPI.sol](src/MPPI.sol), [implementation ABI](abi/MPPI.json) | Payment implementation and inherited OpenZeppelin surface |
 | [MPPISigning.sol](src/MPPISigning.sol) | Session identity and EIP-712 hashes shared with both SDKs |
-| [DeployMPPI.s.sol](script/DeployMPPI.s.sol) | Guarded Arc testnet deployment preparation |
+| [DeployMPPI.s.sol](script/DeployMPPI.s.sol) | Guarded Arc mainnet/testnet deployment preparation |
 | [test/](test/) | Unit, adversarial, fuzz, invariant and deployment tests |
 
 Read the [contract profile](../docs/contract-interface.md) and
-[deployment requirements](../docs/deployment.md). No live MPPI address is
-announced here. SDK runtime integration and Arc acceptance remain pending.
+[deployment reference](../docs/deployment.md) for the verified mainnet and testnet
+addresses, configuration observations and versioned acceptance scope.
 
 ## Verify locally
 

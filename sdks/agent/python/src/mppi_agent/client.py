@@ -38,7 +38,7 @@ from mppi_protocol.capabilities import (
     WalletCall,
 )
 from mppi_protocol.catalog import Catalog, parse_catalog, validate_model
-from mppi_protocol.chain import ChainEvidenceError, ChainSession
+from mppi_protocol.chain import ChainEvidenceError, ChainSession, DeploymentProfile
 from mppi_protocol.contract import ContractCalls, OperationKind, PreparedOperation
 from mppi_protocol.discovery import ProviderIdentity, normalize_origin, parse_document
 from mppi_protocol.errors import ValidationError
@@ -286,6 +286,8 @@ class Client:
         config_path: Path = Path(".mppi/agent.json"),
         initial_session_tokens: int | None = None,
         ca_file: str | None = None,
+        testnet: bool = True,
+        profile: DeploymentProfile | None = None,
     ) -> Client:
         """Use completed CLI onboarding; funding still requires an explicit choice."""
         from .setup import client_from_config
@@ -295,6 +297,8 @@ class Client:
             config_path=config_path,
             initial_session_tokens=initial_session_tokens,
             ca_file=ca_file,
+            testnet=testnet,
+            profile=profile,
         )
 
     def __init__(

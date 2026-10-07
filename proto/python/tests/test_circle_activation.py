@@ -7,9 +7,9 @@ from dataclasses import replace
 import pytest
 from eth_abi import encode
 from eth_utils import keccak
-from mppi_agent.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.capabilities import FundingAuthorization, WalletCall
 from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.registry import RegistryCalls
 from mppi_protocol.signing import voucher_digest

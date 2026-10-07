@@ -5,14 +5,14 @@ then handles discovery, payment messages and inference against the provider's
 MPPI endpoint. This guide uses Circle Agent Wallet on official Arc testnet,
 with Python 3.12+ on macOS or Linux.
 
-The built-in setup requires `mppi-agent` version `0.1.1`. Existing applications
+The built-in setup requires `mppi-agent` version `0.1.2`. Existing applications
 can continue using the [explicit composition interface](python-quickstart.md).
 
 ## 1. Install
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-agent==0.1.1'
+uv pip install 'mppi-agent==0.1.2'
 ```
 
 The shared protocol dependency installs automatically. Run the remaining
@@ -107,7 +107,59 @@ For cooperative close, repeat `sessions.close(session_id)` to inspect the same
 close operation. Never repeat inference to resolve an uncertain payment.
 See [runtime lifecycle](python-runtime.md).
 
-## Supported wallet version
+## Select mainnet explicitly
+
+Circle Agent Wallet supports both [Arc networks](https://developers.circle.com/agent-stack/agent-wallets/supported-blockchains).
+It is the same wallet product, with separate mainnet and testnet login sessions,
+chain balances and MPPI configuration. Use the address returned for `ARC`;
+do not assume a testnet wallet or identity is ready on mainnet.
+
+Authenticate and select your mainnet wallet:
+
+```sh
+circle wallet login you@example.com
+circle wallet list --type agent --chain ARC --output json
+circle wallet balance --address YOUR_MAINNET_WALLET --chain ARC
+```
+
+Circle login without `--testnet` selects mainnet. Follow
+[Circle's funding instructions](https://developers.circle.com/agent-stack/agent-wallets/quickstart)
+to fund that wallet with your chosen amount of real USDC. Then use a separate
+private configuration directory:
+
+```sh
+.venv/bin/mppi-agent onboard --mainnet --wallet YOUR_MAINNET_WALLET \
+  --config .mppi-mainnet/agent.json
+```
+
+Exclude `.mppi-mainnet/` from version control and retain the entire directory.
+The network flag selects the packaged deployment and `ARC_RPC_URL_MAINNET`.
+If that variable is unset, the agent uses Arc's documented
+`https://rpc.blockdaemon.mainnet.arc.io`; an explicit `--rpc-env NAME` selects
+your own environment reference. See [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc).
+
+Use the same network explicitly when constructing the client:
+
+```python
+from pathlib import Path
+from mppi_agent import Client
+
+with Client.from_config(
+    "https://YOUR_MAINNET_PROVIDER",
+    config_path=Path(".mppi-mainnet/agent.json"),
+    testnet=False,
+    initial_session_tokens=10_000,
+) as client:
+    # Use the request and session methods shown above.
+    print(client.agent_id)
+```
+
+The Python agent API defaults to testnet. `onboard_circle(..., testnet=False)`
+also selects mainnet and its RPC environment when `rpc_env` is omitted.
+Both setup and client construction reject a retained configuration from another
+deployment. An explicit trusted `profile=` override remains supported.
+
+## Supported wallet versions
 
 The built-in Circle profile verifies these Arc testnet values:
 
@@ -118,11 +170,25 @@ The built-in Circle profile verifies these Arc testnet values:
 | Implementation runtime Keccak-256 | `0x3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa` |
 
 The implementation has [verified source](https://explorer.testnet.arc.io/address/0x895b96c92d1007872fe1f70606e6b7eeaebd620e?tab=contract).
+Mainnet source support pins the actual Circle Agent Wallet
+`circle_6900_singleowner_v4` account generation:
+
+| Component | Trusted mainnet value |
+| --- | --- |
+| Proxy runtime Keccak-256 | `0xd09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66` |
+| Implementation | `0x9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed` |
+| Implementation runtime Keccak-256 | `0x60ecaaadc845f14626e77541b390bd36a7f5c35efdee5c30471f0eb08626019e` |
+
+The mainnet pins were bound to Circle's authenticated account metadata and its
+[activation receipt](https://explorer.arc.io/tx/0x39cc91d351345c62163c6cd45ad6815f34c5cb063eb2b90cd4cd5fae53984e4c),
+then checked for the adapter's self-execution call, ERC-1271 signatures and
+zero-value USDC authorization simulation. That account interoperability check
+does not establish a funded MPPI exchange or an audit of Circle's implementation.
 Unsupported code fails verification. RPC-returned code is never automatically
 trusted. Circle's [contract versions](https://developers.circle.com/wallets/wallet-upgrades#contract-versions)
-differ between account generations; this profile does not cover every Circle SCA.
+differ between products and account generations; these pins do not cover every
+Circle SCA or infer an Agent Wallet version from Developer Wallet documentation.
 
 Existing compatible wallet integrations retain `FundingWallet`, `SessionSigner`,
 explicit `Client(...)` and `--wallet-factory MODULE:FUNCTION --profile FILE`.
-See [advanced wallet integration](python-onboarding.md). The built-in profile
-selects official testnet only.
+See [advanced wallet integration](python-onboarding.md).

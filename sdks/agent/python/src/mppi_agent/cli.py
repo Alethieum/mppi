@@ -19,7 +19,7 @@ from mppi_protocol.registry import RegistryReader
 from mppi_protocol.types import uint256
 
 from .onboarding import OnboardingError, onboard
-from .setup import DEFAULT_CONFIG, DEFAULT_RPC_ENV, onboard_circle
+from .setup import DEFAULT_CONFIG, DEFAULT_RPC_ENV, MAINNET_RPC_ENV, onboard_circle
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         "onboard", help="check funding and complete ERC-8004 registration"
     )
     command.add_argument(
-        "--profile", type=Path, help="verified deployment profile for a custom wallet factory"
+        "--profile", type=Path, help="explicit trusted deployment profile override"
     )
     command.add_argument(
         "--config",
@@ -46,10 +46,14 @@ def main(argv: list[str] | None = None) -> int:
         "--wallet", help="address of your authenticated, funded Circle Agent Wallet"
     )
     command.add_argument("--rpc-env", help="environment variable containing the Arc RPC URL")
-    command.add_argument(
+    network = command.add_mutually_exclusive_group()
+    network.add_argument(
         "--testnet",
         action="store_true",
         help="select built-in Arc testnet setup, or require testnet in a custom trusted profile",
+    )
+    network.add_argument(
+        "--mainnet", action="store_true", help="select the packaged official Arc mainnet deployment"
     )
     command.add_argument(
         "--agent-id", help="adopt an existing identity owned by the selected wallet"
@@ -59,9 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--wallet-factory requires --profile")
     try:
         if args.wallet_factory is None:
-            if not args.testnet or args.wallet is None or args.profile is not None:
+            if not (args.testnet or args.mainnet) or args.wallet is None:
                 raise OnboardingError(
-                    "use onboard --testnet --wallet ADDRESS for built-in Circle setup; custom profiles require --wallet-factory"
+                    "select --testnet or --mainnet and --wallet ADDRESS for built-in Circle setup"
                 )
             selected_id = None
             if args.agent_id is not None:
@@ -71,8 +75,10 @@ def main(argv: list[str] | None = None) -> int:
             setup = onboard_circle(
                 args.wallet,
                 config_path=args.config,
-                rpc_env=args.rpc_env or DEFAULT_RPC_ENV,
+                rpc_env=args.rpc_env or (MAINNET_RPC_ENV if args.mainnet else DEFAULT_RPC_ENV),
                 agent_id=selected_id,
+                testnet=not args.mainnet,
+                profile=load_profile(args.profile) if args.profile is not None else None,
             )
             _print_result(setup.onboarding, setup.wallet_address, config=str(setup.config_path))
             return 0 if setup.onboarding.complete else 2
@@ -102,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         profile = load_profile(args.profile)
         if args.testnet and profile.domain.chain_id != 5042002:
             raise OnboardingError("--testnet requires an Arc testnet deployment profile")
+        if args.mainnet and profile.domain.chain_id != 5042:
+            raise OnboardingError("--mainnet requires an Arc mainnet deployment profile")
         module, name = args.wallet_factory.split(":", 1)
         factory = getattr(importlib.import_module(module), name)
         wallet = cast(TransactionWallet, factory(profile))

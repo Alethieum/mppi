@@ -3,7 +3,7 @@
 The native Python agent `Client`, provider `Mppi` payment services and shared
 chain observer implement the paid request loop below. Start with the
 [provider quickstart](provider-quickstart.md) or [agent quickstart](agent-quickstart.md)
-for `0.1.1` built-in setup with the packaged official Arc testnet profile.
+for `0.1.2` built-in setup with packaged official Arc mainnet and testnet profiles.
 The [Python composition reference](python-quickstart.md) covers custom wallet
 and explicit chain capabilities.
 
@@ -237,7 +237,7 @@ become money. Errors identify the field without echoing rejected secret values.
 | Section | Required fields and optional values |
 | --- | --- |
 | `provider` | `name`, `description`, HTTPS `public_origin`, nonzero `recipient`; optional `image`, extra `services` |
-| `identity` | uint256 `provider_id`, owner `wallet_address`; optional Circle `wallet_id` |
+| `identity` | uint256 `provider_id`, owner `wallet_address` |
 | `chain` | positive `max_age_ms`; `network` defaults to `mainnet`, optional explicit `rpc` |
 | `upstream` | full internal `url`, optional `api_key_env` credential reference |
 | `models` | unique model cards with explicit capabilities and input/output rates; cache rate optional |

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "chain_id": 5042,
+  "proxy": {
+    "address": "0xbdf7c950390316b6091b729f271371984b37ded7",
+    "code_hash": "0x5ccd3460303a60e591ccd41397bc49be5f31bdae6023150cd0e5a7df83411add"
+  },
+  "implementation": {
+    "address": "0x6de8b8cd1200ffd27c460929c8bf8437e129243b",
+    "code_hash": "0xbf0c89810e4a6b4a036a48b9486eea90327470751f2b56c9124f9226f9df25a2"
+  },
+  "registry": {
+    "address": "0x8004a169fb4a3325136eb29fa0ceb6d2e539a432",
+    "code_hash": "0xd0e45b1d89fa9b6cc7e97c1f155d64180e5c232aaccf9900ef9d4fd738c02b41"
+  },
+  "registry_implementation": {
+    "address": "0x7274e874ca62410a93bd8bf61c69d8045e399c02",
+    "code_hash": "0xa5f9624ea85e45b3f4b8558581f03bfb3e6cefab278d7bf0500ec9bd065dc16f"
+  }
+}

@@ -1,6 +1,6 @@
 # MPPI agent SDK for Python
 
-Version `0.1.1` adds built-in Circle CLI onboarding and
+Version `0.1.2` supports explicit Arc mainnet and testnet selection with built-in Circle CLI onboarding and
 `Client.from_config(...)`. See the
 [agent quickstart](../../../docs/agent-quickstart.md).
 

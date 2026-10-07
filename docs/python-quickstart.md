@@ -9,15 +9,22 @@ Install the role your application uses:
 
 ```sh
 # Provider environment
-uv pip install 'mppi-provider==0.1.1'
+uv pip install 'mppi-provider==0.1.2'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.1'
+uv pip install 'mppi-agent==0.1.2'
 ```
 
-Each role installs its required `mppi-protocol==0.1.0` dependency. The applications
+Each role installs its required `mppi-protocol==0.1.1` dependency. The applications
 communicate through the provider's HTTPS origin; neither needs the other role's
 package. Source development uses the [local build guide](build.md).
+
+The explicit profile example on this page uses testnet. Version `0.1.2`
+also supports packaged mainnet selection through the built-in helpers:
+`Client.from_config(..., testnet=False)` and
+`await Mppi.from_config(..., testnet=False)`. Follow the quickstarts' mainnet
+sections for separate wallet/configuration and RPC selection. Use the accepted
+mainnet profile with explicit composition; never reuse the testnet profile.
 
 ## Explicit integration inputs
 

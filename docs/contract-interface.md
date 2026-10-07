@@ -155,7 +155,8 @@ There is no deployer bootstrap admin. The stock delay can subsequently change
 through a timelocked self-call; MPPI does not add an immutable delay floor.
 
 Before creating the mainnet proxy, verify the actual governance Safe is initialized
-with exactly the selected **3-of-5** custody. Testnet may use 1-of-1. Verify the
+with the selected **single owner and threshold one**, matching the testnet
+custody arrangement. Shared signing custody provides no independent quorum. Verify the
 registry, Safe, controller, chain id, deployed code identities, roles and delay;
 code presence alone is not identity proof. Publish a deployment manifest only
 after implementation/proxy initialization, domain, initial pause state and absence

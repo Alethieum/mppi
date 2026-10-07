@@ -1,12 +1,10 @@
 """Read-only composition from confirmed provider configuration.
 
-The provider supplies the secret environment, trusted deployment selection and
-execution integration. No wallet, identity, listener or retained state is created.
-Circle verification uses the existing adapter's read-only ``verify_wallet``:
-https://developers.circle.com/api-reference/wallets/developer-controlled-wallets/get-wallet
-The registered entity secret is 32 bytes, represented here by the CLI's 64 hex
-characters: https://developers.circle.com/wallets/dev-controlled/entity-secret-management
-Sources checked 2026-10-06; USDC checks match mppi_agent/setup.py:_verify_usdc.
+The provider supplies authenticated Circle CLI access, trusted deployment
+selection and execution integration. Restore the native CLI's original wallet
+operation record; composition creates no wallet, identity or retained state.
+Circle CLI 1.1.4 wallet/list and transaction evidence are checked by the shared
+adapter in mppi_protocol.circle. USDC checks follow the same canonical profile.
 """
 
 from __future__ import annotations
@@ -16,8 +14,8 @@ import re
 from importlib.resources import files
 from pathlib import Path
 
-from mppi_protocol.chain import ChainReader, DeploymentProfile, HttpJsonRpc
-from mppi_protocol.circle import CircleDeveloperWallet
+from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile, HttpJsonRpc
+from mppi_protocol.circle import CircleAgentWallet, supported_account_pins
 from mppi_protocol.contract import ARC_USDC, ContractCalls, _decode_exact, _hash
 from mppi_protocol.deployment import profile_from_mapping
 from mppi_protocol.discovery import parse_document
@@ -37,10 +35,9 @@ def _profile(
     if config.chain.network != ("testnet" if testnet else "mainnet"):
         raise SetupError("provider configuration differs from the selected network")
     if profile is None:
-        if not testnet:
-            raise SetupError("mainnet requires an explicitly trusted deployment profile")
+        name = "arc-testnet.json" if testnet else "arc-mainnet.json"
         profile = profile_from_mapping(
-            parse_document(files("mppi_provider").joinpath("arc-testnet.json").read_bytes())
+            parse_document(files("mppi_provider").joinpath(name).read_bytes())
         )
     if (
         not isinstance(profile, DeploymentProfile)
@@ -61,26 +58,23 @@ def _rpc(config: ProviderConfig, rpc_env: str | None) -> HttpJsonRpc:
     return HttpJsonRpc(endpoint)
 
 
-def _wallet(config: ProviderConfig) -> CircleDeveloperWallet:
-    if config.identity.wallet_id is None:
-        raise SetupError("confirmed provider configuration requires a Circle wallet id")
-    api_key = os.environ.get("CIRCLE_API_KEY")
-    if not api_key:
-        raise SetupError("configure CIRCLE_API_KEY through the provider secret environment")
-    secret = os.environ.get("CIRCLE_ENTITY_SECRET")
-    if secret is None or re.fullmatch(r"[0-9a-fA-F]{64}", secret) is None:
-        raise SetupError("CIRCLE_ENTITY_SECRET must be the registered 32-byte hexadecimal secret")
+def _wallet(
+    config: ProviderConfig, reader: ChainReader, config_path: str | Path
+) -> CircleAgentWallet:
+    path = Path(config_path)
     try:
-        return CircleDeveloperWallet(
-            api_key=api_key,
-            entity_secret=bytes.fromhex(secret),
-            wallet_id=config.identity.wallet_id,
-            address=config.identity.wallet_address,
-            chain_id=config.chain.chain_id,
-            timeout_ms=30_000,
+        proxy_hash, implementation = supported_account_pins(config.chain.chain_id)
+        return CircleAgentWallet(
+            chain=reader,
+            wallet=CodePin(config.identity.wallet_address, proxy_hash),
+            implementation=implementation,
+            checkpoint_path=path.with_name(path.name + ".wallet-operations.json"),
+            require_existing=True,
         )
     except Exception:
-        raise SetupError("invalid Circle wallet configuration") from None
+        raise SetupError(
+            "restore the original Circle wallet operation record for this configuration"
+        ) from None
 
 
 def _verify_usdc(reader: ChainReader) -> None:
@@ -113,13 +107,14 @@ def _prepare(
     testnet: bool,
     profile: DeploymentProfile | None,
     rpc_env: str | None,
-) -> tuple[ProviderConfig, ChainReader, CircleDeveloperWallet, ContractCalls]:
+) -> tuple[ProviderConfig, ChainReader, CircleAgentWallet, ContractCalls]:
     """Blocking configuration and verification; creates no event-loop objects."""
     config = ProviderConfig.from_file(config_path)
     try:
         selected = _profile(config, testnet, profile)
         rpc = _rpc(config, rpc_env)
-        wallet = _wallet(config)
+        reader = ChainReader(rpc, selected)
+        wallet = _wallet(config, reader, config_path)
     except SetupError:
         raise
     except Exception:
@@ -128,7 +123,6 @@ def _prepare(
         wallet.verify_wallet()
     except Exception:
         raise SetupError("Circle wallet verification failed") from None
-    reader = ChainReader(rpc, selected)
     try:
         _verify_usdc(reader)
     except SetupError:

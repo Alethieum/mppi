@@ -4,8 +4,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from mppi_agent.checkpoint import Checkpoint
 from mppi_protocol.errors import ValidationError
+from mppi_protocol.local_state import Checkpoint
 
 
 def test_checkpoint_persists_nonsecret_intent_and_excludes_another_owner(tmp_path: Path) -> None:
@@ -34,7 +34,7 @@ def test_failed_replace_preserves_previous_economic_intent(tmp_path: Path) -> No
     checkpoint = Checkpoint(tmp_path / "agent.json")
     try:
         checkpoint.save({"version": 1, "operation_ref": "original"})
-        with patch("mppi_agent.checkpoint.os.replace", side_effect=OSError("disk")):
+        with patch("mppi_protocol.local_state.os.replace", side_effect=OSError("disk")):
             with pytest.raises(ValidationError):
                 checkpoint.save({"version": 1, "operation_ref": "replacement"})
         assert checkpoint.load() == {"version": 1, "operation_ref": "original"}

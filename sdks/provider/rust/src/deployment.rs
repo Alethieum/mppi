@@ -17,6 +17,15 @@ pub fn official_testnet_profile() -> Result<DeploymentProfile, ValidationError> 
     )?)
 }
 
+/// Exact public release pins from `mppi/deployments/arc-mainnet.json`.
+/// These pins are packaged with the SDK; RPC responses never supply trust anchors.
+pub fn official_mainnet_profile() -> Result<DeploymentProfile, ValidationError> {
+    profile_from_mapping(&parse_document(
+        include_bytes!("arc-mainnet.json"),
+        MAX_DOCUMENT_BYTES,
+    )?)
+}
+
 fn invalid() -> ValidationError {
     ValidationError::new(ValidationCode::InvalidValue, "invalid deployment profile")
 }

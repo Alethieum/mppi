@@ -1,6 +1,6 @@
 # MPPI provider — Rust
 
-Version `0.1.1` provides exact payment arithmetic, canonical price catalogs,
+Version `0.1.2` provides exact payment arithmetic, canonical price catalogs,
 immutable validation of provider usage reports, generated `mppi.v1` tonic types
 and typed session/proof hashing and verification. It also provides validated
 configuration and integration traits, discovery documents, bounded HTTP/RPC,
@@ -9,10 +9,12 @@ canonical chain evidence, freshness checks and explicit contract operations.
 admission, provider reports, supplied-history recovery, ordered batch capture
 and cooperative close. The native CLI adds provider onboarding, explicit updates,
 provider-host launch and endpoint verification. `provider init` generates fresh
-declarations; `--testnet` selects the packaged official profile.
+declarations for an explicit network; saved configuration selects the packaged
+official mainnet or testnet profile, with optional `--mainnet` / `--testnet` overrides.
 `setup::runtime_from_config` composes the runtime with the existing Circle
-operator. Earlier `0.1.0` live Arc testnet acceptance exercised an independent
-Python agent, including capture/refund and explicit updates. The official deployment remains Arc testnet. See the
+Agent Wallet operator. Earlier `0.1.0` live Arc testnet acceptance exercised an independent
+Python agent, including capture/refund and explicit updates. See the
+[deployment reference](../../../docs/deployment.md) for both networks and the
 [v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0) for
 the exact artifact digests, published-install verification status and security
 review scope and results.
@@ -24,7 +26,7 @@ the complete setup and Linux ARM64 binary installation. To build the native CLI
 from crates.io, use Rust 1.95.0:
 
 ```sh
-cargo install mppi-provider --version 0.1.1 --locked --bin mppi
+cargo install mppi-provider --version 0.1.2 --locked --bin mppi
 mppi --help
 ```
 
@@ -33,7 +35,7 @@ provider application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-mppi-provider = "=0.1.1"
+mppi-provider = "=0.1.2"
 ```
 
 Build that application using its own committed lockfile. The CLI uses the
@@ -162,12 +164,14 @@ with a fixed producer wait deadline.
 
 ## Chain evidence and wallet calls
 
-Use `deployment::official_testnet_profile()` for the packaged verified official
-Arc testnet pins, or `deployment::load_profile(path)` for an explicit trusted
-manifest. The CLI selects the packaged profile with `--testnet`; without that
-selection an explicit profile is required. A supplied manifest needs independent
-provenance. The chain reader verifies the observed deployment against either
-profile, using the selected trusted RPC.
+Use `deployment::official_mainnet_profile()` or
+`deployment::official_testnet_profile()` for the packaged official Arc pins, or
+`deployment::load_profile(path)` for an explicit trusted manifest. The CLI selects
+the packaged profile from the resolved configuration network. `--mainnet` and
+`--testnet` override that network; `--profile` supplies independent pins which
+must still match it. A supplied manifest needs independent provenance. The
+chain reader verifies the observed deployment against the selected profile
+using the selected trusted RPC.
 
 `http::HttpTransport::new(timeout_ms, max_bytes, ca_pem)` uses verified TLS,
 no redirects, no implicit proxy, no retries and no decompression. A supplied
@@ -199,9 +203,14 @@ usage within the voucher's authorization. A higher voucher alone is not usage.
 Wallet adapters must durably bind each operation reference to its exact intent
 before sending it. Keep unknown outcomes and their handles for reconciliation.
 Only verified canonical receipts and state establish confirmation; a repeated
-no-op cannot invent a new collection event. `circle::CircleDeveloperWallet`
-supplies the native Circle SCA capability with an explicit bounded operation
-record. Registry and CLI onboarding use the same original-operation checks.
+no-op cannot invent a new collection event. `circle::CircleAgentWallet`
+uses official Circle CLI `1.1.4` with an explicit bounded operation record.
+`CircleAgentWallet::new(chain, address, path, CircleOptions)` creates a journal;
+`open_existing` requires the original journal. `setup::runtime_from_config(host,
+operation_path, coverage, execution)` composes the authenticated wallet and runtime.
+Registry and CLI onboarding use the same original-operation checks. Select the
+operator with `mppi provider onboard --wallet ADDRESS`; login and renewal remain
+with Circle and the operator.
 
 ## Proof verification
 

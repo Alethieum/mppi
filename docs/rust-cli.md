@@ -5,16 +5,18 @@ and Rust providers. Start with the [provider quickstart](provider-quickstart.md)
 for installation, generated declarations and application composition. This
 reference covers onboarding, host launch, verification and explicit updates.
 
-Provider `0.1.1` packages the verified official Arc testnet profile. Use
-`--testnet` to select it; the observed chain, code and proxy implementation must
-still match its pins. `--rpc-env NAME` reads your trusted RPC URL from the named
-environment variable. The commands below use `ARC_RPC_URL_TESTNET`; set it through
-your secret environment before running them. Without that flag, the configuration
-selects the RPC, defaulting to `https://rpc.testnet.arc.io` on testnet.
-`--profile FILE` accepts an independently trusted explicit profile.
-`--testnet` selects the testnet configuration override. The resulting network
-and selected profile must agree.
-[Arc connection details](https://docs.arc.io/arc/references/connect-to-arc).
+Provider `0.1.2` packages official Arc mainnet and testnet profiles and selects
+the profile from the resolved `chain.network`. `--mainnet` or `--testnet` overrides that
+configuration selection; `init` requires one of these flags. An explicit
+`--profile FILE` overrides packaged pins and must match the selected network.
+Observed chain, code and proxy implementation must still match those pins.
+
+`--rpc-env NAME` reads your trusted RPC URL from the named environment variable.
+The testnet commands below use `ARC_RPC_URL_TESTNET`; set it through your secret
+environment before running them. Without that flag, the configuration selects
+the RPC, defaulting to `https://rpc.testnet.arc.io` on testnet and
+`https://rpc.mainnet.arc.io` on mainnet. Use `ARC_RPC_URL_MAINNET` explicitly for a
+mainnet environment override. See [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc).
 
 ## Generate declarations
 
@@ -28,18 +30,23 @@ another output. Replace every `REPLACE` placeholder and review the illustrative
 model, payment and freshness settings; add listener settings for standalone use.
 The template intentionally has no confirmed identity. Onboarding writes that identity to `mppi.toml`.
 
-## Configuration and credentials
+## Configuration and wallet access
 
 `--config` selects the applied configuration path; its default is `mppi.toml`.
 Keep the configuration and its sidecars in a private durable directory.
 `--timeout-ms` sets the bounded CLI request timeout; the default is 30,000 ms.
 
-The operator is a Circle developer-controlled SCA. Configure `CIRCLE_API_KEY`
-and the registered `CIRCLE_ENTITY_SECRET` through your secret environment.
-Configure Circle Gas Station for that wallet/network. The receive-only payout
-recipient is a different address, with signing custody separate from serving.
-Secret values are never command-line options. The upstream URL is its complete
-API base, including its path prefix; your application supplies its authentication.
+The operator is an existing Circle Agent Wallet selected by address. Install
+`@circle-fin/cli@1.1.4` and complete `circle wallet login EMAIL --testnet`, or omit
+`--testnet` for mainnet. Use `circle wallet list --type agent --chain ARC-TESTNET`
+(`ARC` on mainnet) to select it. Keep the Circle CLI available on `PATH` to both
+the native CLI and provider host. Circle's [sessions](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/authenticate)
+expire after 28 days; renew access to the same wallet when needed.
+
+The payout recipient is a different address whose signing authority stays outside
+serving. Circle Agent Wallet gas is [sponsored subject to caps and fair use](https://developers.circle.com/agent-stack/agent-wallets/fees).
+The upstream URL is its complete API base, including its path prefix; your
+application supplies its authentication.
 
 For a Rust owned listener, add explicit listener settings before onboarding:
 
@@ -59,14 +66,14 @@ native gRPC over HTTP/2. Python applications configure their own listeners.
 ## Register and retain the result
 
 ```sh
-mppi provider onboard --testnet --config mppi.toml \
+mppi provider onboard --testnet --config mppi.toml --wallet YOUR_OPERATOR_WALLET \
   --declarations provider-declarations.toml --rpc-env ARC_RPC_URL_TESTNET
 ```
 
-`--wallet-id` selects an existing accessible Circle SCA. Without an existing
-wallet selection, onboarding creates the missing wallet resources. The command
-checks registration, binds the separate recipient, prepares discovery and
-publishes the initial catalog last. A provider identity is saved only after
+`--wallet ADDRESS` selects an existing authenticated Circle Agent Wallet on the
+selected network. Saved reruns may omit the address; a different selection is
+rejected. The command checks registration, binds the separate recipient, prepares
+discovery and publishes the initial catalog last. A provider identity is saved only after
 confirmed registry evidence; ID zero remains a valid identity.
 
 When recipient proof is needed, the JSON result contains `request`. Sign that
@@ -93,25 +100,18 @@ not confirmation. The command checks the original wallet operation and canonical
 registry evidence. An unresolved registration never becomes another mint.
 Completed onboarding checks current state without another registry write.
 Keep the same configuration path and its sidecars across invocations. After
-completion, `mppi.toml` contains the confirmed provider ID, operator address and
-Circle wallet ID alongside the declarations. The result explicitly reports
+completion, `mppi.toml` contains the confirmed provider ID and operator address
+alongside the declarations. The result explicitly reports
 `endpoint_verified: false` and `runtime_application_required: true`: registration
 does not start your application or prove its public route.
 
-For a deployed operator SCA, the credential check signs a fresh nonpayment
-message and discards its signature. Circle rejects typed-data signing before an
-SCA's first onchain transaction. Initial onboarding therefore checks the selected
-wallet's deployment at a canonical block. When it has no code, the intended
-registration transaction validates the entity secret and deploys the wallet;
-no separate activation transaction is added. This also supports an accessible,
-undeployed SCA selected with `--wallet-id`. Existing provider configurations and
-identity adoption require a deployed operator. See Circle's
-[SCA wallets and lazy deployment](https://developers.circle.com/wallets/signing-apis#sca-wallets-and-lazy-deployment).
-
-If wallet creation loses its response, the next invocation searches the retained
-wallet reference. An unresolved wallet-set creation requires checking Circle
-Console and supplying that existing `--wallet-set-id`. The command does not
-repeatedly create resources while an earlier result is unknown.
+The adapter checks CLI version, authenticated account selection and the supported
+SCA runtime and implementation. Initial onboarding permits an undeployed account
+only for the intended registration call. It verifies the deployed account before
+continuing; no separate activation transaction is added. Existing provider
+configurations and runtime composition require the deployed account. See
+[the adapter source](../sdks/provider/rust/src/circle.rs) and Circle's
+[contract execution interface](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/execute-contract).
 
 ## Build and start your integration
 
@@ -138,7 +138,7 @@ mppi provider serve --config /etc/mppi/mppi.toml \
 ```
 
 The host receives `--config` and any explicit `--profile`, `--rpc-env`,
-`--timeout-ms`, `--testnet` and `--upstream` arguments. Use
+`--timeout-ms`, `--mainnet` / `--testnet` and `--upstream` arguments. Use
 `cli::host_configuration(std::env::args_os().skip(1))` to load the same validated
 configuration, profile and chain reader. It inherits the provider's environment;
 select a trusted absolute executable path. On Unix, process replacement keeps
@@ -210,23 +210,30 @@ retain their recipient/operator, and admitted runs retain their accepted prices.
 
 ## Local records and results
 
-The CLI keeps setup and wallet-operation sidecars beside the selected config.
-For `--config mppi.toml`, these are `mppi.toml.wallet-setup.json`,
-`mppi.toml.onboarding.json`, `mppi.toml.wallet-operations.json` and, after an
+The CLI keeps onboarding and wallet-operation sidecars beside the selected config.
+For `--config mppi.toml`, these are `mppi.toml.onboarding.json`,
+`mppi.toml.wallet-operations.json` and, after an
 explicit update, `mppi.toml.update.json`, with their locking records.
 Keep that directory private, durable and backed up. Cooperating local commands
 use file locks. Providers coordinate independent hosts using the same operator.
 The records contain exact setup/payment transaction intent and identifiers,
 not credentials, inference history, usage storage or a provider recovery service.
 
-`CircleDeveloperWallet` requires an explicit local operation-record path. It
-binds each reference to the exact wallet, network, destination and calldata
-before submission. Reconciliation is read-only. The adapter trusts Circle's
-authenticated original reference/transaction-ID lookup to associate a chain hash
-with that call; the SDK separately verifies canonical receipts and effects. Its bounded record accepts
-16 MiB and 16,384 operation references; it refuses new operations at capacity
-and never silently deletes original evidence. Retain old records for unresolved
-and recoverable operations when managing that wallet's retained history.
+`CircleAgentWallet` requires an explicit local operation-record path. It binds
+each reference to the exact wallet, network, destination and calldata before
+submission. Python and Rust use the same journal format. Reconciliation is
+read-only and requires the original retained Circle transaction ID and matching
+call fields. If submission loses its result before that ID is saved, the operation
+remains `UNKNOWN`; similar history entries do not establish its identity. Keep
+the original journal and resolve the original operation with Circle before any
+replacement is considered.
+
+The adapter permits 60 KiB calldata, 4,096 operation references and a 16 MiB
+journal. It refuses new operations at capacity and retains original evidence.
+Read commands have a default 240-second deadline and reconciliation examines at
+most 20 pages. Execute and sign commands drain to completion; a timeout kill does
+not turn an uncertain submission into a safe retry. Trusted embedded hosts can
+set `CircleOptions`; these are adapter bounds, not protocol limits.
 
 Exit code `0` means the requested check/setup completed; `2` means pending work
 or recipient proof is required; `1` means invalid input, conflicting state or

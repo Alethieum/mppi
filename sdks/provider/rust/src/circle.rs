@@ -1,47 +1,53 @@
-//! Circle developer-controlled SCA operations on Arc.
+//! Circle Agent Wallet CLI 1.1.4, with retained exact original operations.
 //!
-//! Credentials are supplied by the caller. Transaction references bind to exact
-//! calls in an explicit local wallet journal before submission. Reconciliation
-//! only reads the original service operation; Circle status is never chain proof.
-//! This journal holds wallet idempotency evidence, not provider payment history.
-//! The adapter trusts authenticated Circle reference/transaction-ID lookup to
-//! identify its transaction hash. Canonical effects are verified separately;
-//! Circle lookup does not provide independent proof of inner calldata.
+//! Login and custody belong to the official CLI. No API key or entity secret is
+//! accepted. CLI status is never canonical chain confirmation. Once dispatched,
+//! an intent is only reconciled by its returned transaction ID, never resubmitted.
+//! Sources: @circle-fin/cli 1.1.4 wallet/execute.ts, wallet/sign.ts,
+//! transaction/list.ts and wallet/helpers.ts (published dist/index.js.map);
+//! https://developers.circle.com/agent-stack/agent-wallets/quickstart
+//! https://developers.circle.com/agent-stack/agent-wallets/supported-blockchains
 
-use crate::{
-    Address, B256,
-    capabilities::{TransactionWallet, WalletError},
-    discovery::parse_address,
-    local_state::LocalState,
-    types::{OperationResult, OperationState, WalletCall},
+use std::{
+    collections::{BTreeMap, HashSet},
+    ffi::OsString,
+    fmt,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use aws_lc_rs::rsa::{OAEP_SHA256_MGF1SHA256, OaepPublicEncryptingKey, PublicEncryptingKey};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use reqwest::{Client, Method, header};
+
+use alloy_primitives::{Address, B256, keccak256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
 
-const ORIGIN: &str = "https://api.circle.com/v1/w3s";
-const MAX_RESPONSE: usize = 1 << 20;
-const MAX_REQUEST: usize = 4 << 20;
-const MAX_CALL: usize = 1 << 20;
+use crate::{
+    capabilities::{TransactionWallet, WalletError},
+    chain::{ChainReader, CodePin, data, encoded},
+    deployment::profile_to_mapping,
+    discovery::parse_address,
+    local_state::LocalState,
+    registry::RegistryCalls,
+    types::{OperationResult, OperationState, WalletCall},
+};
+
+const MAX_OUTPUT: usize = 1 << 20;
+const MAX_STDERR: usize = 64 << 10;
+const MAX_CALL: usize = 60 << 10;
+const MAX_OPERATIONS: usize = 4096;
 const MAX_JOURNAL: usize = 16 << 20;
-const MAX_OPERATIONS: usize = 16_384;
+const EXECUTE: &str = "execute(address,uint256,bytes)";
+const SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
-/// Sanitized errors never contain credentials, request bodies or service text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CircleError {
     Configuration,
     Unavailable,
+    Authentication,
+    Version,
     InvalidEvidence,
     Journal,
     Capacity,
@@ -49,600 +55,309 @@ pub enum CircleError {
 impl fmt::Display for CircleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Configuration => "invalid Circle wallet configuration",
-            Self::Unavailable => "Circle service evidence unavailable",
-            Self::InvalidEvidence => "Circle evidence differs from the original operation",
-            Self::Journal => "Circle wallet journal unavailable or inconsistent",
-            Self::Capacity => "Circle wallet journal capacity reached; retain its original operation evidence before changing configuration",
+            Self::Configuration => "invalid Circle Agent Wallet configuration",
+            Self::Unavailable => "Circle Agent Wallet command unavailable; check CLI access and the selected network session",
+            Self::Authentication => "Circle Agent Wallet session missing or expired; run circle wallet login EMAIL for mainnet, or circle wallet login EMAIL --testnet, then rerun with the same retained operation records",
+            Self::Version => "Circle CLI must be the verified @circle-fin/cli version 1.1.4",
+            Self::InvalidEvidence => "Circle Agent Wallet evidence differs from the selected account or original operation",
+            Self::Journal => "Circle Agent Wallet operation record unavailable or inconsistent; restore the original record",
+            Self::Capacity => "Circle Agent Wallet operation record capacity reached",
         })
     }
 }
 impl std::error::Error for CircleError {}
 
-/// Registered Circle API credentials. Neither Debug nor errors reveal secrets.
-pub struct CircleCredentials {
-    api_key: Zeroizing<String>,
-    entity_secret: Zeroizing<[u8; 32]>,
+/// Trusted CLI executable prefix. Never shell text or credentials. Read commands
+/// have a deadline; execute/sign are drained to completion without a timeout kill.
+#[derive(Clone, Debug)]
+pub struct CircleOptions {
+    pub command: Vec<OsString>,
+    pub read_timeout_ms: u64,
+    pub max_pages: usize,
+    pub allow_registration_activation: bool,
 }
-impl CircleCredentials {
-    pub fn new(api_key: String, entity_secret: [u8; 32]) -> Result<Self, CircleError> {
-        let api_key = Zeroizing::new(api_key);
-        let entity_secret = Zeroizing::new(entity_secret);
-        if api_key.is_empty()
-            || api_key.len() > 8192
-            || api_key.bytes().any(|byte| !(33..=126).contains(&byte))
+impl Default for CircleOptions {
+    fn default() -> Self {
+        Self {
+            command: vec!["circle".into()],
+            read_timeout_ms: 240_000,
+            max_pages: 20,
+            allow_registration_activation: false,
+        }
+    }
+}
+impl CircleOptions {
+    fn validate(&self) -> Result<(), CircleError> {
+        if self.command.is_empty()
+            || self.command.len() > 16
+            || self
+                .command
+                .iter()
+                .any(|s| s.is_empty() || s.len() > 4096 || s.as_encoded_bytes().contains(&0))
+            || !(1..=300_000).contains(&self.read_timeout_ms)
+            || !(1..=100).contains(&self.max_pages)
         {
             return Err(CircleError::Configuration);
         }
-        Ok(Self {
-            api_key,
-            entity_secret,
-        })
-    }
-}
-impl fmt::Debug for CircleCredentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CircleCredentials").finish_non_exhaustive()
+        Ok(())
     }
 }
 
-fn blockchain(chain_id: u64) -> Result<&'static str, CircleError> {
-    match chain_id {
+/// Independently reviewed account proxy/runtime pins; RPC never supplies them.
+/// Same network-specific pins as mppi_protocol.circle.supported_account_pins.
+pub fn supported_account_pins(chain_id: u64) -> Result<(B256, CodePin), CircleError> {
+    let proxy =
+        alloy_primitives::b256!("d09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66");
+    let (address, hash) = match chain_id {
+        5_042_002 => (
+            alloy_primitives::address!("895b96c92d1007872fe1f70606e6b7eeaebd620e"),
+            alloy_primitives::b256!(
+                "3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa"
+            ),
+        ),
+        5042 => (
+            alloy_primitives::address!("9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed"),
+            alloy_primitives::b256!(
+                "60ecaaadc845f14626e77541b390bd36a7f5c35efdee5c30471f0eb08626019e"
+            ),
+        ),
+        _ => return Err(CircleError::Configuration),
+    };
+    Ok((
+        proxy,
+        CodePin::new(address, hash).map_err(|_| CircleError::Configuration)?,
+    ))
+}
+fn blockchain(chain: u64) -> Result<&'static str, CircleError> {
+    match chain {
         5042 => Ok("ARC"),
         5_042_002 => Ok("ARC-TESTNET"),
         _ => Err(CircleError::Configuration),
     }
 }
-fn uuid(value: &str) -> Result<(), CircleError> {
+fn uuid(value: &str, v4: bool) -> Result<(), CircleError> {
     if value.len() != 36
         || !value.bytes().enumerate().all(|(i, b)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
+            if [8, 13, 18, 23].contains(&i) {
                 b == b'-'
             } else {
                 b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
             }
         })
+        || v4 && (value.as_bytes()[14] != b'4' || !b"89ab".contains(&value.as_bytes()[19]))
     {
         return Err(CircleError::InvalidEvidence);
     }
     Ok(())
 }
-fn idempotency_key(value: &str) -> Result<(), CircleError> {
-    uuid(value)?;
-    if value.as_bytes()[14] != b'4' || !matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b') {
-        return Err(CircleError::Configuration);
-    }
-    Ok(())
-}
 fn fresh_key() -> Result<String, CircleError> {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).map_err(|_| CircleError::Unavailable)?;
     bytes[6] = (bytes[6] & 15) | 64;
     bytes[8] = (bytes[8] & 63) | 128;
-    let hex = alloy_primitives::hex::encode(bytes);
+    let h = alloy_primitives::hex::encode(bytes);
     Ok(format!(
         "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
     ))
-}
-fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str, CircleError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or(CircleError::InvalidEvidence)
-}
-fn address(value: &Value, field: &str) -> Result<Address, CircleError> {
-    parse_address(string(value, field)?).map_err(|_| CircleError::InvalidEvidence)
-}
-fn address_hex(value: Address) -> String {
-    format!("{value:#x}")
-}
-fn bytes_hex(value: &str, max: usize) -> Result<Vec<u8>, CircleError> {
-    let hex = value
-        .strip_prefix("0x")
-        .ok_or(CircleError::InvalidEvidence)?;
-    if hex.len() > max * 2 || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(CircleError::InvalidEvidence);
-    }
-    alloy_primitives::hex::decode(hex).map_err(|_| CircleError::InvalidEvidence)
-}
-fn hash(value: &str) -> Result<B256, CircleError> {
-    B256::try_from(bytes_hex(value, 32)?.as_slice()).map_err(|_| CircleError::InvalidEvidence)
 }
 fn reference(value: &str) -> Result<(), CircleError> {
     if value.is_empty() || value.len() > 4096 {
-        return Err(CircleError::Configuration);
+        Err(CircleError::Configuration)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
-fn name(value: &str) -> Result<(), CircleError> {
-    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        return Err(CircleError::Configuration);
+fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, CircleError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(CircleError::InvalidEvidence)
+}
+fn address(value: &Value, key: &str) -> Result<Address, CircleError> {
+    parse_address(text(value, key)?).map_err(|_| CircleError::InvalidEvidence)
+}
+fn bytes(value: &str, maximum: usize) -> Result<Vec<u8>, CircleError> {
+    let h = value
+        .strip_prefix("0x")
+        .ok_or(CircleError::InvalidEvidence)?;
+    if h.len() > maximum * 2 || h.len() % 2 != 0 {
+        return Err(CircleError::InvalidEvidence);
     }
-    Ok(())
+    alloy_primitives::hex::decode(h).map_err(|_| CircleError::InvalidEvidence)
+}
+fn hash(value: &str) -> Result<B256, CircleError> {
+    B256::try_from(bytes(value, 32)?.as_slice()).map_err(|_| CircleError::InvalidEvidence)
 }
 
+#[derive(Debug)]
+pub(crate) struct CommandOutput {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+}
 #[tonic::async_trait]
-pub(crate) trait CircleTransport: Send + Sync {
-    async fn request(
+pub(crate) trait CircleCommand: Send + Sync {
+    async fn run(
         &self,
-        method: Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, CircleError>;
+        arguments: Vec<String>,
+        mutating: bool,
+    ) -> Result<CommandOutput, CircleError>;
 }
-struct CircleHttp {
-    client: Client,
-    api_key: Zeroizing<String>,
-}
-impl CircleHttp {
-    fn new(api_key: Zeroizing<String>, timeout_ms: u64) -> Result<Self, CircleError> {
-        if !(1..=86_400_000).contains(&timeout_ms) {
-            return Err(CircleError::Configuration);
+struct CliCommand(CircleOptions);
+
+// Drain both pipes concurrently, retaining only bounded bytes. An overflow from a
+// mutating command never kills its custodian process or permits a replacement.
+fn drain(mut pipe: impl Read, limit: usize) -> Result<Vec<u8>, CircleError> {
+    let mut output = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0; 8192];
+    loop {
+        let count = pipe
+            .read(&mut chunk)
+            .map_err(|_| CircleError::Unavailable)?;
+        if count == 0 {
+            break;
         }
-        let client = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
-            .no_deflate()
-            .referer(false)
-            .http1_only()
-            .tls_sslkeylogfile(false)
-            .build()
-            .map_err(|_| CircleError::Configuration)?;
-        Ok(Self { client, api_key })
+        if output.len().saturating_add(count) <= limit && !overflow {
+            output.extend_from_slice(&chunk[..count]);
+        } else {
+            overflow = true;
+        }
     }
-    async fn send(
-        &self,
-        request: reqwest::RequestBuilder,
-        body: Option<Value>,
-    ) -> Result<Value, CircleError> {
-        let mut authorization =
-            header::HeaderValue::from_str(&format!("Bearer {}", &*self.api_key))
-                .map_err(|_| CircleError::Configuration)?;
-        authorization.set_sensitive(true);
-        let mut request = request
-            .header(header::AUTHORIZATION, authorization)
-            .header(header::ACCEPT, "application/json")
-            .header(header::ACCEPT_ENCODING, "identity");
-        if let Some(body) = body {
-            let body = serde_json::to_vec(&body).map_err(|_| CircleError::Configuration)?;
-            if body.len() > MAX_REQUEST {
-                return Err(CircleError::Configuration);
+    if overflow {
+        Err(CircleError::Unavailable)
+    } else {
+        Ok(output)
+    }
+}
+fn run_process(
+    options: CircleOptions,
+    args: Vec<String>,
+    mutating: bool,
+) -> Result<CommandOutput, CircleError> {
+    let mut command = Command::new(&options.command[0]);
+    command
+        .args(&options.command[1..])
+        .args(args)
+        .env("DO_NOT_TRACK", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|_| CircleError::Unavailable)?;
+    let stdout = child.stdout.take().ok_or(CircleError::Unavailable)?;
+    let stderr = child.stderr.take().ok_or(CircleError::Unavailable)?;
+    let out = std::thread::spawn(move || drain(stdout, MAX_OUTPUT));
+    let err = std::thread::spawn(move || drain(stderr, MAX_STDERR));
+    let deadline = Instant::now() + Duration::from_millis(options.read_timeout_ms);
+    let mut timed_out = false;
+    let mut status = None;
+    while status.is_none() || !out.is_finished() || !err.is_finished() {
+        if status.is_none() {
+            status = child.try_wait().map_err(|_| CircleError::Unavailable)?;
+        }
+        if !mutating && Instant::now() >= deadline {
+            timed_out = true;
+            #[cfg(unix)]
+            // SAFETY: this invocation created its own process group with its PID;
+            // only read-only CLI invocations are terminated. No shared group.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            request = request
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body);
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            break;
         }
-        let mut response = request.send().await.map_err(|_| CircleError::Unavailable)?;
-        if !matches!(response.status().as_u16(), 200 | 201) {
-            return Err(CircleError::Unavailable);
-        }
-        let headers = response.headers();
-        if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
-            || headers.get_all(header::CONTENT_ENCODING).iter().count() > 1
-            || !headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| {
-                    v.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/json")
-                })
-            || headers
-                .get(header::CONTENT_ENCODING)
-                .is_some_and(|v| !v.to_str().is_ok_and(|v| v.eq_ignore_ascii_case("identity")))
-            || response
-                .content_length()
-                .is_some_and(|n| n > MAX_RESPONSE as u64)
-        {
-            return Err(CircleError::InvalidEvidence);
-        }
-        let mut raw = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stdout = out.join().map_err(|_| CircleError::Unavailable)??;
+    let _ = err.join().map_err(|_| CircleError::Unavailable)??;
+    if timed_out {
+        return Err(CircleError::Unavailable);
+    }
+    Ok(CommandOutput {
+        success: status.is_some_and(|s| s.success()),
+        stdout,
+    })
+}
+#[tonic::async_trait]
+impl CircleCommand for CliCommand {
+    async fn run(
+        &self,
+        arguments: Vec<String>,
+        mutating: bool,
+    ) -> Result<CommandOutput, CircleError> {
+        let options = self.0.clone();
+        // spawn_blocking work is not aborted when its awaiting future is dropped:
+        // https://docs.rs/tokio/1.53.1/tokio/task/fn.spawn_blocking.html
+        tokio::task::spawn_blocking(move || run_process(options, arguments, mutating))
             .await
             .map_err(|_| CircleError::Unavailable)?
-        {
-            if chunk.len() > MAX_RESPONSE - raw.len() {
-                return Err(CircleError::InvalidEvidence);
-            }
-            raw.extend_from_slice(&chunk);
-        }
-        let value = crate::json::parse_document(&raw, MAX_RESPONSE, crate::DEFAULT_JSON_DEPTH)
-            .map_err(|_| CircleError::InvalidEvidence)?;
-        value
-            .get("data")
-            .filter(|v| v.is_object())
-            .cloned()
-            .ok_or(CircleError::InvalidEvidence)
-    }
-}
-#[tonic::async_trait]
-impl CircleTransport for CircleHttp {
-    async fn request(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, CircleError> {
-        if !path.starts_with('/') || path.starts_with("//") || path.contains(['#', '\\']) {
-            return Err(CircleError::Configuration);
-        }
-        self.send(self.client.request(method, format!("{ORIGIN}{path}")), body)
-            .await
     }
 }
 
-/// Validated service wallet identity; obtaining it does not establish chain state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CircleWalletIdentity {
-    wallet_id: String,
-    address: Address,
-    chain_id: u64,
-    wallet_set_id: String,
-}
-impl CircleWalletIdentity {
-    fn parse(value: &Value, wallet_id: Option<&str>, chain_id: u64) -> Result<Self, CircleError> {
-        let id = string(value, "id")?;
-        uuid(id)?;
-        let wallet_set_id = string(value, "walletSetId")?;
-        uuid(wallet_set_id)?;
-        let address = address(value, "address")?;
-        if wallet_id.is_some_and(|expected| expected != id)
-            || string(value, "blockchain")? != blockchain(chain_id)?
-            || string(value, "custodyType")? != "DEVELOPER"
-            || string(value, "accountType")? != "SCA"
-            || string(value, "state")? != "LIVE"
-            || address.is_zero()
-        {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(Self {
-            wallet_id: id.into(),
-            address,
-            chain_id,
-            wallet_set_id: wallet_set_id.into(),
-        })
-    }
-    pub fn wallet_id(&self) -> &str {
-        &self.wallet_id
-    }
-    pub fn address(&self) -> Address {
-        self.address
-    }
-    pub fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-    pub fn wallet_set_id(&self) -> &str {
-        &self.wallet_set_id
-    }
-}
-
-/// Fixed-origin Circle API client. Setup callers retain their request and key
-/// before invoking a mutating method, then preserve the returned resource IDs.
-pub struct CircleClient {
-    transport: Arc<dyn CircleTransport>,
-    entity_secret: Zeroizing<[u8; 32]>,
-}
-impl fmt::Debug for CircleClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CircleClient").finish_non_exhaustive()
-    }
-}
-impl CircleClient {
-    #[cfg(test)]
-    pub(crate) fn with_test_transport(transport: Arc<dyn CircleTransport>) -> Self {
-        Self {
-            transport,
-            entity_secret: Zeroizing::new([0; 32]),
-        }
-    }
-    pub fn new(credentials: CircleCredentials, timeout_ms: u64) -> Result<Self, CircleError> {
-        Ok(Self {
-            transport: Arc::new(CircleHttp::new(credentials.api_key, timeout_ms)?),
-            entity_secret: credentials.entity_secret,
-        })
-    }
-    async fn ciphertext(&self) -> Result<String, CircleError> {
-        let value = self
-            .transport
-            .request(Method::GET, "/config/entity/publicKey", None)
-            .await?;
-        encrypt_secret(string(&value, "publicKey")?, &self.entity_secret)
-    }
-    pub async fn wallet(
-        &self,
-        wallet_id: &str,
-        chain_id: u64,
-    ) -> Result<CircleWalletIdentity, CircleError> {
-        uuid(wallet_id)?;
-        blockchain(chain_id)?;
-        let value = self
-            .transport
-            .request(Method::GET, &format!("/wallets/{wallet_id}"), None)
-            .await?;
-        CircleWalletIdentity::parse(
-            value.get("wallet").ok_or(CircleError::InvalidEvidence)?,
-            Some(wallet_id),
-            chain_id,
-        )
-    }
-    pub async fn verify_wallet(&self, identity: &CircleWalletIdentity) -> Result<(), CircleError> {
-        if self
-            .wallet(identity.wallet_id(), identity.chain_id())
-            .await?
-            != *identity
-        {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(())
-    }
-    /// Validates registered entity-secret access through a fresh, nonpayment
-    /// EIP-712 signature. It submits no chain transaction and discards the proof.
-    /// A wallet must already exist; initial creation validates the secret in its
-    /// separately retained, idempotent setup request.
-    pub async fn verify_credentials(
-        &self,
-        identity: &CircleWalletIdentity,
-    ) -> Result<(), CircleError> {
-        let mut nonce = [0u8; 32];
-        getrandom::fill(&mut nonce).map_err(|_| CircleError::Unavailable)?;
-        self.sign_typed_data(identity, &json!({
-            "types": {
-                "EIP712Domain": [
-                    {"name":"name","type":"string"},
-                    {"name":"version","type":"string"},
-                    {"name":"chainId","type":"uint256"},
-                    {"name":"verifyingContract","type":"address"}
-                ],
-                "CredentialCheck": [{"name":"nonce","type":"bytes32"}]
-            },
-            "domain": {"name":"MPPI Circle Credential Check", "version":"1",
-                "chainId":identity.chain_id(), "verifyingContract":address_hex(identity.address())},
-            "primaryType":"CredentialCheck",
-            "message":{"nonce":format!("0x{}", alloy_primitives::hex::encode(nonce))}
-        })).await?;
-        Ok(())
-    }
-    pub async fn get_wallet_set(&self, wallet_set_id: &str) -> Result<String, CircleError> {
-        uuid(wallet_set_id)?;
-        let value = self
-            .transport
-            .request(Method::GET, &format!("/walletSets/{wallet_set_id}"), None)
-            .await?;
-        let set = value.get("walletSet").ok_or(CircleError::InvalidEvidence)?;
-        if string(set, "id")? != wallet_set_id || string(set, "custodyType")? != "DEVELOPER" {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(wallet_set_id.into())
-    }
-    /// Explicit setup mutation. Retry only this same retained key and intent.
-    pub async fn create_wallet_set(
-        &self,
-        set_name: &str,
-        key: &str,
-    ) -> Result<String, CircleError> {
-        self.create_wallet_set_before_submit(set_name, key, || Ok(()))
-            .await
-    }
-    /// Prepare before the caller durably marks submission. No await or fallible
-    /// preparation separates that marker from the original mutation request.
-    pub(crate) async fn create_wallet_set_before_submit(
-        &self,
-        set_name: &str,
-        key: &str,
-        before_submit: impl FnOnce() -> Result<(), CircleError>,
-    ) -> Result<String, CircleError> {
-        name(set_name)?;
-        idempotency_key(key)?;
-        let body = json!({
-            "name": set_name, "idempotencyKey": key, "entitySecretCiphertext": self.ciphertext().await?
-        });
-        before_submit()?;
-        let value = self
-            .transport
-            .request(Method::POST, "/developer/walletSets", Some(body))
-            .await?;
-        let set = value.get("walletSet").ok_or(CircleError::InvalidEvidence)?;
-        let id = string(set, "id")?;
-        uuid(id)?;
-        if string(set, "custodyType")? != "DEVELOPER" {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(id.into())
-    }
-    /// Explicit setup mutation creating exactly one Arc SCA in the selected set.
-    pub async fn create_wallet(
-        &self,
-        wallet_set_id: &str,
-        chain_id: u64,
-        wallet_name: &str,
-        key: &str,
-    ) -> Result<CircleWalletIdentity, CircleError> {
-        self.create_wallet_before_submit(wallet_set_id, chain_id, wallet_name, key, || Ok(()))
-            .await
-    }
-    pub(crate) async fn create_wallet_before_submit(
-        &self,
-        wallet_set_id: &str,
-        chain_id: u64,
-        wallet_name: &str,
-        key: &str,
-        before_submit: impl FnOnce() -> Result<(), CircleError>,
-    ) -> Result<CircleWalletIdentity, CircleError> {
-        uuid(wallet_set_id)?;
-        name(wallet_name)?;
-        idempotency_key(key)?;
-        let chain = blockchain(chain_id)?;
-        self.get_wallet_set(wallet_set_id).await?;
-        let body = json!({
-            "walletSetId": wallet_set_id, "blockchains": [chain], "accountType": "SCA", "count": 1,
-            "metadata": [{"name": wallet_name, "refId": key}], "idempotencyKey": key,
-            "entitySecretCiphertext": self.ciphertext().await?
-        });
-        before_submit()?;
-        let value = self
-            .transport
-            .request(Method::POST, "/developer/wallets", Some(body))
-            .await?;
-        let rows = value
-            .get("wallets")
-            .and_then(Value::as_array)
-            .ok_or(CircleError::InvalidEvidence)?;
-        if rows.len() != 1 {
-            return Err(CircleError::InvalidEvidence);
-        }
-        let identity = CircleWalletIdentity::parse(&rows[0], None, chain_id)?;
-        if identity.wallet_set_id() != wallet_set_id || string(&rows[0], "refId")? != key {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(identity)
-    }
-    /// Query a possibly created wallet by the original setup key stored in its
-    /// metadata. Missing evidence returns None and never authorizes resubmission.
-    /// Both list and detail records must retain the original reference and set.
-    pub async fn find_created_wallet(
-        &self,
-        wallet_set_id: &str,
-        chain_id: u64,
-        ref_id: &str,
-    ) -> Result<Option<CircleWalletIdentity>, CircleError> {
-        uuid(wallet_set_id)?;
-        blockchain(chain_id)?;
-        idempotency_key(ref_id)?;
-        let path = format!("/wallets?walletSetId={wallet_set_id}&refId={ref_id}&pageSize=2");
-        let value = self.transport.request(Method::GET, &path, None).await?;
-        let rows = value
-            .get("wallets")
-            .and_then(Value::as_array)
-            .ok_or(CircleError::InvalidEvidence)?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        if rows.len() != 1 {
-            return Err(CircleError::InvalidEvidence);
-        }
-        let identity = CircleWalletIdentity::parse(&rows[0], None, chain_id)?;
-        if identity.wallet_set_id() != wallet_set_id || string(&rows[0], "refId")? != ref_id {
-            return Err(CircleError::InvalidEvidence);
-        }
-        let value = self
-            .transport
-            .request(
-                Method::GET,
-                &format!("/wallets/{}", identity.wallet_id()),
-                None,
-            )
-            .await?;
-        let record = value.get("wallet").ok_or(CircleError::InvalidEvidence)?;
-        if CircleWalletIdentity::parse(record, Some(identity.wallet_id()), chain_id)? != identity
-            || string(record, "refId")? != ref_id
-        {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(Some(identity))
-    }
-    /// Sign EIP-712 data using this verified operator wallet only. The returned
-    /// SCA bytes are not an MPPI session signature. Recipient proof custody stays
-    /// with the separately selected recipient wallet.
-    pub async fn sign_typed_data(
-        &self,
-        identity: &CircleWalletIdentity,
-        typed_data: &Value,
-    ) -> Result<Vec<u8>, CircleError> {
-        if !typed_data.is_object() {
-            return Err(CircleError::Configuration);
-        }
-        let data = serde_json::to_string(typed_data).map_err(|_| CircleError::Configuration)?;
-        if data.len() > MAX_RESPONSE {
-            return Err(CircleError::Configuration);
-        }
-        self.verify_wallet(identity).await?;
-        let value = self.transport.request(Method::POST, "/developer/sign/typedData", Some(json!({
-            "walletId": identity.wallet_id(), "data": data, "entitySecretCiphertext": self.ciphertext().await?
-        }))).await?;
-        let signature = bytes_hex(string(&value, "signature")?, MAX_RESPONSE / 2)?;
-        if signature.is_empty() {
-            return Err(CircleError::InvalidEvidence);
-        }
-        Ok(signature)
-    }
-}
-
-fn encrypt_secret(pem: &str, secret: &[u8; 32]) -> Result<String, CircleError> {
-    if pem.len() > 16_384 {
-        return Err(CircleError::InvalidEvidence);
-    }
-    let body = pem
-        .trim()
-        .strip_prefix("-----BEGIN PUBLIC KEY-----")
-        .and_then(|v| v.strip_suffix("-----END PUBLIC KEY-----"))
-        .ok_or(CircleError::InvalidEvidence)?;
-    let body: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let der = STANDARD
-        .decode(body)
-        .map_err(|_| CircleError::InvalidEvidence)?;
-    let public = PublicEncryptingKey::from_der(&der).map_err(|_| CircleError::InvalidEvidence)?;
-    if !(2048..=8192).contains(&public.key_size_bits()) {
-        return Err(CircleError::InvalidEvidence);
-    }
-    let public = OaepPublicEncryptingKey::new(public).map_err(|_| CircleError::InvalidEvidence)?;
-    let mut ciphertext = vec![0u8; public.ciphertext_size()];
-    let ciphertext = public
-        .encrypt(&OAEP_SHA256_MGF1SHA256, secret, &mut ciphertext, None)
-        .map_err(|_| CircleError::Unavailable)?;
-    Ok(STANDARD.encode(ciphertext))
-}
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JournalOperation {
-    service_ref: String,
+struct RetainedCall {
+    chain_id: u64,
     to: String,
-    calldata: String,
-    attempted: bool,
+    data: String,
+}
+impl RetainedCall {
+    fn from_call(call: &WalletCall) -> Self {
+        Self {
+            chain_id: call.chain_id(),
+            to: encoded(call.to()),
+            data: encoded(call.data()),
+        }
+    }
+    fn call(&self) -> Result<WalletCall, CircleError> {
+        WalletCall::new(
+            self.chain_id,
+            parse_address(&self.to).map_err(|_| CircleError::Journal)?,
+            bytes(&self.data, MAX_CALL)?,
+        )
+        .map_err(|_| CircleError::Journal)
+    }
+}
+fn self_route() -> String {
+    "self".into()
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retained {
+    #[serde(default = "self_route")]
+    route: String,
+    call: RetainedCall,
+    idempotency_key: String,
     wallet_operation_id: Option<String>,
     tx_hash: Option<String>,
+    state: String,
 }
-impl JournalOperation {
-    fn validate(&self) -> Result<(), CircleError> {
-        idempotency_key(&self.service_ref).map_err(|_| CircleError::Journal)?;
-        if parse_address(&self.to)
-            .map_err(|_| CircleError::Journal)?
-            .is_zero()
+impl Retained {
+    fn result(&self, reference: &str, unknown: bool) -> Result<OperationResult, CircleError> {
+        let state = if unknown
+            || self.state == "unknown"
+            || self.state == "failed" && self.tx_hash.is_none()
         {
-            return Err(CircleError::Journal);
-        }
-        bytes_hex(&self.calldata, MAX_CALL).map_err(|_| CircleError::Journal)?;
-        if let Some(id) = &self.wallet_operation_id {
-            uuid(id).map_err(|_| CircleError::Journal)?;
-        }
-        if let Some(tx) = &self.tx_hash {
-            hash(tx).map_err(|_| CircleError::Journal)?;
-        }
-        if (!self.attempted && (self.wallet_operation_id.is_some() || self.tx_hash.is_some()))
-            || (self.tx_hash.is_some() && self.wallet_operation_id.is_none())
-        {
-            return Err(CircleError::Journal);
-        }
-        Ok(())
-    }
-    fn result(
-        &self,
-        reference: &str,
-        state: OperationState,
-    ) -> Result<OperationResult, CircleError> {
+            // A hashless failure after dispatch never proves no submission.
+            OperationState::Unknown
+        } else if self.state == "failed" {
+            OperationState::Failed
+        } else {
+            OperationState::Pending
+        };
         OperationResult::new(
             reference,
             state,
@@ -654,54 +369,207 @@ impl JournalOperation {
         .map_err(|_| CircleError::Journal)
     }
 }
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Journal {
-    version: u32,
-    wallet_id: String,
-    wallet_address: String,
-    wallet_set_id: String,
-    chain_id: u64,
-    operations: BTreeMap<String, JournalOperation>,
+
+/// Native TransactionWallet using the authenticated, pinned Circle Agent CLI.
+/// Keep one original operation file per wallet/profile, including across native
+/// onboarding and Python runtime use. Constructors never provision a wallet.
+#[derive(Clone)]
+pub struct CircleAgentWallet {
+    chain: Arc<ChainReader>,
+    wallet: CodePin,
+    implementation: CodePin,
+    path: PathBuf,
+    options: CircleOptions,
+    command: Arc<dyn CircleCommand>,
+    lock: Arc<Mutex<()>>,
+    require_existing: bool,
 }
-impl Journal {
-    fn new(identity: &CircleWalletIdentity) -> Self {
-        Self {
-            version: 1,
-            wallet_id: identity.wallet_id.clone(),
-            wallet_address: address_hex(identity.address),
-            wallet_set_id: identity.wallet_set_id.clone(),
-            chain_id: identity.chain_id,
-            operations: BTreeMap::new(),
-        }
+impl fmt::Debug for CircleAgentWallet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircleAgentWallet")
+            .field("address", &self.wallet.address())
+            .finish_non_exhaustive()
     }
-    fn read(store: &LocalState, identity: &CircleWalletIdentity) -> Result<Self, CircleError> {
-        let value = store
-            .read()
-            .map_err(|_| CircleError::Journal)?
-            .ok_or(CircleError::Journal)?;
-        let record: Self = serde_json::from_value(value).map_err(|_| CircleError::Journal)?;
-        if record.version != 1
-            || record.wallet_id != identity.wallet_id
-            || record.wallet_address != address_hex(identity.address)
-            || record.wallet_set_id != identity.wallet_set_id
-            || record.chain_id != identity.chain_id
-            || record.operations.len() > MAX_OPERATIONS
-        {
-            return Err(CircleError::Journal);
+}
+impl CircleAgentWallet {
+    pub fn new(
+        chain: Arc<ChainReader>,
+        address: Address,
+        path: impl AsRef<Path>,
+        options: CircleOptions,
+    ) -> Result<Self, CircleError> {
+        Self::construct(chain, address, path.as_ref(), options, false)
+    }
+    pub fn open_existing(
+        chain: Arc<ChainReader>,
+        address: Address,
+        path: impl AsRef<Path>,
+        options: CircleOptions,
+    ) -> Result<Self, CircleError> {
+        Self::construct(chain, address, path.as_ref(), options, true)
+    }
+    fn construct(
+        chain: Arc<ChainReader>,
+        address: Address,
+        path: &Path,
+        options: CircleOptions,
+        require_existing: bool,
+    ) -> Result<Self, CircleError> {
+        let (proxy, implementation) = supported_account_pins(chain.profile().domain().chain_id())?;
+        let wallet = CodePin::new(address, proxy).map_err(|_| CircleError::Configuration)?;
+        let command = Arc::new(CliCommand(options.clone()));
+        Self::with_command(
+            chain,
+            wallet,
+            implementation,
+            path,
+            options,
+            require_existing,
+            command,
+        )
+    }
+    pub(crate) fn with_command(
+        chain: Arc<ChainReader>,
+        wallet: CodePin,
+        implementation: CodePin,
+        path: &Path,
+        options: CircleOptions,
+        require_existing: bool,
+        command: Arc<dyn CircleCommand>,
+    ) -> Result<Self, CircleError> {
+        options.validate()?;
+        blockchain(chain.profile().domain().chain_id())?;
+        let mut result = Self {
+            chain,
+            wallet,
+            implementation,
+            path: path.to_owned(),
+            options,
+            command,
+            lock: Arc::new(Mutex::new(())),
+            require_existing,
+        };
+        let mut store = result.store()?;
+        result.path = store.path().to_owned();
+        let operations = result.load(&store)?;
+        if store.read().map_err(|_| CircleError::Journal)?.is_none() {
+            result.save(&mut store, &operations)?;
         }
-        let mut service_refs = std::collections::BTreeSet::new();
-        for (key, operation) in &record.operations {
-            reference(key).map_err(|_| CircleError::Journal)?;
-            operation.validate()?;
-            if !service_refs.insert(&operation.service_ref) {
-                return Err(CircleError::Journal);
+        Ok(result)
+    }
+    pub fn address(&self) -> Address {
+        self.wallet.address()
+    }
+    fn scope(&self) -> Value {
+        json!({"version":1,"kind":"mppi-circle-agent-wallet","profile":profile_to_mapping(self.chain.profile()),
+            "wallet":{"address":encoded(self.address()),"code_hash":encoded(self.wallet.code_hash())},
+            "implementation":{"address":encoded(self.implementation.address()),"code_hash":encoded(self.implementation.code_hash())}})
+    }
+    fn store(&self) -> Result<LocalState, CircleError> {
+        if self.require_existing {
+            let mut lock = self.path.as_os_str().to_os_string();
+            lock.push(".lock");
+            for path in [&self.path, &PathBuf::from(lock)] {
+                if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+                    return Err(CircleError::Journal);
+                }
             }
         }
-        Ok(record)
+        LocalState::open(&self.path, MAX_JOURNAL).map_err(|_| CircleError::Journal)
     }
-    fn write(&self, store: &mut LocalState) -> Result<(), CircleError> {
-        let value = serde_json::to_value(self).map_err(|_| CircleError::Journal)?;
+    fn registration_call(&self) -> Result<WalletCall, CircleError> {
+        RegistryCalls::new(
+            self.chain.profile().domain().chain_id(),
+            self.chain.profile().registry_address(),
+        )
+        .and_then(|calls| calls.register(self.address(), None))
+        .map(|p| p.call().clone())
+        .map_err(|_| CircleError::Configuration)
+    }
+    fn validate_call(&self, call: &WalletCall) -> Result<(), CircleError> {
+        if call.chain_id() != self.chain.profile().domain().chain_id()
+            || call.data().len() > MAX_CALL
+        {
+            Err(CircleError::Configuration)
+        } else {
+            Ok(())
+        }
+    }
+    fn load(&self, store: &LocalState) -> Result<BTreeMap<String, Retained>, CircleError> {
+        let Some(mut value) = store.read().map_err(|_| CircleError::Journal)? else {
+            return if self.require_existing {
+                Err(CircleError::Journal)
+            } else {
+                Ok(BTreeMap::new())
+            };
+        };
+        let operations = value
+            .as_object_mut()
+            .ok_or(CircleError::Journal)?
+            .remove("operations")
+            .ok_or(CircleError::Journal)?;
+        if value != self.scope() {
+            return Err(CircleError::Journal);
+        }
+        // serde Option accepts omitted fields; reject them before typed decoding.
+        let rows = operations.as_object().ok_or(CircleError::Journal)?;
+        if rows.len() > MAX_OPERATIONS {
+            return Err(CircleError::Capacity);
+        }
+        for row in rows.values() {
+            let fields = row.as_object().ok_or(CircleError::Journal)?;
+            for name in [
+                "call",
+                "idempotency_key",
+                "wallet_operation_id",
+                "tx_hash",
+                "state",
+            ] {
+                if !fields.contains_key(name) {
+                    return Err(CircleError::Journal);
+                }
+            }
+        }
+        let operations: BTreeMap<String, Retained> =
+            serde_json::from_value(operations).map_err(|_| CircleError::Journal)?;
+        let mut keys = HashSet::new();
+        let mut ids = HashSet::new();
+        for (reference_, row) in &operations {
+            reference(reference_)?;
+            let call = row.call.call()?;
+            self.validate_call(&call)?;
+            if !(row.route == "self"
+                || row.route == "direct_register" && call == self.registration_call()?)
+                || !["unknown", "pending", "failed"].contains(&row.state.as_str())
+            {
+                return Err(CircleError::Journal);
+            }
+            uuid(&row.idempotency_key, true)?;
+            if !keys.insert(&row.idempotency_key) {
+                return Err(CircleError::Journal);
+            }
+            if let Some(id) = &row.wallet_operation_id {
+                uuid(id, false)?;
+                if !ids.insert(id) {
+                    return Err(CircleError::Journal);
+                }
+            }
+            if let Some(tx) = &row.tx_hash {
+                hash(tx)?;
+                if row.wallet_operation_id.is_none() {
+                    return Err(CircleError::Journal);
+                }
+            }
+        }
+        Ok(operations)
+    }
+    fn save(
+        &self,
+        store: &mut LocalState,
+        operations: &BTreeMap<String, Retained>,
+    ) -> Result<(), CircleError> {
+        let mut value = self.scope();
+        value["operations"] = serde_json::to_value(operations).map_err(|_| CircleError::Journal)?;
         if serde_json::to_vec(&value)
             .map_err(|_| CircleError::Journal)?
             .len()
@@ -711,305 +579,400 @@ impl Journal {
         }
         store.write(&value).map_err(|_| CircleError::Journal)
     }
-}
-
-/// Native configured Circle transaction wallet, backed by an explicit private
-/// wallet-operation journal. Keep this journal for the lifetime of its operations.
-/// Each operation locks out concurrent processes using the same path. Records contain
-/// exact calls and public handles; credentials and inference usage are absent.
-pub struct CircleDeveloperWallet {
-    client: Arc<CircleClient>,
-    identity: CircleWalletIdentity,
-    journal_path: PathBuf,
-    operation_lock: Mutex<()>,
-}
-impl fmt::Debug for CircleDeveloperWallet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CircleDeveloperWallet")
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
-    }
-}
-impl CircleDeveloperWallet {
-    pub fn new(
-        client: Arc<CircleClient>,
-        identity: CircleWalletIdentity,
-        journal_path: impl AsRef<Path>,
-    ) -> Result<Self, CircleError> {
-        Self::open(client, identity, journal_path.as_ref(), true)
-    }
-    /// Resume an existing operation record. Missing records fail without creating
-    /// replacement wallet history; retain the path selected during onboarding.
-    pub fn open_existing(
-        client: Arc<CircleClient>,
-        identity: CircleWalletIdentity,
-        journal_path: impl AsRef<Path>,
-    ) -> Result<Self, CircleError> {
-        let path = journal_path.as_ref();
-        if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-            return Err(CircleError::Journal);
+    async fn json(&self, mut arguments: Vec<String>, mutating: bool) -> Result<Value, CircleError> {
+        arguments.extend(["--output".into(), "json".into()]);
+        let output = self.command.run(arguments, mutating).await?;
+        let value = crate::json::parse_document(&output.stdout, MAX_OUTPUT, 32)
+            .map_err(|_| CircleError::InvalidEvidence)?;
+        if matches!(
+            value["error"]["code"].as_str(),
+            Some("AUTH_REQUIRED" | "AUTH_EXPIRED")
+        ) {
+            return Err(CircleError::Authentication);
         }
-        Self::open(client, identity, path, false)
-    }
-    fn open(
-        client: Arc<CircleClient>,
-        identity: CircleWalletIdentity,
-        journal_path: &Path,
-        create: bool,
-    ) -> Result<Self, CircleError> {
-        let journal_path = journal_path.to_owned();
-        let mut journal =
-            LocalState::open(&journal_path, MAX_JOURNAL).map_err(|_| CircleError::Journal)?;
-        if journal.read().map_err(|_| CircleError::Journal)?.is_none() {
-            if !create {
-                return Err(CircleError::Journal);
-            }
-            Journal::new(&identity).write(&mut journal)?;
+        if !output.success {
+            return Err(CircleError::Unavailable);
         }
-        Journal::read(&journal, &identity)?;
-        let journal_path = journal.path().to_owned();
-        Ok(Self {
-            client,
-            identity,
-            journal_path,
-            operation_lock: Mutex::new(()),
-        })
+        value
+            .get("data")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or(CircleError::InvalidEvidence)
     }
-    pub fn identity(&self) -> &CircleWalletIdentity {
-        &self.identity
-    }
-    /// Confirms current Circle account access to the configured SCA.
     pub async fn verify_wallet(&self) -> Result<(), CircleError> {
-        self.client.verify_wallet(&self.identity).await
+        self.verify(false).await
     }
-
-    fn record(
-        &self,
-        original: &JournalOperation,
-        value: &Value,
-    ) -> Result<(JournalOperation, OperationState), CircleError> {
-        let id = string(value, "id")?;
-        uuid(id)?;
-        if !original.attempted
-            || string(value, "refId")? != original.service_ref
-            || string(value, "walletId")? != self.identity.wallet_id
-            || string(value, "blockchain")? != blockchain(self.identity.chain_id)?
-            || string(value, "custodyType")? != "DEVELOPER"
-            || string(value, "operation")? != "CONTRACT_EXECUTION"
-            || string(value, "transactionType")? != "OUTBOUND"
-            || address(value, "sourceAddress")? != self.identity.address
-            || address(value, "contractAddress")?
-                != parse_address(&original.to).map_err(|_| CircleError::Journal)?
-            || original
-                .wallet_operation_id
-                .as_deref()
-                .is_some_and(|previous| previous != id)
+    pub async fn verify_registration_wallet(&self) -> Result<(), CircleError> {
+        if !self.options.allow_registration_activation {
+            return Err(CircleError::Configuration);
+        }
+        self.verify(true).await
+    }
+    async fn verify(&self, allow_undeployed: bool) -> Result<(), CircleError> {
+        let version = self.command.run(vec!["--version".into()], false).await?;
+        if !version.success || version.stdout.trim_ascii() != b"1.1.4" {
+            return Err(CircleError::Version);
+        }
+        let chain = blockchain(self.chain.profile().domain().chain_id())?;
+        let result = self
+            .json(
+                vec![
+                    "wallet".into(),
+                    "list".into(),
+                    "--type".into(),
+                    "agent".into(),
+                    "--chain".into(),
+                    chain.into(),
+                ],
+                false,
+            )
+            .await?;
+        let wallets = result["wallets"]
+            .as_array()
+            .filter(|v| v.len() <= 50)
+            .ok_or(CircleError::InvalidEvidence)?;
+        let matches: Vec<_> = wallets
+            .iter()
+            .filter(|row| address(row, "address").ok() == Some(self.address()))
+            .collect();
+        if matches.len() != 1 || matches[0]["type"] != "agent" || matches[0]["blockchain"] != chain
         {
             return Err(CircleError::InvalidEvidence);
         }
-        if let Some(data) = value.get("callData")
-            && bytes_hex(data.as_str().ok_or(CircleError::InvalidEvidence)?, MAX_CALL)?
-                != bytes_hex(&original.calldata, MAX_CALL)?
-        {
-            return Err(CircleError::InvalidEvidence);
-        }
-        let mut next = original.clone();
-        next.wallet_operation_id = Some(id.into());
-        if let Some(tx) = value
-            .get("txHash")
-            .filter(|v| !v.is_null() && v.as_str() != Some(""))
-        {
-            let tx = hash(tx.as_str().ok_or(CircleError::InvalidEvidence)?)?;
-            if original
-                .tx_hash
-                .as_deref()
-                .map(hash)
-                .transpose()?
-                .is_some_and(|old| old != tx)
-            {
+        let invalid = |_| CircleError::InvalidEvidence;
+        let block = self.chain.block(None).await.map_err(invalid)?;
+        self.chain
+            .verify_deployment(&block)
+            .await
+            .map_err(invalid)?;
+        let position = self.chain.position(&block).map_err(invalid)?;
+        for (optional, pin) in [
+            (false, &self.implementation),
+            (allow_undeployed, &self.wallet),
+        ] {
+            let raw = self
+                .chain
+                .rpc()
+                .call("eth_getCode", json!([encoded(pin.address()), position]))
+                .await
+                .map_err(invalid)?;
+            let code = data(&raw).map_err(invalid)?;
+            if optional && code.is_empty() {
+                self.chain.check_canonical(&block).await.map_err(invalid)?;
+                return Ok(());
+            }
+            if code.is_empty() || keccak256(code) != pin.code_hash() {
                 return Err(CircleError::InvalidEvidence);
             }
-            next.tx_hash = Some(format!("{tx:#x}"));
         }
-        let state = match string(value, "state")? {
-            "INITIATED" | "CLEARED" | "QUEUED" | "SENT" | "STUCK" => OperationState::Pending,
-            "CONFIRMED" | "COMPLETE" if next.tx_hash.is_some() => OperationState::Pending,
-            // Once a POST may have started, a service failure label does not
-            // prove that the exact call was never submitted. Preserve its
-            // identity/hash for canonical reconciliation; only the durable
-            // pre-submission marker below can attest hashless Failed.
-            "FAILED" | "DENIED" | "CANCELLED" => OperationState::Unknown,
-            _ => OperationState::Unknown,
-        };
-        Ok((next, state))
+        let slot = self
+            .chain
+            .rpc()
+            .call(
+                "eth_getStorageAt",
+                json!([encoded(self.address()), SLOT, position]),
+            )
+            .await
+            .map_err(invalid)?;
+        if data(&slot).map_err(invalid)? != self.implementation.address().into_word().as_slice() {
+            return Err(CircleError::InvalidEvidence);
+        }
+        self.chain.check_canonical(&block).await.map_err(invalid)
     }
-    async fn lookup(
+    /// Sign exact caller-supplied EIP-712 data for this selected chain, preserving
+    /// Circle's complete ERC-1271 proof bytes. Never used for MPPI session vouchers.
+    pub async fn sign_typed_data(&self, typed_data: &Value) -> Result<Vec<u8>, CircleError> {
+        if typed_data["domain"]["chainId"].as_u64()
+            != Some(self.chain.profile().domain().chain_id())
+        {
+            return Err(CircleError::Configuration);
+        }
+        let raw = serde_json::to_string(typed_data).map_err(|_| CircleError::Configuration)?;
+        if raw.len() > MAX_CALL {
+            return Err(CircleError::Configuration);
+        }
+        let _lock = self.lock.lock().await;
+        let store = self.store()?;
+        self.load(&store)?;
+        self.verify_wallet().await?;
+        let value = self
+            .json(
+                vec![
+                    "wallet".into(),
+                    "sign".into(),
+                    "typed-data".into(),
+                    raw,
+                    "--address".into(),
+                    encoded(self.address()),
+                    "--chain".into(),
+                    blockchain(self.chain.profile().domain().chain_id())?.into(),
+                ],
+                true,
+            )
+            .await?;
+        let signature = bytes(text(&value, "signature")?, MAX_STDERR)?;
+        if signature.is_empty() {
+            return Err(CircleError::InvalidEvidence);
+        }
+        Ok(signature)
+    }
+    async fn observe(
         &self,
         reference: &str,
-        journal: &mut Journal,
+        row: &Value,
+        from_execute: bool,
+        operations: &mut BTreeMap<String, Retained>,
         store: &mut LocalState,
-    ) -> Result<(JournalOperation, OperationState), CircleError> {
-        let operation = journal
-            .operations
+    ) -> Result<OperationResult, CircleError> {
+        let original = operations
             .get(reference)
             .ok_or(CircleError::Journal)?
             .clone();
-        if !operation.attempted {
-            return Ok((operation, OperationState::Failed));
-        }
-        let path = format!(
-            "/transactions?refId={}&walletIds={}&operation=CONTRACT_EXECUTION&custodyType=DEVELOPER&pageSize=2",
-            operation.service_ref, self.identity.wallet_id
-        );
-        let value = self
-            .client
-            .transport
-            .request(Method::GET, &path, None)
-            .await?;
-        let rows = value
-            .get("transactions")
-            .and_then(Value::as_array)
-            .ok_or(CircleError::InvalidEvidence)?;
-        if rows.is_empty() {
-            return Ok((operation.clone(), OperationState::Unknown));
-        }
-        if rows.len() != 1 {
+        let id = text(row, "id")?;
+        uuid(id, false)?;
+        if original
+            .wallet_operation_id
+            .as_ref()
+            .is_some_and(|old| old != id)
+            || from_execute && text(row, "idempotencyKey")? != original.idempotency_key
+            || !from_execute && original.wallet_operation_id.is_none()
+        {
             return Err(CircleError::InvalidEvidence);
         }
-        let (summary, _) = self.record(&operation, &rows[0])?;
-        journal.operations.insert(reference.into(), summary.clone());
-        journal.write(store)?; // Save validated handles before another await.
-        let id = summary
-            .wallet_operation_id
-            .as_deref()
-            .ok_or(CircleError::InvalidEvidence)?;
-        let value = self
-            .client
-            .transport
-            .request(Method::GET, &format!("/transactions/{id}"), None)
-            .await?;
-        self.record(
-            &summary,
-            value
-                .get("transaction")
-                .ok_or(CircleError::InvalidEvidence)?,
-        )
+        let call = original.call.call()?;
+        let direct = original.route == "direct_register";
+        let destination = if direct { call.to() } else { self.address() };
+        let exact_call = if direct {
+            call == self.registration_call()?
+                && row["abiFunctionSignature"] == "register()"
+                && (row["abiParameters"].is_null()
+                    || row["abiParameters"].as_array().is_some_and(Vec::is_empty))
+        } else {
+            row["abiFunctionSignature"] == EXECUTE
+                && row["abiParameters"].as_array().is_some_and(|p| {
+                    p.len() == 3
+                        && p[0].as_str().and_then(|s| parse_address(s).ok()) == Some(call.to())
+                        && p[1] == "0"
+                        && p[2]
+                            .as_str()
+                            .and_then(|s| bytes(s, MAX_CALL).ok())
+                            .as_deref()
+                            == Some(call.data())
+                })
+        };
+        if !exact_call
+            || row["blockchain"] != blockchain(call.chain_id())?
+            || row["operation"] != "CONTRACT_EXECUTION"
+            || row["transactionType"] != "OUTBOUND"
+            || address(row, "sourceAddress")? != self.address()
+            || address(row, "contractAddress")? != destination
+            || !row["destinationAddress"].is_null()
+                && address(row, "destinationAddress")? != destination
+            || operations.iter().any(|(key, value)| {
+                key != reference && value.wallet_operation_id.as_deref() == Some(id)
+            })
+        {
+            return Err(CircleError::InvalidEvidence);
+        }
+        let tx = match row.get("txHash") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.is_empty() => None,
+            Some(Value::String(s)) => Some(hash(s)?),
+            _ => return Err(CircleError::InvalidEvidence),
+        };
+        let previous = original.tx_hash.as_deref().map(hash).transpose()?;
+        if previous.is_some() && tx.is_some() && previous != tx {
+            return Err(CircleError::InvalidEvidence);
+        }
+        let state = match text(row, "state")? {
+            "INITIATED" | "CLEARED" | "QUEUED" | "SENT" | "STUCK" | "CONFIRMED" | "COMPLETE" => {
+                "pending"
+            }
+            "FAILED" | "CANCELLED" | "DENIED" => "failed",
+            _ => return Err(CircleError::InvalidEvidence),
+        };
+        let retained = operations.get_mut(reference).ok_or(CircleError::Journal)?;
+        retained.wallet_operation_id = Some(id.into());
+        retained.tx_hash = tx.or(previous).map(encoded);
+        retained.state = state.into();
+        self.save(store, operations)?;
+        if direct {
+            self.verify(true).await?;
+        }
+        operations[reference].result(reference, false)
     }
     async fn reconcile_locked(
         &self,
         reference: &str,
-        journal: &mut Journal,
+        operations: &mut BTreeMap<String, Retained>,
         store: &mut LocalState,
     ) -> Result<OperationResult, CircleError> {
-        match self.lookup(reference, journal, store).await {
-            Ok((next, state)) => {
-                let result = next.result(reference, state)?;
-                journal.operations.insert(reference.into(), next);
-                journal.write(store)?;
-                Ok(result)
+        let Some(retained) = operations.get(reference) else {
+            return OperationResult::new(
+                reference,
+                OperationState::Unknown,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .map_err(|_| CircleError::Journal);
+        };
+        let Some(id) = retained.wallet_operation_id.clone() else {
+            return retained.result(reference, true);
+        };
+        let result = async {
+            let mut cursor: Option<String> = None;
+            let mut seen = HashSet::new();
+            for _ in 0..self.options.max_pages {
+                let mut args = vec![
+                    "transaction".into(),
+                    "list".into(),
+                    "--address".into(),
+                    encoded(self.address()),
+                    "--chain".into(),
+                    blockchain(self.chain.profile().domain().chain_id())?.into(),
+                    "--operation".into(),
+                    "execute".into(),
+                    "--tx-type".into(),
+                    "outbound".into(),
+                    "--limit".into(),
+                    "50".into(),
+                ];
+                if let Some(cursor) = &cursor {
+                    args.extend(["--cursor".into(), cursor.clone()]);
+                }
+                let result = self.json(args, false).await?;
+                let page = result["transactions"]
+                    .as_array()
+                    .filter(|v| v.len() <= 50)
+                    .ok_or(CircleError::InvalidEvidence)?;
+                let mut found = None;
+                for row in page {
+                    let candidate = text(row, "id")?;
+                    uuid(candidate, false)?;
+                    if !seen.insert(candidate.to_owned()) {
+                        return Err(CircleError::InvalidEvidence);
+                    }
+                    cursor = Some(candidate.to_owned());
+                    if candidate == id {
+                        found = Some(row);
+                    }
+                }
+                if let Some(row) = found {
+                    return self.observe(reference, row, false, operations, store).await;
+                }
+                if page.len() < 50 {
+                    break;
+                }
             }
+            Err(CircleError::Unavailable)
+        }
+        .await;
+        match result {
+            Ok(result) => Ok(result),
             Err(CircleError::Journal | CircleError::Capacity) => Err(CircleError::Journal),
-            Err(_) => journal
-                .operations
-                .get(reference)
-                .ok_or(CircleError::Journal)?
-                .result(reference, OperationState::Unknown),
+            Err(_) => operations[reference].result(reference, true),
         }
     }
     async fn execute_inner(
         &self,
         call: &WalletCall,
-        operation_ref: &str,
+        reference_: &str,
     ) -> Result<OperationResult, CircleError> {
-        reference(operation_ref)?;
-        if call.chain_id() != self.identity.chain_id || call.data().len() > MAX_CALL {
-            return Err(CircleError::Configuration);
-        }
-        let _guard = self.operation_lock.lock().await;
-        let mut store =
-            LocalState::open(&self.journal_path, MAX_JOURNAL).map_err(|_| CircleError::Journal)?;
-        let mut journal = Journal::read(&store, &self.identity)?;
-        let to = address_hex(call.to());
-        let calldata = format!("0x{}", alloy_primitives::hex::encode(call.data()));
-        if let Some(original) = journal.operations.get(operation_ref) {
-            if original.to != to || original.calldata != calldata {
+        reference(reference_)?;
+        self.validate_call(call)?;
+        let _lock = self.lock.lock().await;
+        let mut store = self.store()?;
+        let mut operations = self.load(&store)?;
+        if let Some(row) = operations.get(reference_) {
+            if row.call.call()? != *call {
                 return Err(CircleError::InvalidEvidence);
             }
             return self
-                .reconcile_locked(operation_ref, &mut journal, &mut store)
+                .reconcile_locked(reference_, &mut operations, &mut store)
                 .await;
         }
-        if journal.operations.len() >= MAX_OPERATIONS {
+        if operations.len() >= MAX_OPERATIONS {
             return Err(CircleError::Capacity);
         }
-        let mut operation = JournalOperation {
-            service_ref: fresh_key()?,
-            to,
-            calldata,
-            attempted: false,
-            wallet_operation_id: None,
-            tx_hash: None,
-        };
-        journal
-            .operations
-            .insert(operation_ref.into(), operation.clone());
-        journal.write(&mut store)?;
-        let ciphertext = match async {
-            self.verify_wallet().await?;
-            self.client.ciphertext().await
+        let direct =
+            self.options.allow_registration_activation && *call == self.registration_call()?;
+        self.verify(direct).await?;
+        let key = fresh_key()?;
+        operations.insert(
+            reference_.into(),
+            Retained {
+                route: if direct { "direct_register" } else { "self" }.into(),
+                call: RetainedCall::from_call(call),
+                idempotency_key: key.clone(),
+                wallet_operation_id: None,
+                tx_hash: None,
+                state: "unknown".into(),
+            },
+        );
+        self.save(&mut store, &operations)?;
+        let mut args = vec!["wallet".into(), "execute".into()];
+        if direct {
+            args.extend(["register()".into(), "--amount".into(), "0".into()]);
+        } else {
+            args.extend([
+                EXECUTE.into(),
+                encoded(call.to()),
+                "0".into(),
+                encoded(call.data()),
+            ]);
         }
-        .await
-        {
-            Ok(value) => value,
-            Err(_) => return operation.result(operation_ref, OperationState::Failed),
+        args.extend([
+            "--contract".into(),
+            encoded(if direct { call.to() } else { self.address() }),
+            "--address".into(),
+            encoded(self.address()),
+            "--chain".into(),
+            blockchain(call.chain_id())?.into(),
+            "--idempotency-key".into(),
+            key,
+        ]);
+        let result = match self.json(args, true).await {
+            Ok(row) => {
+                self.observe(reference_, &row, true, &mut operations, &mut store)
+                    .await
+            }
+            Err(error) => Err(error),
         };
-        operation.attempted = true;
-        journal
-            .operations
-            .insert(operation_ref.into(), operation.clone());
-        journal.write(&mut store)?; // Required before submission can start, including cancellation.
-        let response = self.client.transport.request(Method::POST, "/developer/transactions/contractExecution", Some(json!({
-            "idempotencyKey": operation.service_ref, "refId": operation.service_ref,
-            "walletId": self.identity.wallet_id, "contractAddress": operation.to,
-            "callData": operation.calldata, "amount": "0", "feeLevel": "MEDIUM", "entitySecretCiphertext": ciphertext
-        }))).await;
-        if let Ok(response) = response
-            && let Ok(id) = string(&response, "id")
-            && uuid(id).is_ok()
-        {
-            operation.wallet_operation_id = Some(id.into());
-            journal
-                .operations
-                .insert(operation_ref.into(), operation.clone());
-            journal.write(&mut store)?;
+        match result {
+            Ok(result) => Ok(result),
+            Err(CircleError::Journal | CircleError::Capacity) => Err(CircleError::Journal),
+            Err(_) => operations[reference_].result(reference_, true),
         }
-        // The original submission remains the only write. A lost response is
-        // recovered through refId lookup, with handles saved before further I/O.
-        self.reconcile_locked(operation_ref, &mut journal, &mut store)
-            .await
     }
 }
 #[tonic::async_trait]
-impl TransactionWallet for CircleDeveloperWallet {
+impl TransactionWallet for CircleAgentWallet {
     fn address(&self) -> Address {
-        self.identity.address
+        self.address()
     }
     async fn execute(
         &self,
         call: &WalletCall,
-        operation_ref: &str,
+        reference: &str,
     ) -> Result<OperationResult, WalletError> {
-        self.execute_inner(call, operation_ref)
+        // Keep the lock and original returned handles alive if a caller drops its
+        // future. The detached task finishes the original invocation; no retry.
+        let wallet = self.clone();
+        let call = call.clone();
+        let reference = reference.to_owned();
+        tokio::spawn(async move { wallet.execute_inner(&call, &reference).await })
             .await
+            .map_err(|_| WalletError)?
             .map_err(|_| WalletError)
     }
-    async fn reconcile(&self, operation_ref: &str) -> Result<OperationResult, WalletError> {
-        reference(operation_ref).map_err(|_| WalletError)?;
-        let _guard = self.operation_lock.lock().await;
-        let mut store =
-            LocalState::open(&self.journal_path, MAX_JOURNAL).map_err(|_| WalletError)?;
-        let mut journal = Journal::read(&store, &self.identity).map_err(|_| WalletError)?;
-        self.reconcile_locked(operation_ref, &mut journal, &mut store)
+    async fn reconcile(&self, reference_: &str) -> Result<OperationResult, WalletError> {
+        reference(reference_).map_err(|_| WalletError)?;
+        let _lock = self.lock.lock().await;
+        let mut store = self.store().map_err(|_| WalletError)?;
+        let mut operations = self.load(&store).map_err(|_| WalletError)?;
+        self.reconcile_locked(reference_, &mut operations, &mut store)
             .await
             .map_err(|_| WalletError)
     }

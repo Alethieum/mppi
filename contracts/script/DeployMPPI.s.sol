@@ -12,13 +12,15 @@ interface IMPPIDeploymentSafe {
     function getThreshold() external view returns (uint256);
 }
 
-/// @notice Arc testnet deployment preparation with the selected 1-of-1 Safe profile.
+/// @notice Arc deployment preparation with the selected 1-of-1 Safe profile.
 /// @dev Read docs/deployment.md before use. Code/configuration checks do not prove
 ///      registry/Safe identity, custody, or approval of the release parameters.
 ///      No private key is read by the script. Foundry supplies the broadcaster.
 contract DeployMPPI is Script {
     uint256 public constant ARC_TESTNET_CHAIN_ID = 5042002;
+    uint256 public constant ARC_MAINNET_CHAIN_ID = 5042;
     uint256 public constant TESTNET_TIMELOCK_DELAY = 60;
+    uint256 public constant MAINNET_TIMELOCK_DELAY = 86_400;
     address public constant MPPI_CREATE2_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     // Arachnid be3c5974 runtime; independently pinned by Foundry 1.8.3 constants.rs.
     bytes32 public constant CREATE2_FACTORY_CODEHASH =
@@ -42,7 +44,7 @@ contract DeployMPPI is Script {
     error WrongChain(uint256 actual, uint256 expected);
     error ZeroDeploymentAddress();
     error MissingContractCode(address account);
-    error InvalidTestnetSafe();
+    error InvalidGovernanceSafe();
     error DeployerIsSafeOwner();
     error UnexpectedFactoryCode(bytes32 actual);
     error DeploymentAddressOccupied(address account);
@@ -50,7 +52,19 @@ contract DeployMPPI is Script {
     error UnexpectedFactoryResult(address expected);
 
     function run() external returns (TimelockController timelock, MPPI implementation, ERC1967Proxy proxy) {
-        if (block.chainid != ARC_TESTNET_CHAIN_ID) revert WrongChain(block.chainid, ARC_TESTNET_CHAIN_ID);
+        return _run(ARC_TESTNET_CHAIN_ID, TESTNET_TIMELOCK_DELAY);
+    }
+
+    /// @notice Explicit mainnet entry point; `run()` remains testnet-only.
+    function runMainnet() external returns (TimelockController timelock, MPPI implementation, ERC1967Proxy proxy) {
+        return _run(ARC_MAINNET_CHAIN_ID, MAINNET_TIMELOCK_DELAY);
+    }
+
+    function _run(uint256 expectedChainId, uint256 delay)
+        private
+        returns (TimelockController timelock, MPPI implementation, ERC1967Proxy proxy)
+    {
+        if (block.chainid != expectedChainId) revert WrongChain(block.chainid, expectedChainId);
         Configuration memory config = Configuration({
             registry: vm.envAddress("MPPI_REGISTRY"),
             guardian: vm.envAddress("MPPI_GUARDIAN"),
@@ -60,7 +74,7 @@ contract DeployMPPI is Script {
             releaseSalt: vm.envBytes32("MPPI_RELEASE_SALT")
         });
         _validate(config);
-        Creation[3] memory plan = _prepare(config);
+        Creation[3] memory plan = _prepare(config, delay);
         for (uint256 i; i < plan.length; ++i) {
             if (plan[i].predicted.code.length != 0 || vm.getNonce(plan[i].predicted) != 0) {
                 revert DeploymentAddressOccupied(plan[i].predicted);
@@ -92,13 +106,13 @@ contract DeployMPPI is Script {
         if (
             owners.length != 1 || owners[0] != config.safeOwner || owners[0] == address(1) || owners[0] == config.safe
                 || IMPPIDeploymentSafe(config.safe).getThreshold() != 1
-        ) revert InvalidTestnetSafe();
+        ) revert InvalidGovernanceSafe();
         if (MPPI_CREATE2_FACTORY.codehash != CREATE2_FACTORY_CODEHASH) {
             revert UnexpectedFactoryCode(MPPI_CREATE2_FACTORY.codehash);
         }
     }
 
-    function _prepare(Configuration memory config) private pure returns (Creation[3] memory plan) {
+    function _prepare(Configuration memory config, uint256 delay) private pure returns (Creation[3] memory plan) {
         address[] memory proposers = new address[](1);
         proposers[0] = config.safe;
         address[] memory executors = new address[](1);
@@ -106,10 +120,7 @@ contract DeployMPPI is Script {
         plan[0] = _creation(
             config.releaseSalt,
             "mppi.timelock",
-            abi.encodePacked(
-                type(TimelockController).creationCode,
-                abi.encode(TESTNET_TIMELOCK_DELAY, proposers, executors, address(0))
-            )
+            abi.encodePacked(type(TimelockController).creationCode, abi.encode(delay, proposers, executors, address(0)))
         );
         plan[1] = _creation(config.releaseSalt, "mppi.implementation", type(MPPI).creationCode);
         bytes memory initializer =
