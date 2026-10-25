@@ -348,6 +348,20 @@ impl Fixture {
             .unwrap()
             .voucher = Some(voucher);
     }
+    /// Coverage requests sent on the owner's Control stream since the last call.
+    pub(super) async fn coverage_requests(&self) -> Vec<proto::CoverageRequest> {
+        let queue = self.provider.inner.lock().unwrap().attachments[&1]
+            .queue
+            .clone();
+        let mut requests = Vec::new();
+        while queue.buffered().unwrap().0 > 0 {
+            let message = proto::ControlMessage::decode(queue.get().await.unwrap().as_slice());
+            if let Some(proto::control_message::Kind::LowCredit(notice)) = message.unwrap().kind {
+                requests.extend(notice.coverage_request);
+            }
+        }
+        requests
+    }
     pub(super) fn admit(&self, id: u8) -> RunHandle {
         let run = self.begin(id);
         assert!(matches!(
@@ -406,7 +420,7 @@ async fn signed_admission_preserves_payload_and_deduplicates_before_callbacks() 
             .inner
             .attempt_admission(&run, counts(1000))
             .unwrap(),
-        Admission::Wait(_)
+        Admission::Authorizing
     ));
     assert!(
         !fixture.provider.inner.lock().unwrap().sessions[&fixture.sid].runs[&hash(1)].admitted()
@@ -448,21 +462,18 @@ async fn concurrent_pending_candidates_cannot_reuse_authorized_headroom() {
             .unwrap(),
         Admission::Granted
     ));
-    let Admission::Wait(guidance) = fixture
-        .provider
-        .inner
-        .attempt_admission(&second, counts(1000))
-        .unwrap()
-    else {
+    assert!(matches!(
+        fixture
+            .provider
+            .inner
+            .attempt_admission(&second, counts(1000))
+            .unwrap(),
+        Admission::Authorizing
+    ));
+    let [request] = &fixture.coverage_requests().await[..] else {
         panic!("combined coverage requires two units")
     };
-    let Some(proto::control_message::Kind::LowCredit(guidance)) = guidance.kind else {
-        panic!("coverage guidance")
-    };
-    assert_eq!(
-        guidance.coverage_request.unwrap().required_by_price[0].output_tokens,
-        Some(2000)
-    );
+    assert_eq!(request.required_by_price[0].output_tokens, Some(2000));
     fixture.voucher(2);
     assert!(matches!(
         fixture
@@ -492,6 +503,146 @@ async fn concurrent_pending_candidates_cannot_reuse_authorized_headroom() {
             .amount,
         Some(0)
     );
+}
+
+#[tokio::test]
+async fn a_waiting_run_is_not_overtaken_by_runs_that_first_wait_after_it() {
+    // Each round, a later run arrives while the waiting run's voucher is in
+    // flight. Admitted on existing headroom, it would raise the waiting run's
+    // target again, so the voucher always lands one run short.
+    let fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    let attempt = |run: &RunHandle, output| {
+        fixture
+            .provider
+            .inner
+            .attempt_admission(run, counts(output))
+            .unwrap()
+    };
+    let asked = || {
+        let state = fixture.provider.inner.lock().unwrap();
+        let session = &state.sessions[&fixture.sid];
+        let candidate = Some((hash(1), counts(3000)));
+        fixture
+            .provider
+            .inner
+            .required_rows_locked(session, candidate)
+            .unwrap()
+            .1
+    };
+    fixture.voucher(1);
+    let waiting = fixture.begin(1);
+    assert!(matches!(attempt(&waiting, 3000), Admission::Authorizing));
+    let (mut admitted, mut overtaken) = (None, 0);
+    for round in 0..20 {
+        let target = asked(); // The waiting run's coverage request.
+        let later = fixture.begin(10 + round);
+        if matches!(attempt(&later, 1000), Admission::Granted) {
+            overtaken += 1;
+        }
+        fixture.voucher(target); // The agent's answer lands.
+        if matches!(attempt(&waiting, 3000), Admission::Granted) {
+            admitted = Some(round);
+            break;
+        }
+    }
+    assert_eq!((admitted, overtaken), (Some(0), 0));
+}
+
+#[tokio::test]
+async fn a_run_waiting_its_turn_asks_for_nothing_and_moves_up_when_the_head_leaves() {
+    let fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    let attempt = |run: &RunHandle, output| {
+        fixture
+            .provider
+            .inner
+            .attempt_admission(run, counts(output))
+    };
+    fixture.voucher(1);
+    let head = fixture.begin(1);
+    assert!(matches!(
+        attempt(&head, 3000).unwrap(),
+        Admission::Authorizing
+    ));
+    // Covered on its own, the next run waits its turn without guidance.
+    let next = fixture.begin(2);
+    assert!(matches!(attempt(&next, 1000).unwrap(), Admission::Deferred));
+    let requests = fixture.coverage_requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].run_id.as_deref(), Some(hash(1).as_slice()));
+    // A run the deposit cannot cover is still refused at once.
+    let error = attempt(&fixture.begin(3), 101_000).err().unwrap();
+    assert_eq!(
+        wire::parse_payment_error(&error).unwrap().unwrap().code(),
+        PaymentCode::InsufficientDeposit
+    );
+    fixture.provider.inner.cancel_run(&head.context);
+    assert!(matches!(attempt(&next, 1000).unwrap(), Admission::Granted));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_uncovered_head_repeats_its_request_after_a_short_voucher_or_a_turn() {
+    let fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    let attempt = |run: &RunHandle, output| {
+        fixture
+            .provider
+            .inner
+            .attempt_admission(run, counts(output))
+            .unwrap()
+    };
+    fixture.voucher(1);
+    let head = fixture.begin(1);
+    assert!(matches!(attempt(&head, 3000), Admission::Authorizing));
+    assert_eq!(fixture.coverage_requests().await.len(), 1);
+    assert!(matches!(attempt(&head, 3000), Admission::Authorizing));
+    assert_eq!(fixture.coverage_requests().await.len(), 0); // Unchanged, so not repeated.
+    let later = fixture.begin(2);
+    assert!(matches!(attempt(&later, 5000), Admission::Authorizing));
+    assert_eq!(fixture.coverage_requests().await.len(), 1);
+    fixture.voucher(2); // A voucher that still leaves both short.
+    assert!(matches!(attempt(&later, 5000), Admission::Authorizing));
+    assert!(matches!(attempt(&head, 3000), Admission::Authorizing));
+    let requests = fixture.coverage_requests().await;
+    assert_eq!(requests.len(), 1); // Only the head repeats its request.
+    assert_eq!(requests[0].run_id.as_deref(), Some(hash(1).as_slice()));
+    tokio::time::advance(TURN).await;
+    assert!(matches!(attempt(&head, 3000), Admission::Authorizing));
+    assert_eq!(fixture.coverage_requests().await.len(), 1); // And once a turn.
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_head_refused_for_its_deposit_on_recheck_leaves_the_queue() {
+    let fixture = Fixture::new(1000).await; // Deposit 100 units.
+    let attempt = |run: &RunHandle, output| {
+        fixture
+            .provider
+            .inner
+            .attempt_admission(run, counts(output))
+    };
+    fixture.voucher(3);
+    let head = fixture.begin(1);
+    assert!(matches!(
+        attempt(&head, 98_000).unwrap(),
+        Admission::Authorizing
+    ));
+    let later = fixture.begin(2);
+    assert!(matches!(
+        attempt(&later, 3000).unwrap(),
+        Admission::Deferred
+    ));
+    tokio::time::advance(TURN).await; // The head's turn is over.
+    assert!(matches!(attempt(&later, 3000).unwrap(), Admission::Granted));
+    // The head's target is now 3 + 98 units, above the deposit.
+    let error = attempt(&head, 98_000).err().unwrap();
+    assert_eq!(
+        wire::parse_payment_error(&error).unwrap().unwrap().code(),
+        PaymentCode::InsufficientDeposit
+    );
+    fixture.provider.inner.cancel_run(&head.context); // As its RPC ends.
+    fixture.voucher(4);
+    assert!(matches!(
+        attempt(&fixture.begin(3), 1000).unwrap(),
+        Admission::Granted
+    ));
 }
 
 #[tokio::test]
@@ -759,7 +910,7 @@ async fn zero_price_requires_explicit_zero_voucher_and_checks_group_counts() {
             .inner
             .attempt_admission(&first, counts(1000))
             .unwrap(),
-        Admission::Wait(_)
+        Admission::Authorizing
     ));
     fixture.voucher(0);
     assert!(matches!(

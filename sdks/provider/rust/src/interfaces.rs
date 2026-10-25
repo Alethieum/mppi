@@ -207,6 +207,18 @@ pub trait ExecutionProvider: Send + Sync {
 pub trait ProviderSessions: Send + Sync {
     async fn checkpoint(&self, session_id: B256) -> IntegrationResult<RecoveryEvidence>;
     async fn recover(&self, evidence: RecoveryEvidence) -> IntegrationResult<SessionView>;
+    /// As `recover`, for evidence the host asserts is the session's current
+    /// history: checkpointed after every admission and before dispatch, and
+    /// never older than its newest checkpoint. A pending run absent from that
+    /// history was then never admitted, and a reattachment answers it
+    /// NOT_ADMITTED. After `recover` such a run refuses the attachment
+    /// instead, since an older checkpoint may lack a run that was served.
+    async fn recover_current(&self, evidence: RecoveryEvidence) -> IntegrationResult<SessionView> {
+        let _ = evidence;
+        Err(Box::new(tonic::Status::unimplemented(
+            "recovery from asserted current history is unsupported",
+        )))
+    }
     async fn settle(&self, session_id: B256) -> IntegrationResult<OperationResult>;
     async fn settle_batch(&self, session_ids: &[B256]) -> IntegrationResult<OperationResult>;
     async fn close(&self, session_id: B256) -> IntegrationResult<OperationResult>;

@@ -41,11 +41,15 @@ def discover(
     if expected_origin is not None and normalize_origin(expected_origin) != origin:
         raise ValidationError(ValidationCode.INVALID_VALUE, "provider origin differs from registry")
     http = transport if transport is not None else HttpTransport()
-    registration = http.request(origin + "/discover")
-    verify_registration(registration, identity, expected_origin=origin)
-    # A removed/malformed current offering blocks new work, not recovery of
-    # retained session terms. Registration still binds the serving endpoint.
-    models = b"" if identity.catalog is None else http.request(origin + "/models")
+    try:
+        registration = http.request(origin + "/discover")
+        verify_registration(registration, identity, expected_origin=origin)
+        # A removed/malformed current offering blocks new work, not recovery of
+        # retained session terms. Registration still binds the serving endpoint.
+        models = b"" if identity.catalog is None else http.request(origin + "/models")
+    finally:
+        if transport is None:
+            http.close()  # Its kept-alive connection outlives no one.
     model_ids = () if identity.catalog is None else verify_models(models, identity.catalog)
     return ProviderDiscovery(identity, origin, registration, models, model_ids)
 

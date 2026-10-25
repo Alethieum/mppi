@@ -5,14 +5,14 @@ then handles discovery, payment messages and inference against the provider's
 MPPI endpoint. This guide uses Circle Agent Wallet on official Arc testnet,
 with Python 3.12+ on macOS or Linux.
 
-The built-in setup requires `mppi-agent` version `0.1.3`. Existing applications
+The built-in setup requires `mppi-agent` version `0.1.4`. Existing applications
 can continue using the [explicit composition interface](python-quickstart.md).
 
 ## 1. Install
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-agent==0.1.3'
+uv pip install 'mppi-agent==0.1.4'
 ```
 
 The shared protocol dependency installs automatically. Run the remaining
@@ -65,15 +65,18 @@ Set `ARC_RPC_URL_TESTNET` through your secret environment for your own trusted
 RPC; `--rpc-env NAME` selects a different variable. URLs with credentials are
 never stored in configuration.
 
-The built-in client requires chain evidence less than 60 seconds old and polls
-Arc every 15 seconds, as the explicit composition does; pass
+Requests within an attached session read no chain: they use the session's
+confirmed deposit, accepted prices and attachment. Opening, attachment, top-up
+and close use chain evidence less than 60 seconds old, refreshing first when it
+is older, and the client also refreshes once a minute in the background; pass
 `Client.from_config(..., max_age_ms=..., poll_interval_ms=...)` to choose
-another cadence. Each poll costs about 24 RPC requests, so one client makes
-about 1.6 requests per second; see [read cost](python-runtime.md#fresh-chain-state)
-to size a shared RPC plan. Wallet operations have a 300-second wait budget,
-including Circle's signing and submission steps. Expired chain evidence still
-stops new authorization; waiting longer never extends a session's collection
-deadline. A Complete stream has no deadline unless you set one: an explicitly
+another cadence. A failed background refresh reaches the error hook. An
+unavailable RPC never blocks requests; evidence contradicting the deployment
+stops them until a later refresh is accepted. See
+[read cost](python-runtime.md#fresh-chain-state) to size a shared RPC plan.
+Wallet operations have a 300-second wait budget, including
+Circle's signing and submission steps. Waiting never extends a session's
+collection deadline. A Complete stream has no deadline unless you set one: an explicitly
 composed `Client(..., request_timeout_ms=...)` bounds each inference RPC.
 
 ## 4. Make a request
@@ -165,36 +168,29 @@ also selects mainnet and its RPC environment when `rpc_env` is omitted.
 Both setup and client construction reject a retained configuration from another
 deployment. An explicit trusted `profile=` override remains supported.
 
-## Supported wallet versions
+## Wallet requirements
 
-The built-in Circle profile verifies these Arc testnet values:
+Built-in setup accepts any Circle Agent Wallet account generation; it pins no
+account code or implementation. Before submitting a session opening, the agent
+checks at one block what makes the authorization valid for it:
 
-| Component | Trusted value |
-| --- | --- |
-| Proxy runtime Keccak-256 | `0xd09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66` |
-| SingleOwnerMSCA implementation | `0x895b96c92d1007872fe1f70606e6b7eeaebd620e` |
-| Implementation runtime Keccak-256 | `0x3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa` |
+- the registry binds its ERC-8004 agent id to this wallet, as the provider
+  checks when the session opens;
+- the RPC serves the selected network;
+- USDC would accept the wallet's signature: an ECDSA signature for an account
+  without code, or ERC-1271 `isValidSignature` approval from a smart account.
 
-The implementation has [verified source](https://explorer.testnet.arc.io/address/0x895b96c92d1007872fe1f70606e6b7eeaebd620e?tab=contract).
-Mainnet source support pins the actual Circle Agent Wallet
-`circle_6900_singleowner_v4` account generation:
-
-| Component | Trusted mainnet value |
-| --- | --- |
-| Proxy runtime Keccak-256 | `0xd09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66` |
-| Implementation | `0x9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed` |
-| Implementation runtime Keccak-256 | `0x60ecaaadc845f14626e77541b390bd36a7f5c35efdee5c30471f0eb08626019e` |
-
-The mainnet pins were bound to Circle's authenticated account metadata and its
-[activation receipt](https://explorer.arc.io/tx/0x39cc91d351345c62163c6cd45ad6815f34c5cb063eb2b90cd4cd5fae53984e4c),
-then checked for the adapter's self-execution call, ERC-1271 signatures and
-zero-value USDC authorization simulation. That account interoperability check
-does not establish a funded MPPI exchange or an audit of Circle's implementation.
-Unsupported code fails verification. RPC-returned code is never automatically
-trusted. Circle's [contract versions](https://developers.circle.com/wallets/wallet-upgrades#contract-versions)
-differ between products and account generations; these pins do not cover every
-Circle SCA or infer an Agent Wallet version from Developer Wallet documentation.
+A refusal raises `FundingAuthorizationError` with `reason` `AGENT_ID_REQUIRED`,
+`AGENT_WALLET_MISMATCH` or `INVALID_SIGNATURE`. Nothing is submitted, and the
+same funding can be retried once the wallet can sign it. A top-up relies on the
+binding and signature its session's opening proved; USDC still checks it, and a
+refusal is a definite failed top-up. The MPPI contract and USDC enforce
+everything else on chain. A smart account must be deployed before
+it funds; onboarding's registration deploys it. Exits such as `requestClose`
+and `withdraw` need no agent id or signature check.
 
 Existing compatible wallet integrations retain `FundingWallet`, `SessionSigner`,
-explicit `Client(...)` and `--wallet-factory MODULE:FUNCTION --profile FILE`.
-See [advanced wallet integration](python-onboarding.md).
+explicit `Client(..., agent_id=...)` and `--wallet-factory MODULE:FUNCTION --profile FILE`.
+Other wallets fit behind the same interface with a thin adapter, including
+wallets whose service signs as it executes; see
+[funding wallet adapters](python-onboarding.md#funding-wallet-adapters).

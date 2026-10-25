@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from mppi_protocol import chain
 from mppi_protocol.deployment import load_profile, profile_from_mapping, profile_to_mapping
 from mppi_protocol.errors import ValidationError
 
@@ -74,3 +75,11 @@ def test_profile_json_rejects_duplicate_fields_and_oversized_file(tmp_path):
     path.write_bytes(b" " * ((1 << 20) + 1))
     with pytest.raises(ValidationError):
         load_profile(path)
+
+
+def test_multicall3_is_pinned_to_its_canonical_address_and_runtime():
+    # test_chain swaps in its stand-in's hash; the released value is held here.
+    assert chain._MULTICALL3.hex() == "ca11bde05977b3631167028862be2a173976ca11"
+    assert chain._MULTICALL3_CODE_HASH.hex() == (
+        "d5c15df687b16f2ff992fc8d767b4216323184a2bbc6ee2f9c398c318e770891"
+    )

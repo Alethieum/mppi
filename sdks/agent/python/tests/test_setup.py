@@ -8,7 +8,6 @@ from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
-import mppi_protocol.circle as shared_circle
 import pytest
 from eth_abi import encode
 from eth_account.messages import encode_typed_data
@@ -52,7 +51,6 @@ class Boundaries:
         self.rpc_urls = []
         self.reads = []
         self.wallets = []
-        self.wallet_pins = []
         self.usdc_name, self.usdc_version, self.usdc_decimals = "USDC", "2", 6
         self.separator = None
         owner = self
@@ -143,10 +141,9 @@ class Boundaries:
                 )
 
         class Wallet:
-            def __init__(self, *, chain, wallet, implementation, checkpoint_path, **kwargs):
-                owner.wallets.append(wallet.address)
-                owner.wallet_pins.append((wallet.code_hash, implementation))
-                self.chain, self.address, self.path = chain, wallet.address, checkpoint_path
+            def __init__(self, *, chain, address, checkpoint_path, **kwargs):
+                owner.wallets.append(address)
+                self.chain, self.address, self.path = chain, address, checkpoint_path
                 self.journal = None
 
             @contextmanager
@@ -295,6 +292,17 @@ def test_builtin_follower_allows_read_latency_but_same_head_still_expires(
             assert block == self.head
             return PauseLevel.NONE
 
+        # ChainReader's batched forms, built from the reads above.
+        def _blocks(self, numbers):
+            return [self.block(number) for number in numbers]
+
+        def _observe_at(self, number, block_hash, *, providers=(), sessions=(), recheck=None):
+            block = self.block(number)
+            assert block.observation.block_hash == block_hash
+            self.verify_deployment(block)
+            again = self.block(recheck) if recheck is not None else None
+            return block, again, self.pause_level(block), {}, {}
+
     def follower(reader, **options):
         return ChainFollower(
             DelayedReader(reader),
@@ -305,8 +313,8 @@ def test_builtin_follower_allows_read_latency_but_same_head_still_expires(
 
     monkeypatch.setattr(setup, "ChainFollower", follower)
     with Client.from_config(PROVIDER, config_path=boundary.config) as client:
-        # MPPI-35: the explicit composition's cadence, not a 2 s poll.
-        assert (client.chain.max_age_ms, client.chain.poll_interval_ms) == (60_000, 15_000)
+        # Requests read no chain, so the background poll runs once per freshness limit.
+        assert (client.chain.max_age_ms, client.chain.poll_interval_ms) == (60_000, 60_000)
         assert client.chain.collection_margin_ms == 30_000
 
         async def scenario():
@@ -398,7 +406,9 @@ def test_builtin_wallet_operation_budget_allows_cli_wait_but_remains_bounded(
             assert outcome.state is expected and outcome.operation_ref == reference
             assert client._operations[reference] == (operation, outcome)
             assert len(calls) == 1
-            assert calls[0][0] == (client.wallet, operation)
+            # Through the timing wrapper, which only counts the wallet's time.
+            wallet, submitted = calls[0][0]
+            assert (wallet._wallet, submitted) == (client.wallet, operation)
             assert calls[0][1]["operation_ref"] == reference
             assert calls[0][1]["chain"] is client.chain.reader
             assert outcome.wallet_operation_id == (
@@ -639,19 +649,7 @@ def test_network_profile_errors_precede_state_and_wallet(boundary, testnet, prof
     assert not boundary.wallets and not boundary.rpc_urls and not boundary.submissions
 
 
-def test_mainnet_never_infers_account_pins_from_testnet(boundary, monkeypatch):
-    monkeypatch.delitem(shared_circle._ACCOUNT_PINS, 5042, raising=False)
-    profile = profile_from_mapping(setup._profile())
-    profile = replace(profile, domain=replace(profile.domain, chain_id=5042))
-    with pytest.raises(OnboardingError, match="account pins are unavailable"):
-        boundary.onboard(testnet=False, profile=profile, rpc_env=setup.MAINNET_RPC_ENV)
-    assert not list(boundary.config.parent.iterdir())
-    assert not boundary.wallets and not boundary.rpc_urls and not boundary.submissions
-
-
-def test_mainnet_builtin_composition_uses_only_selected_profile_rpc_and_account_pins(
-    boundary, monkeypatch
-):
+def test_mainnet_builtin_composition_uses_only_selected_profile_and_rpc(boundary, monkeypatch):
     options = mainnet_selection(monkeypatch)
     expected_profile = profile_from_mapping(setup._profile(testnet=False))
     assert boundary.onboard(**options).onboarding.complete
@@ -659,7 +657,7 @@ def test_mainnet_builtin_composition_uses_only_selected_profile_rpc_and_account_
     with Client.from_config(PROVIDER, config_path=boundary.config, testnet=False) as client:
         assert client.contract.domain.chain_id == 5042
         assert client.chain.reader.profile == expected_profile
-    assert set(boundary.wallet_pins) == {shared_circle._ACCOUNT_PINS[5042]}
+    assert set(boundary.wallets) == {ADDRESS}  # Any Circle account generation.
     assert set(boundary.rpc_urls) == {"https://mainnet.example/selected"}
     assert len(boundary.submissions) == 1
     record = json.loads(boundary.config.read_bytes())
@@ -763,7 +761,7 @@ def test_mainnet_builtin_cli_does_not_require_a_wallet_factory(monkeypatch, tmp_
 
 
 def test_builtin_client_takes_the_callers_chain_timing(boundary):
-    """MPPI-35: each poll costs about 24 RPC reads, so the caller chooses its cadence."""
+    """Each poll reads the chain, so the caller chooses its cadence."""
     boundary.onboard()
     with Client.from_config(
         PROVIDER, config_path=boundary.config, max_age_ms=30_000, poll_interval_ms=5_000

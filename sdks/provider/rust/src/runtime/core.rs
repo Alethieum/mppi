@@ -331,6 +331,7 @@ impl Runtime {
             last_low_credit: None,
             unresolved: false,
             retained_bytes: prepared.payload().len(),
+            queued: None,
         };
         let identity = snapshot
             .identities()
@@ -444,13 +445,69 @@ impl Runtime {
                 &self.limits.wire,
             ));
         }
-        if session
-            .voucher
-            .as_ref()
-            .and_then(|voucher| voucher.cumulative)
-            .is_none_or(|amount| amount < required)
-        {
-            return Ok(Admission::Wait(Box::new(guidance)));
+        let voucher = session.voucher.as_ref().and_then(|item| item.cumulative);
+        let covered = voucher.is_some_and(|amount| amount >= required);
+        // Admit runs in the order they first waited, but only for a turn. A
+        // later run admitted on headroom an earlier run is waiting for raises
+        // that run's target, so under steady load the earlier run would chase
+        // it until its wait ended. A turn ends after TURN, so a run the agent
+        // never covers cannot hold back covered work for longer than that.
+        let now = Instant::now();
+        let turn =
+            TURN.min(Duration::from_millis(self.config.payment().authorization_wait_ms()) / 2);
+        let position = run.queued.as_ref().map(|queued| queued.position);
+        let earlier = session
+            .runs
+            .values()
+            .filter(|other| other.context.run_id() != context.run_id())
+            .filter_map(Run::waiting)
+            .filter(|other| position.is_none_or(|own| other.position < own))
+            .map(|other| other.since)
+            .collect::<Vec<_>>();
+        let deferred = earlier.iter().any(|since| now < *since + turn);
+        if !covered || deferred {
+            let owner = session.owner;
+            let session = state.sessions.get_mut(&context.session_id()).unwrap();
+            if position.is_none() {
+                let position = session.waited;
+                session.waited = position
+                    .checked_add(1)
+                    .ok_or_else(|| Status::resource_exhausted("admission queue limit"))?;
+                session.runs.get_mut(&context.run_id()).unwrap().queued = Some(Queued {
+                    position,
+                    since: now,
+                    sent: None,
+                });
+            }
+            if covered {
+                return Ok(Admission::Deferred); // Needs no voucher, so no guidance.
+            }
+            // Send guidance when it changes. The head also repeats it when a new
+            // voucher still leaves it short, and once a turn: the agent may have
+            // declined it while its own view of the deposit was behind.
+            let encoded = guidance.encode_to_vec();
+            let queued = session
+                .runs
+                .get_mut(&context.run_id())
+                .unwrap()
+                .queued
+                .as_mut()
+                .unwrap();
+            let send = queued.sent.as_ref().is_none_or(|(last, at, then)| {
+                *last != encoded || (earlier.is_empty() && (*then != voucher || now >= *at + turn))
+            });
+            if send {
+                queued.sent = Some((encoded, now, voucher));
+                let owner = owner.ok_or_else(|| {
+                    not_ready(
+                        "CONTROL_NOT_READY",
+                        Some(context.session_id()),
+                        Some(context.run_id()),
+                    )
+                })?;
+                self.send_locked(&mut state, owner, guidance)?;
+            }
+            return Ok(Admission::Authorizing);
         }
         if session.active().count() >= self.limits.wire.pending_runs() {
             return Err(Status::resource_exhausted("active run recovery limit"));

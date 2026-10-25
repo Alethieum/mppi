@@ -110,7 +110,7 @@ async fn compose(
     );
     wallet.verify_wallet().await.map_err(|error| match error {
         crate::circle::CircleError::Authentication => SetupError("Circle Agent Wallet session missing or expired; run circle wallet login EMAIL (mainnet) or circle wallet login EMAIL --testnet, then rerun"),
-        _ => SetupError("Circle Agent Wallet account, network, CLI version or code pins could not be verified"),
+        _ => SetupError("Circle Agent Wallet account, network or CLI version could not be verified"),
     })?;
     let contract = verified_usdc_contract(&chain).await?;
     Mppi::with_limits_and_hooks(

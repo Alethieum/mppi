@@ -94,8 +94,6 @@ impl Rpc for TestRpc {
             "eth_getStorageAt" => {
                 let address = if params[0] == encoded(Address::repeat_byte(1)) {
                     2
-                } else if params[0] == encoded(operator()) {
-                    0x55
                 } else {
                     4
                 };
@@ -274,8 +272,7 @@ impl Fixture {
     fn make_wallet(&self, existing: bool) -> Result<Arc<CircleAgentWallet>, CircleError> {
         Ok(Arc::new(CircleAgentWallet::with_command(
             self.host().chain,
-            CodePin::new(operator(), keccak256([0x60, 0])).unwrap(),
-            CodePin::new(Address::repeat_byte(0x55), keccak256([0x60, 0])).unwrap(),
+            operator(),
             &self.path,
             CircleOptions::default(),
             existing,
@@ -430,7 +427,7 @@ async fn usdc_domain_rejects_wrong_network_code_values_separator_abi_and_reorg()
 async fn operation_record_identity_is_checked_and_cannot_be_replaced() {
     let fixture = Fixture::new(None, operator());
     let mut value: Value = serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();
-    value["wallet"]["address"] = json!(encoded(Address::repeat_byte(0x22)));
+    value["wallet"] = json!(encoded(Address::repeat_byte(0x22)));
     fs::write(&fixture.path, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(fixture.compose().await.is_err());
     let retained: Value = serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();

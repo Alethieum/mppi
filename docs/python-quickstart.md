@@ -12,11 +12,11 @@ Install the role your application uses:
 uv pip install 'mppi-provider==0.1.2'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.3'
+uv pip install 'mppi-agent==0.1.4'
 ```
 
 Each role installs its required protocol dependency: the agent
-`mppi-protocol==0.1.2`, the provider `mppi-protocol==0.1.1`. The applications
+`mppi-protocol==0.1.3`, the provider `mppi-protocol==0.1.1`. The applications
 communicate through the provider's HTTPS origin; neither needs the other role's
 package. Source development uses the [local build guide](build.md).
 
@@ -210,7 +210,10 @@ cannot cover what the provider requires; `Client(on_funding_notice=callback)`
 receives the same notice as a `FundingNotice` whose `shortfall` is the missing
 amount in USDC base units, worked out at delivery; explicitly call
 `client.sessions.topUp(session_id, amount)` with positive USDC base units and
-inspect its operation result. Ordinary voucher renewal remains automatic within
+inspect its operation result. A provider repeats a request it is still waiting
+on, so the same shortfall can arrive again while your top-up is in flight: make
+the callback idempotent, for example by starting no second top-up while one is
+pending. Ordinary voucher renewal remains automatic within
 confirmed funding. See [agent composition](python-runtime.md#agent-composition)
 and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 
@@ -220,7 +223,8 @@ and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 | --- | --- |
 | `CONFIRMED` operation | Matching canonical chain evidence is available; retain its original reference. |
 | `PENDING` / `UNKNOWN` | Reconcile the original wallet operation with `sessions.reconcile(operation_ref)`; for cooperative close, repeat `sessions.close(session_id)` to inspect that same close. Do not replace funding or replay inference. |
-| `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. |
+| `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. A `cause` beginning `NotSubmittedError` means the wallet adapter's own record proves nothing reached its service, so it is safe to try again: for an opening, calling `sessions.open` again sends the same intent under a new reference while its authorization is valid. An opening whose authorization expired is forgotten, and the next `sessions.open` starts a fresh one. |
+| Uncertain opening, authorization expired | `sessions.reconcile(operation_ref)` returns `FAILED` with cause `authorization expired before any opening` once a canonical block at or after its `valid_before` shows no deposit: the opening never happened and never can. |
 | Missing final inference accounting | Retain the original run and reservation; do not invent token usage or replay inference. |
 | Provider unavailable | Agent `requestClose`, then eligible `withdraw`, provide the contract exit path. `releaseIdle` has its own eligibility. |
 

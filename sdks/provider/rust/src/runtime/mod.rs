@@ -216,11 +216,17 @@ pub(super) struct Session {
     pub(super) close_reference: Option<String>,
     pub(super) inconsistent: bool,
     pub(super) history_available: bool,
+    /// Every admission is in `runs`: the session was opened by this runtime,
+    /// or restored from history its host asserts is current. Only then does a
+    /// pending run absent from `runs` prove it was never admitted.
+    pub(super) admissions_known: bool,
     pub(super) operation: Option<PendingOperation>,
     pub(super) baseline: Option<PendingOperation>,
     pub(super) close_result: Option<proto::CloseResult>,
     pub(super) confirmed_units: u64,
     pub(super) last_collection: Instant,
+    /// Runs that have waited for admission so far: the next one's position.
+    pub(super) waited: u64,
 }
 #[derive(Clone)]
 pub(super) struct PendingOperation {
@@ -249,7 +255,20 @@ pub(super) struct Run {
     pub(super) last_low_credit: Option<(u64, U256)>,
     pub(super) unresolved: bool,
     pub(super) retained_bytes: usize,
+    /// Its place among runs waiting for admission, from its first wait.
+    pub(super) queued: Option<Queued>,
 }
+pub(super) struct Queued {
+    pub(super) position: u64,
+    pub(super) since: Instant,
+    /// The last coverage request sent for it, when, and the voucher then.
+    pub(super) sent: Option<(Vec<u8>, Instant, Option<u64>)>,
+}
+/// How long a waiting run keeps its place ahead of later covered runs, and how
+/// often a head the agent has not covered repeats its request: a few voucher
+/// round trips. The turn is also at most half the authorization wait, so a
+/// covered run never waits out its turn into that wait's expiry.
+pub(super) const TURN: Duration = Duration::from_secs(2);
 pub(super) struct RunHandle {
     pub(super) context: RunContext,
     pub(super) request: PreparedRequest,
@@ -258,7 +277,10 @@ pub(super) struct RunHandle {
 }
 pub(super) enum Admission {
     Granted,
-    Wait(Box<proto::ControlMessage>),
+    /// Authorization is missing: the configured wait applies.
+    Authorizing,
+    /// Covered, but an earlier run is still within its turn.
+    Deferred,
 }
 
 impl Mppi {
@@ -384,6 +406,12 @@ impl Run {
     pub(super) fn active(&self) -> bool {
         self.admitted() && self.accounting.final_status().is_none()
     }
+    /// When this run's turn began, while it waits for admission.
+    pub(super) fn waiting(&self) -> Option<&Queued> {
+        self.queued
+            .as_ref()
+            .filter(|_| self.phase == RunPhase::Preparing && !self.stop.is_cancelled())
+    }
 }
 impl Session {
     pub(super) fn new(sid: B256, opening: OpeningEvidence, history_available: bool) -> Self {
@@ -406,11 +434,13 @@ impl Session {
             close_reference: None,
             inconsistent: false,
             history_available,
+            admissions_known: true,
             operation: None,
             baseline: None,
             close_result: None,
             confirmed_units: 0,
             last_collection: Instant::now(),
+            waited: 0,
         }
     }
     pub(super) fn active(&self) -> impl Iterator<Item = &Run> {

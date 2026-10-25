@@ -264,7 +264,7 @@ def test_transport_marks_only_retryable_http_statuses_transient(status, transien
     assert "secret" not in str(caught.value)
 
 
-def test_transport_marks_dropped_connections_but_not_timeouts_or_content_transient():
+def test_transport_marks_dropped_connections_and_timeouts_but_not_content_transient():
     with server() as port:
         with pytest.raises(TransportError) as slow:
             HttpTransport(timeout_ms=200).request(f"http://127.0.0.1:{port}/slow", body=b'{"id":1}')
@@ -273,7 +273,7 @@ def test_transport_marks_dropped_connections_but_not_timeouts_or_content_transie
     with pytest.raises(TransportError) as refused:
         HttpTransport(timeout_ms=1000).request(f"http://127.0.0.1:{port}/", body=b'{"id":1}')
     assert (slow.value.transient, html.value.transient, refused.value.transient) == (
-        False,
+        True,
         False,
         True,
     )
@@ -292,7 +292,200 @@ def test_rpc_read_retries_rate_limits_with_bounded_backoff(monkeypatch):
         assert exhausted.value.transient and ATTEMPTS["/flaky/503/9"] == 3
         assert delays == [0.25, 1.0]
         delays.clear()
-        for path in ("/flaky/404/1", "/slow/a"):
-            with pytest.raises(TransportError):
-                HttpJsonRpc(endpoint + path, HttpTransport(timeout_ms=200)).call("eth_chainId", [])
+        with pytest.raises(TransportError):
+            HttpJsonRpc(endpoint + "/flaky/404/1", HttpTransport(timeout_ms=200)).call(
+                "eth_chainId", []
+            )
         assert ATTEMPTS["/flaky/404/1"] == 1 and delays == []
+
+
+class KeptAlive(BaseHTTPRequestHandler):
+    """An HTTP/1.1 JSON-RPC peer that keeps connections open and answers batches.
+
+    A batch's responses come back in reverse order: JSON-RPC 2.0 section 6 lets
+    a server answer in any order, so the client must match them by id.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_):
+        pass
+
+    def setup(self):
+        super().setup()
+        with KEPT_LOCK:
+            KEPT["connections"] += 1
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with KEPT_LOCK:
+            KEPT["requests"] += 1
+            stall = self.path == "/stall-once" and KEPT["requests"] == 1
+        if stall:
+            threading.Event().wait(0.6)  # Longer than the client waits.
+        if self.path == "/refuse" or (isinstance(payload, list) and self.path == "/refuse-batch"):
+            self.send_response(400)  # As a gateway that accepts no batch requests.
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if isinstance(payload, list) and self.path == "/single":
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600}}
+        elif isinstance(payload, list):
+            response = [self.answer(call) for call in reversed(payload)]
+        else:
+            response = self.answer(payload)
+        body = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        if self.path == "/drop":
+            self.close_connection = True  # Closed while idle, without saying so.
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except BrokenPipeError:
+            self.close_connection = True  # The client gave up on a stalled reply.
+
+    def answer(self, call):
+        if self.path == "/limited" and call["params"][0] == "limited":
+            with KEPT_LOCK:
+                KEPT["limited"] += 1
+                limited = KEPT["limited"] == 1
+            if limited:
+                return {"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32007}}
+        return {"jsonrpc": "2.0", "id": call["id"], "result": call["params"][0]}
+
+
+KEPT = {"connections": 0, "requests": 0, "limited": 0}
+KEPT_LOCK = threading.Lock()
+
+
+@contextmanager
+def kept_alive():
+    with KEPT_LOCK:
+        KEPT.update(connections=0, requests=0, limited=0)
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), KeptAlive)
+    peer.daemon_threads = True
+    thread = threading.Thread(target=peer.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{peer.server_address[1]}"
+    finally:
+        peer.shutdown()
+        peer.server_close()
+        thread.join(timeout=5)
+
+
+def test_sequential_reads_reuse_one_kept_alive_connection():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint)
+        for number in range(20):
+            assert rpc.call("eth_getBlockByNumber", [hex(number), False]) == hex(number)
+        rpc.close()
+    assert (KEPT["requests"], KEPT["connections"]) == (20, 1)
+
+
+def test_a_connection_the_server_closed_while_idle_is_replaced_once():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/drop")
+        for number in range(3):
+            assert rpc.call("eth_getBlockByNumber", [hex(number), False]) == hex(number)
+        rpc.close()
+    assert (KEPT["requests"], KEPT["connections"]) == (3, 3)
+
+
+def test_a_batch_is_one_round_trip_and_matched_by_id():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint)
+        calls = [("eth_getBlockByNumber", [hex(number), False]) for number in range(40)]
+        assert rpc.call_many(calls) == [hex(number) for number in range(40)]
+        rpc.close()
+    # At most 32 calls per batch: a plan that counts each call stays within its limit.
+    assert (KEPT["requests"], KEPT["connections"]) == (2, 1)
+
+
+def test_a_rate_limited_entry_repeats_its_batch(monkeypatch):
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/limited")
+        calls = [("eth_getBlockByNumber", ["limited", False]), ("eth_chainId", ["0x1"])]
+        assert rpc.call_many(calls) == ["limited", "0x1"]
+        rpc.close()
+    assert KEPT["requests"] == 2 and delays == [0.25]
+
+
+def test_an_endpoint_without_batches_is_read_one_call_at_a_time():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/single")
+        calls = [("eth_getBlockByNumber", [hex(number), False]) for number in range(3)]
+        assert rpc.call_many(calls) == ["0x0", "0x1", "0x2"]
+        assert rpc.call_many(calls) == ["0x0", "0x1", "0x2"]
+        rpc.close()
+    assert KEPT["requests"] == 1 + 3 + 3  # One refused batch, then single calls.
+
+
+def test_an_endpoint_that_refuses_batch_requests_is_read_one_call_at_a_time():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/refuse-batch")
+        calls = [("eth_getBlockByNumber", [hex(number), False]) for number in range(3)]
+        assert rpc.call_many(calls) == ["0x0", "0x1", "0x2"]
+        assert rpc.call_many(calls) == ["0x0", "0x1", "0x2"]
+        rpc.close()
+    assert KEPT["requests"] == 1 + 3 + 3  # One refused batch, then single calls.
+
+
+def test_an_endpoint_that_refuses_single_calls_too_keeps_its_batches():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/refuse")
+        calls = [("eth_getBlockByNumber", [hex(number), False]) for number in range(3)]
+        for _ in range(2):
+            with pytest.raises(TransportError, match="status 400"):
+                rpc.call_many(calls)
+        rpc.close()
+    assert KEPT["requests"] == 2 * (1 + 1)  # Each time a batch, then one single call.
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign", "extra", "object"])
+def test_a_batch_reply_must_answer_each_call_exactly_once(fault, monkeypatch):
+    calls = [("eth_chainId", []), ("eth_getBlockByNumber", ["latest", False])]
+
+    def reply(endpoint, *, body):
+        sent = json.loads(body)
+        rows = [{"jsonrpc": "2.0", "id": call["id"], "result": "0x1"} for call in sent]
+        if fault == "missing":
+            rows = rows[:1]
+        elif fault == "duplicate":
+            rows = [rows[0], rows[0]]
+        elif fault == "foreign":
+            rows[1]["id"] = "foreign"
+        elif fault == "extra":
+            rows.append({"jsonrpc": "2.0", "id": "extra", "result": "0x1"})
+        else:
+            rows = [rows[0], "0x1"]
+        return json.dumps(rows).encode()
+
+    transport = HttpTransport()
+    monkeypatch.setattr(
+        HttpTransport, "request", lambda self, url, *, body=None: reply(url, body=body)
+    )
+    with pytest.raises(ChainEvidenceError):
+        HttpJsonRpc("http://127.0.0.1:9", transport).call_many(calls)
+
+
+def test_a_batch_accepts_only_read_only_methods():
+    with pytest.raises(ChainEvidenceError):
+        HttpJsonRpc("http://127.0.0.1:9").call_many(
+            [("eth_chainId", []), ("eth_sendRawTransaction", ["0x00"])]
+        )
+
+
+def test_a_read_that_times_out_once_is_repeated_and_answered():
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/stall-once", HttpTransport(timeout_ms=300))
+        assert rpc.call("eth_getBlockByNumber", ["0x5", False]) == "0x5"
+        rpc.close()
+    assert KEPT["requests"] == 2

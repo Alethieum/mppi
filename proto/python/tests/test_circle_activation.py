@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 from eth_abi import encode
 from eth_utils import keccak
-from mppi_protocol.capabilities import FundingAuthorization, WalletCall
+from mppi_protocol.capabilities import WalletCall
 from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile
 from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.errors import ValidationError
@@ -164,8 +164,7 @@ def activation(tmp_path, monkeypatch):
     chain = ChainReader(rpc, DeploymentProfile(DOMAIN, REGISTRY, *pins))
     options = {
         "chain": chain,
-        "wallet": CodePin(WALLET, keccak(rpc.wallet_code)),
-        "implementation": CodePin(WALLET_IMPL, keccak(rpc.codes[WALLET_IMPL])),
+        "address": WALLET,
         "checkpoint_path": tmp_path / "circle.json",
         "allow_registration_activation": True,
     }
@@ -210,45 +209,34 @@ def test_registration_deploys_once_and_reconciles_persisted_direct_route(
         WalletCall(CHAIN, PROXY, b"\x01\x23\x45\x67"),
     ],
 )
-def test_undeployed_registration_permission_cannot_authorize_other_calls(activation, call):
+def test_registration_opt_in_sends_only_its_exact_call_directly(activation, call):
     create, _, cli, _ = activation
-    with pytest.raises(CircleAgentWalletError):
-        create().execute(call, operation_ref="register-ref")
-    assert not cli.path.exists()
-    assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
+    create().execute(call, operation_ref="register-ref")
+    row = json.loads(cli.path.read_text())["operations"]["register-ref"]
+    assert row["route"] == "self"
+    executions = [args for args in cli.calls if args[:2] == ["wallet", "execute"]]
+    assert [args[2] for args in executions] == ["execute(address,uint256,bytes)"]
 
 
-def test_activation_requires_explicit_boolean_and_does_not_enable_signing(activation):
+def test_activation_requires_an_explicit_boolean_opt_in(activation):
     create, _, cli, _ = activation
     with pytest.raises(ValidationError):
         create(allow_registration_activation=1)
     with pytest.raises(CircleAgentWalletError, match="not enabled"):
         create(allow_registration_activation=False).verify_registration_wallet()
-    with pytest.raises(CircleAgentWalletError):
-        create(allow_registration_activation=False).execute(REGISTER, operation_ref="register-ref")
-    wallet = create()
-    with pytest.raises(CircleAgentWalletError):
-        wallet.verify_wallet()
-    auth = FundingAuthorization(
-        CHAIN, bytes.fromhex("36" + "00" * 19), "USDC", "2", WALLET, PROXY, 1, 10, 20, b"\x33" * 32
-    )
-    with pytest.raises(CircleAgentWalletError):
-        wallet.sign_funding_authorization(auth)
     assert not cli.path.exists()
     assert not any(args[:2] in (["wallet", "execute"], ["wallet", "sign"]) for args in cli.calls)
 
 
-@pytest.mark.parametrize("problem", ["version", "account", "chain", "implementation", "registry"])
-def test_activation_still_verifies_custody_network_and_trusted_code(activation, problem):
+@pytest.mark.parametrize("problem", ["version", "account", "chain"])
+def test_activation_still_verifies_cli_custody_and_network(activation, problem):
     create, rpc, cli, _ = activation
     if problem == "version":
         cli.version = b"1.1.5"
     elif problem == "account":
         cli.wallets[0]["type"] = "local"
-    elif problem == "chain":
-        cli.wallets[0]["blockchain"] = "ARC"
     else:
-        rpc.codes[WALLET_IMPL if problem == "implementation" else REGISTRY] = b"changed"
+        cli.wallets[0]["blockchain"] = "ARC"
     with pytest.raises(RuntimeError):
         create().execute(REGISTER, operation_ref="register-ref")
     assert not cli.path.exists()
@@ -304,22 +292,15 @@ def test_pending_registration_recovers_only_original_id_and_route(activation):
     assert sum(args[:2] == ["wallet", "execute"] for args in cli.calls) == 1
 
 
-def test_unsupported_deployed_code_preserves_handles_and_blocks_funding(activation):
-    create, _, cli, _ = activation
-    cli.deployment = b"unsupported account"
+def test_any_deployed_account_generation_is_accepted(activation):
+    create, rpc, cli, _ = activation
+    cli.deployment = b"another account generation"
     wallet = create()
     result = wallet.execute(REGISTER, operation_ref="register-ref")
-    assert result.state is OperationState.UNKNOWN
+    assert result.state is OperationState.PENDING
     assert result.tx_hash == TX and result.wallet_operation_id == ID
-    cli.pages = [cli.transaction()]
-    assert create().reconcile(operation_ref="register-ref") == result
-    with pytest.raises(CircleAgentWalletError):
-        wallet.verify_registration_wallet()
-    with pytest.raises(CircleAgentWalletError):
-        wallet.verify_wallet()
-    with pytest.raises(CircleAgentWalletError):
-        wallet.execute(WalletCall(CHAIN, PROXY, b"\x01\x23\x45\x67"), operation_ref="fund")
-    assert sum(args[:2] == ["wallet", "execute"] for args in cli.calls) == 1
+    wallet.verify_wallet()  # No account code or implementation is pinned.
+    assert rpc.calls == []
 
 
 def test_legacy_registration_journal_remains_self_execution_after_opt_in(activation):

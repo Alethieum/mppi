@@ -4,8 +4,8 @@ Start with the [agent quickstart](agent-quickstart.md) or
 [provider quickstart](provider-quickstart.md) for built-in Circle setup. This page
 documents custom wallet and application composition.
 
-Python agent `0.1.3` and provider `0.1.2` share the Circle Agent Wallet adapter
-from `mppi-protocol` (`0.1.2` and `0.1.1` respectively). Both built-in setup paths select the packaged official
+Python agent `0.1.4` and provider `0.1.2` share the Circle Agent Wallet adapter
+from `mppi-protocol` (`0.1.3` and `0.1.1` respectively). Both built-in setup paths select the packaged official
 profile for the requested network. Explicit integrations below supply their own
 trusted profile. Python and Rust providers use the same native onboarding CLI.
 The [versioned testnet release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
@@ -22,7 +22,7 @@ explicit capabilities.
 Install your role into a Python 3.12+ environment:
 
 ```sh
-uv pip install 'mppi-agent==0.1.3'
+uv pip install 'mppi-agent==0.1.4'
 ```
 
 The provider environment installs `mppi-provider==0.1.2`. The shared protocol
@@ -120,11 +120,38 @@ address remain the funding wallet. The signer needs neither funding nor its own
 ERC-8004 registration. Retain the signer credential in your secret service and
 pass its recoverable reference to `Client`.
 
+### Funding wallet adapters
+
+Any wallet provider fits behind `FundingWallet` with a thin adapter; the SDK
+pins no wallet implementation or version. An adapter provides:
+
+| Member | Requirement |
+| --- | --- |
+| `address` | The funding wallet: the session's agent, its refund destination and the wallet the agent's ERC-8004 id binds |
+| `execute(call, *, operation_ref)` | Sends the nonpayable `call` once from `address` with zero native value, after durably binding `operation_ref` to it. Raise `NotSubmittedError` only when its own record proves nothing reached the wallet service |
+| `reconcile(*, operation_ref)` | Reports that same submission without sending anything |
+| `sign_funding_authorization(authorization)` | Returns bytes USDC accepts for exactly that authorization from `address`: an ECDSA signature for an account without code, or bytes its ERC-1271 `isValidSignature` approves |
+| `signs_at_execute` (optional) | `True` when the wallet service creates that signature as it executes: `sign_funding_authorization` returns a placeholder, and `execute` replaces it with the real signature before sending |
+
+Funding requires the agent id: pass `agent_id` to `Client`. Before submitting
+an opening, the agent checks, in one read at one block, that the
+registry's `getAgentWallet(agent_id)` is `address` and that the signature passes
+the same check USDC applies. Otherwise it raises `FundingAuthorizationError`
+with `reason` `AGENT_ID_REQUIRED`, `AGENT_WALLET_MISMATCH` or
+`INVALID_SIGNATURE`, and nothing is submitted; an all-zero placeholder from a
+wallet that has not declared `signs_at_execute` is
+`SIGNATURE_DEFERRED_UNDECLARED`. For a wallet that declares it, the agent
+checks only the binding and never simulates the placeholder; USDC verifies the
+real signature on chain. A top-up relies on what its session's opening proved,
+with USDC still checking its signature. A smart
+account must have code when it funds; registering through it deploys it. Exits
+are never gated this way.
+
 ### Circle Agent Wallet adapter
 
 `mppi_protocol.circle.CircleAgentWallet` uses the unmodified Circle CLI `1.1.4`.
-It accepts a `ChainReader`, an explicitly trusted `CodePin` for the funding SCA,
-a second pin for its implementation, and its own local operation journal:
+It accepts a `ChainReader`, the funding wallet's address and its own local
+operation journal:
 
 ```python
 from pathlib import Path
@@ -132,28 +159,27 @@ from mppi_protocol.circle import CircleAgentWallet
 
 wallet = CircleAgentWallet(
     chain=chain_reader,
-    wallet=funding_sca_pin,
-    implementation=sca_implementation_pin,
+    address=funding_wallet_address,
     checkpoint_path=Path("circle-operations.json"),
 )
 wallet.verify_wallet()
 ```
 
-Use a deployed SCA whose implementation supports the self-execution call. The
-adapter verifies its runtime code, implementation slot and CLI account selection
-before signing or submission. Circle documents deployment on the
+Before signing or submission, the adapter verifies the CLI version and that the
+CLI selects `address` as an agent wallet on the selected network. It pins no
+account code, so any Circle account generation that supports the self-execution
+call works. Circle documents deployment on the
 [first outbound transaction](https://developers.circle.com/wallets/account-types#smart-contract-accounts-sca-and-msca);
-receiving funds alone does not establish deployment. Wallet activation and
-provenance of the selected account pins remain wallet setup prerequisites.
+receiving funds alone does not establish deployment. Circle wallet upgrades are
+started only by the wallet holder ([upgrades](https://developers.circle.com/wallets/wallet-upgrades));
+an upgraded account keeps working while USDC accepts its signatures.
 
 The adapter passes the exact target and calldata through the account's
 `execute(address,uint256,bytes)` function with zero native value. It retains a
 stable key and exact intent before invoking the CLI. Funding signatures remain
 the original Circle signature bytes; MPPI's fixed ECDSA signer stays separate.
 The earlier agent integration passed the versioned live Arc testnet registration,
-funding and payment checks with a deployed, pinned SCA. The
-[supported wallet pins](agent-quickstart.md#supported-wallet-versions) distinguish
-that account generation from mainnet.
+funding and payment checks with a deployed Circle SCA.
 
 CLI reconciliation uses only the original retained transaction ID and matching
 call fields. If the execute response is lost before an ID is saved, the public
@@ -162,7 +188,9 @@ similar transaction appears in recent history. Do not delete the journal to
 retry. Resolve the original operation with the wallet service first.
 
 The journal permits 4,096 retained operations; exceeding that bound stops new
-submissions. Calls are limited to 60 KiB of calldata to fit the reviewed CLI
+submissions. Its format 2 no longer retains account code pins. A format 1
+journal for the same wallet and deployment still loads and is rewritten on its
+next save; earlier releases refuse format 2, so do not downgrade over it. Calls are limited to 60 KiB of calldata to fit the reviewed CLI
 transport. Each command has bounded output. Read-only commands have a default
 240-second timeout, and reconciliation examines at most 20 pages. Execute and
 sign commands drain to completion without a timeout kill. These are adapter limits,
@@ -177,7 +205,7 @@ onboarding journal at `mppi.toml.wallet-operations.json`. It uses the authentica
 Circle CLI. Start with the [provider quickstart](provider-quickstart.md).
 
 Explicit provider integrations use the same `mppi_protocol.circle.CircleAgentWallet`
-constructor shown above, with the provider operator's pins and journal. Set
+constructor shown above, with the provider operator's address and journal. Set
 `require_existing=True` when restoring an onboarded wallet. Its operator must
 match the configuration and differ from the receive-only payout recipient.
 Recipient proof signing stays outside the serving process. Separate wallet

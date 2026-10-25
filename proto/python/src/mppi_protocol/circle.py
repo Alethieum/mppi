@@ -1,7 +1,9 @@
 """Circle Agent Wallet CLI 1.1.4 adapter with an operator-owned intent journal.
 
-Uses the unmodified CLI and a caller-pinned SCA self-execution wrapper. Wallet
+Uses the unmodified CLI and the account's own self-execution call. Wallet
 login/custody stay with Circle; MPPI's fixed SessionSigner remains separate.
+It accepts any Circle account generation: before submitting an opening, the
+agent checks the signature as USDC will and that its agent id binds this wallet.
 Circle service status is never canonical payment confirmation. If execute loses
 its returned transaction ID, the CLI has no reference lookup: retain UNKNOWN.
 
@@ -25,19 +27,18 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from mppi_protocol.capabilities import FundingAuthorization, WalletCall
-from mppi_protocol.chain import ChainReader, CodePin, _data
-from mppi_protocol.contract import ARC_USDC, _hash
+from mppi_protocol.capabilities import FundingAuthorization, NotSubmittedError, WalletCall
+from mppi_protocol.chain import ChainReader
+from mppi_protocol.contract import ARC_USDC
 from mppi_protocol.deployment import profile_to_mapping
 from mppi_protocol.discovery import address_hex, parse_address, parse_document
 from mppi_protocol.errors import ValidationCode, ValidationError
 from mppi_protocol.registry import RegistryCalls
-from mppi_protocol.types import OperationResult, OperationState
+from mppi_protocol.types import OperationResult, OperationState, fixed_bytes
 
 from .local_state import Checkpoint
 
 _BLOCKCHAINS = {5042: "ARC", 5042002: "ARC-TESTNET"}
-_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 _EXECUTE = "execute(address,uint256,bytes)"
 _MAX_OUTPUT = 1 << 20
 _MAX_STDERR = 64 << 10
@@ -51,33 +52,12 @@ class CircleAgentWalletError(RuntimeError):
     """Local/remote wallet evidence unavailable; errors never include CLI output."""
 
 
-_PROXY_HASH = bytes.fromhex("d09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66")
-_IMPLEMENTATION = CodePin(
-    bytes.fromhex("895b96c92d1007872fe1f70606e6b7eeaebd620e"),
-    bytes.fromhex("3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa"),
-)
-# Network-specific Circle account versions. Mainnet v4 was bound to Circle's
-# authenticated wallet metadata and creation receipt, then checked for ERC-1271
-# and USDC authorization compatibility on both documented RPC endpoints.
-# Public identities and verification references: docs/agent-quickstart.md.
-_MAINNET_IMPLEMENTATION = CodePin(
-    bytes.fromhex("9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed"),
-    bytes.fromhex("60ecaaadc845f14626e77541b390bd36a7f5c35efdee5c30471f0eb08626019e"),
-)
-_ACCOUNT_PINS = {
-    5042002: (_PROXY_HASH, _IMPLEMENTATION),
-    5042: (_PROXY_HASH, _MAINNET_IMPLEMENTATION),
-}
+class CircleNotSubmittedError(NotSubmittedError, CircleAgentWalletError):
+    """Execute failed before its intent was journaled, so Circle was never asked.
 
-
-def supported_account_pins(chain_id: int) -> tuple[bytes, CodePin]:
-    """Return the reviewed Circle account implementation for the selected network."""
-    try:
-        return _ACCOUNT_PINS[chain_id]
-    except KeyError:
-        raise CircleAgentWalletError(
-            "verified Circle account pins unavailable for this network"
-        ) from None
+    Still a CircleAgentWalletError for callers that catch that; its cause is
+    the error that stopped it.
+    """
 
 
 def _object(value: object) -> dict[str, Any]:
@@ -163,13 +143,15 @@ def funding_typed_data(authorization: FundingAuthorization) -> dict[str, object]
 
 
 class CircleAgentWallet:
-    """FundingWallet using an authenticated official CLI and explicit account pins.
+    """FundingWallet using the authenticated official CLI 1.1.4.
 
     ``command`` is a trusted executable prefix, not shell text. No secrets are
-    accepted by this constructor or journal. Account runtime/implementation pins
-    must have independently checked provenance. Explicit registration activation
-    permits only the verified registry's exact register() call before deployment;
-    funding and all other calls still require deployed, matching account code.
+    accepted by this constructor or journal. The CLI must select ``address`` as
+    an agent wallet on this network. Its account code is not pinned: an account
+    that cannot execute or sign these calls fails them, and the agent checks
+    every funding signature before submitting it. Explicit registration
+    activation sends only the verified registry's exact register() call directly;
+    every other call goes through the account's own execute with zero value.
     Keep one journal for this wallet/profile. Its lock is owned only during each
     operation. Linux and macOS use the existing Checkpoint locking contract.
     """
@@ -178,8 +160,7 @@ class CircleAgentWallet:
         self,
         *,
         chain: ChainReader,
-        wallet: CodePin,
-        implementation: CodePin,
+        address: bytes,
         checkpoint_path: Path,
         command: tuple[str, ...] = ("circle",),
         timeout_seconds: float = 240,
@@ -187,14 +168,11 @@ class CircleAgentWallet:
         allow_registration_activation: bool = False,
         require_existing: bool = False,
     ) -> None:
-        if (
-            not isinstance(chain, ChainReader)
-            or not isinstance(wallet, CodePin)
-            or not isinstance(implementation, CodePin)
-        ):
-            raise ValidationError(
-                ValidationCode.INVALID_VALUE, "explicit chain and wallet pins required"
-            )
+        if not isinstance(chain, ChainReader):
+            raise ValidationError(ValidationCode.INVALID_VALUE, "explicit chain reader required")
+        fixed_bytes(address, 20, field="address", nonzero=True)
+        if chain.profile.domain.chain_id not in _BLOCKCHAINS:
+            raise CircleAgentWalletError("Circle Agent Wallets are unavailable for this network")
         if (
             type(command) is not tuple
             or not 1 <= len(command) <= 16
@@ -210,9 +188,7 @@ class CircleAgentWallet:
             or type(require_existing) is not bool
         ):
             raise ValidationError(ValidationCode.INVALID_VALUE, "invalid Circle process limits")
-        self._chain = chain
-        self._wallet = wallet
-        self._implementation = implementation
+        self._address = address
         self._chain_id = chain.profile.domain.chain_id
         self._blockchain = _BLOCKCHAINS[self._chain_id]
         self._command = command
@@ -221,26 +197,20 @@ class CircleAgentWallet:
         self._allow_registration_activation = allow_registration_activation
         self._require_existing = require_existing
         self._registration_call = (
-            RegistryCalls(self._chain_id, chain.profile.registry_address)
-            .register(wallet.address)
-            .call
+            RegistryCalls(self._chain_id, chain.profile.registry_address).register(address).call
         )
         self._lock = threading.RLock()
+        # Facts that cannot change for this object: the CLI's version and its
+        # selection of this wallet.
+        self._selection_verified = False
         self._checkpoint_path = Path(checkpoint_path)
         self._checkpoint: Checkpoint | None = None
         self._operations: dict[str, Any] = {}
         self._scope = {
-            "version": 1,
+            "version": 2,
             "kind": "mppi-circle-agent-wallet",
             "profile": profile_to_mapping(chain.profile),
-            "wallet": {
-                "address": address_hex(wallet.address),
-                "code_hash": "0x" + wallet.code_hash.hex(),
-            },
-            "implementation": {
-                "address": address_hex(implementation.address),
-                "code_hash": "0x" + implementation.code_hash.hex(),
-            },
+            "wallet": address_hex(address),
         }
         with self._journal():
             pass
@@ -263,9 +233,7 @@ class CircleAgentWallet:
             record = checkpoint.load()
             if record is None:
                 record = self._scope | {"operations": {}}
-            if set(record) != set(self._scope) | {"operations"} or any(
-                record[key] != value for key, value in self._scope.items()
-            ):
+            if not self._owns(record):
                 raise CircleAgentWalletError("Circle journal belongs to another wallet profile")
             operations = _object(record["operations"])
             if len(operations) > _MAX_OPERATIONS:
@@ -286,9 +254,25 @@ class CircleAgentWallet:
         except Exception:
             raise CircleAgentWalletError("Circle journal could not be validated") from None
 
+    def _owns(self, record: dict[str, Any]) -> bool:
+        """This wallet and profile's journal. Version 1 also retained account
+        code pins, which no longer select anything; the next save drops them."""
+        scope = self._scope
+        if record.get("version") == 1:
+            pinned = record.get("wallet")
+            return (
+                set(record) == set(scope) | {"implementation", "operations"}
+                and (record["kind"], record["profile"]) == (scope["kind"], scope["profile"])
+                and type(pinned) is dict
+                and pinned.get("address") == scope["wallet"]
+            )
+        return set(record) == set(scope) | {"operations"} and all(
+            record[key] == value for key, value in scope.items()
+        )
+
     @property
     def address(self) -> bytes:
-        return self._wallet.address
+        return self._address
 
     def _run(self, arguments: list[str]) -> bytes:
         """Bound output; let an original custody command finish its own polling.
@@ -399,63 +383,40 @@ class CircleAgentWallet:
             raise CircleAgentWalletError("Circle command returned invalid JSON") from None
 
     def verify_wallet(self) -> None:
-        """Verify CLI selection and explicit canonical account code/implementation pins."""
-        self._verify_wallet(allow_undeployed=False)
+        """Verify the CLI version and its selection of this agent wallet."""
+        with self._lock:
+            if not self._selection_verified:
+                self._verify_selection()
+                self._selection_verified = True
 
     def verify_registration_wallet(self) -> None:
-        """Check explicitly opted-in registration custody; absence of code is permitted.
-
-        This does not establish a deployed funding wallet. Call verify_wallet()
-        before accepting completed setup or using the wallet for funding.
-        """
+        """verify_wallet for a wallet explicitly opted in to registration activation."""
         if not self._allow_registration_activation:
             raise CircleAgentWalletError("Circle registration activation was not enabled")
-        self._verify_wallet(allow_undeployed=True)
+        self.verify_wallet()
 
-    def _verify_wallet(self, *, allow_undeployed: bool) -> None:
-        with self._lock:
-            if self._run(["--version"]).strip() != b"1.1.4":
-                raise CircleAgentWalletError("Circle CLI version must match verified 1.1.4")
-            data = self._json(["wallet", "list", "--type", "agent", "--chain", self._blockchain])
-            wallets = data.get("wallets")
-            if type(wallets) is not list or len(wallets) > 50:
-                raise CircleAgentWalletError("Circle wallet list is invalid")
-            matches = [
-                row
-                for row in wallets
-                if type(row) is dict
-                and type(row.get("address")) is str
-                and row["address"].lower() == address_hex(self.address)
-            ]
-            if (
-                len(matches) != 1
-                or matches[0].get("type") != "agent"
-                or matches[0].get("blockchain") != self._blockchain
-            ):
-                raise CircleAgentWalletError(
-                    "Circle wallet selection does not match configured identity"
-                )
-            block = self._chain.block()
-            self._chain.verify_deployment(block)
-            position = self._chain._position(block)
-            for optional, pin in ((False, self._implementation), (allow_undeployed, self._wallet)):
-                code = _data(
-                    self._chain.rpc.call("eth_getCode", [address_hex(pin.address), position])
-                )
-                if optional and not code:
-                    self._chain._check_canonical(block)
-                    return
-                if not code or _hash(code) != pin.code_hash:
-                    raise CircleAgentWalletError("Circle SCA code differs from selected pins")
-            slot = _data(
-                self._chain.rpc.call(
-                    "eth_getStorageAt", [address_hex(self.address), _SLOT, position]
-                ),
-                32,
+    def _verify_selection(self) -> None:
+        if self._run(["--version"]).strip() != b"1.1.4":
+            raise CircleAgentWalletError("Circle CLI version must match verified 1.1.4")
+        data = self._json(["wallet", "list", "--type", "agent", "--chain", self._blockchain])
+        wallets = data.get("wallets")
+        if type(wallets) is not list or len(wallets) > 50:
+            raise CircleAgentWalletError("Circle wallet list is invalid")
+        matches = [
+            row
+            for row in wallets
+            if type(row) is dict
+            and type(row.get("address")) is str
+            and row["address"].lower() == address_hex(self.address)
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].get("type") != "agent"
+            or matches[0].get("blockchain") != self._blockchain
+        ):
+            raise CircleAgentWalletError(
+                "Circle wallet selection does not match configured identity"
             )
-            if slot != bytes(12) + self._implementation.address:
-                raise CircleAgentWalletError("Circle SCA implementation differs from selected pin")
-            self._chain._check_canonical(block)
 
     def _call(self, value: object) -> WalletCall:
         row = _object(value)
@@ -590,10 +551,6 @@ class CircleAgentWallet:
             }
         )
         self._save()
-        if direct:
-            # Preserve the original handles even if deployment produced unsupported
-            # code. Setup must strictly verify deployment before reporting complete.
-            self._verify_wallet(allow_undeployed=True)
         return self._result(reference, retained)
 
     def execute(self, call: WalletCall, *, operation_ref: str) -> OperationResult:
@@ -607,27 +564,35 @@ class CircleAgentWallet:
                         ValidationCode.INVALID_VALUE, "operation reference was reused"
                     )
                 return self._reconcile(operation_ref)
-            if len(self._operations) >= _MAX_OPERATIONS:
-                raise CircleAgentWalletError("Circle journal operation limit exceeded")
+            # Until the journal holds this intent, nothing has reached Circle:
+            # a failure here is a definite NotSubmittedError, never an unknown.
             direct = self._allow_registration_activation and call == self._registration_call
-            if direct:
-                self.verify_registration_wallet()
-            else:
-                self.verify_wallet()
-            row: dict[str, Any] = {
-                "route": "direct_register" if direct else "self",
-                "call": {
-                    "chain_id": call.chain_id,
-                    "to": address_hex(call.to),
-                    "data": "0x" + call.data.hex(),
-                },
-                "idempotency_key": str(uuid4()),
-                "wallet_operation_id": None,
-                "tx_hash": None,
-                "state": "unknown",
-            }
-            self._operations[operation_ref] = row
-            self._save()  # Before any possible remote submission; never delete on uncertainty.
+            try:
+                if len(self._operations) >= _MAX_OPERATIONS:
+                    raise CircleAgentWalletError("Circle journal operation limit exceeded")
+                if direct:
+                    self.verify_registration_wallet()
+                else:
+                    self.verify_wallet()
+                row: dict[str, Any] = {
+                    "route": "direct_register" if direct else "self",
+                    "call": {
+                        "chain_id": call.chain_id,
+                        "to": address_hex(call.to),
+                        "data": "0x" + call.data.hex(),
+                    },
+                    "idempotency_key": str(uuid4()),
+                    "wallet_operation_id": None,
+                    "tx_hash": None,
+                    "state": "unknown",
+                }
+                self._operations[operation_ref] = row
+                self._save()  # Before any possible remote submission; never delete on uncertainty.
+            except Exception as error:
+                # Circle is asked only below, so even a save that landed before
+                # failing handed nothing over; that row can only ever reconcile.
+                self._operations.pop(operation_ref, None)
+                raise CircleNotSubmittedError("Circle was not asked to execute") from error
             try:
                 # CLI 1.1.4 dist/index.js:96104-96255 forwards register() without
                 # parameters and a zero native amount. Circle account-types, SCA:

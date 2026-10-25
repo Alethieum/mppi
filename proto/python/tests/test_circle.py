@@ -16,13 +16,15 @@ import pytest
 from eth_abi import encode
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
-from mppi_protocol.capabilities import FundingAuthorization, WalletCall
+from mppi_protocol.capabilities import FundingAuthorization, NotSubmittedError, WalletCall
 from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile
 from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
+from mppi_protocol.contract import ARC_USDC, ContractCalls
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.local_state import Checkpoint
+from mppi_protocol.operations import submit_operation
 from mppi_protocol.signing import voucher_digest
-from mppi_protocol.types import Domain, OperationState
+from mppi_protocol.types import Domain, OperationState, SessionDescriptor
 
 CHAIN = 5042002
 PROXY = b"\x99" * 20
@@ -30,7 +32,6 @@ IMPLEMENTATION = b"\x98" * 20
 REGISTRY = b"\x97" * 20
 REGISTRY_IMPLEMENTATION = b"\x96" * 20
 WALLET = b"\x11" * 20
-WALLET_IMPLEMENTATION = b"\x12" * 20
 TOKEN = bytes.fromhex("3600000000000000000000000000000000000000")
 HASH = b"\xbb" * 32
 TX = b"\xaa" * 32
@@ -49,18 +50,9 @@ class Rpc:
         self.code = {
             address: bytes([i]) + b"runtime"
             for i, address in enumerate(
-                (
-                    PROXY,
-                    IMPLEMENTATION,
-                    REGISTRY,
-                    REGISTRY_IMPLEMENTATION,
-                    WALLET,
-                    WALLET_IMPLEMENTATION,
-                ),
-                start=1,
+                (PROXY, IMPLEMENTATION, REGISTRY, REGISTRY_IMPLEMENTATION), start=1
             )
         }
-        self.wallet_implementation = WALLET_IMPLEMENTATION
         self.chain = CHAIN
 
     def call(self, method, params):
@@ -79,11 +71,7 @@ class Rpc:
             return hx(self.code[bytes.fromhex(params[0][2:])])
         if method == "eth_getStorageAt":
             address = bytes.fromhex(params[0][2:])
-            target = {
-                PROXY: IMPLEMENTATION,
-                REGISTRY: REGISTRY_IMPLEMENTATION,
-                WALLET: self.wallet_implementation,
-            }[address]
+            target = {PROXY: IMPLEMENTATION, REGISTRY: REGISTRY_IMPLEMENTATION}[address]
             return hx(bytes(12) + target)
         if method == "eth_call":
             assert params[0] == {
@@ -209,12 +197,7 @@ def context(tmp_path, monkeypatch):
     chain = ChainReader(rpc, DeploymentProfile(DOMAIN, REGISTRY, *pins))
     path = tmp_path / "wallet.json"
     cli = Cli(path)
-    options = {
-        "chain": chain,
-        "wallet": CodePin(WALLET, keccak(rpc.code[WALLET])),
-        "implementation": CodePin(WALLET_IMPLEMENTATION, keccak(rpc.code[WALLET_IMPLEMENTATION])),
-        "checkpoint_path": path,
-    }
+    options = {"chain": chain, "address": WALLET, "checkpoint_path": path}
     wallet = CircleAgentWallet(**options)
     monkeypatch.setattr(wallet, "_run", cli)
     return wallet, rpc, cli, options
@@ -335,13 +318,10 @@ def test_page_limit_fails_closed(context):
         "account",
         "network",
         "duplicate",
-        "code",
-        "implementation",
-        "chain",
         "malformed_address",
     ],
 )
-def test_selection_and_pins_rechecked_before_any_write(context, problem):
+def test_cli_selection_checked_before_any_write(context, problem):
     wallet, rpc, cli, _ = context
     if problem == "version":
         cli.version = b"1.1.5\n"
@@ -351,17 +331,11 @@ def test_selection_and_pins_rechecked_before_any_write(context, problem):
         cli.wallets[0]["blockchain"] = "ARC"
     elif problem == "duplicate":
         cli.wallets *= 2
-    elif problem == "code":
-        rpc.code[WALLET] = b"changed"
-    elif problem == "implementation":
-        rpc.wallet_implementation = PROXY
-    elif problem == "chain":
-        rpc.chain = 5042
     else:
         cli.wallets[0]["address"] = {}
     with pytest.raises((CircleAgentWalletError, RuntimeError)):
         wallet.execute(CALL, operation_ref="original-ref")
-    assert not cli.path.exists()
+    assert not cli.path.exists() and rpc.calls == []
     assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
 
 
@@ -372,9 +346,28 @@ def test_journal_failure_prevents_submission(context, monkeypatch):
         raise OSError("storage failure")
 
     monkeypatch.setattr(Checkpoint, "save", fail)
-    with pytest.raises(OSError):
+    with pytest.raises(NotSubmittedError) as failure:  # Circle was never asked.
         wallet.execute(CALL, operation_ref="original-ref")
+    assert isinstance(failure.value.__cause__, OSError)
     assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
+
+
+def test_a_failed_wallet_check_before_the_journal_is_a_definite_not_submitted(context):
+    """A check inside execute fails before the intent is journaled: Circle was
+    never asked, so the operation definitely failed and keeps the error kind."""
+    wallet, rpc, cli, options = context
+    cli.version = b"1.1.5\n"  # verify_wallet rejects the CLI.
+    descriptor = SessionDescriptor(
+        WALLET, b"\x05" * 20, 42, b"\x06" * 20, b"\x07" * 20, ARC_USDC, b"\x08" * 32
+    )
+    operation = ContractCalls(DOMAIN, "USDC", "2").request_close(descriptor)
+    result = submit_operation(
+        wallet, operation, operation_ref="original-ref", chain=options["chain"]
+    )
+    assert result.state is OperationState.FAILED and result.tx_hash is None
+    assert result.cause == "NotSubmittedError: CircleAgentWalletError"
+    assert not any(args[:2] == ["wallet", "execute"] for args in cli.calls)
+    assert wallet.reconcile(operation_ref="original-ref").state is OperationState.UNKNOWN
 
 
 def test_funding_signature_bytes_preserved_and_typed_data_independent(context):
@@ -427,9 +420,7 @@ def test_restart_rejects_changed_profile_and_tampered_journal(context):
     wallet, _, cli, options = context
     wallet.execute(CALL, operation_ref="original-ref")
     with pytest.raises(CircleAgentWalletError):
-        CircleAgentWallet(
-            **(options | {"implementation": CodePin(WALLET_IMPLEMENTATION, b"\x01" * 32)})
-        )
+        CircleAgentWallet(**(options | {"address": b"\x13" * 20}))
     record = json.loads(cli.path.read_text())
     record["operations"]["original-ref"]["call"]["chain_id"] = 5042
     cli.path.write_text(json.dumps(record))
@@ -616,3 +607,57 @@ def test_hashless_service_failure_keeps_original_submission_unknown(context):
     cli.pages = [[cli.transaction(state="FAILED", txHash=None)]]
     assert wallet.execute(CALL, operation_ref="original-ref") == result
     assert sum(args[:2] == ["wallet", "execute"] for args in cli.calls) == 1
+
+
+class Trips:
+    """Counts round trips to the RPC: one per call, or one per batch."""
+
+    def __init__(self, rpc):
+        self.rpc, self.trips = rpc, 0
+
+    def call(self, method, params):
+        self.trips += 1
+        return self.rpc.call(method, params)
+
+    def call_many(self, calls):
+        self.trips += 1
+        return [self.rpc.call(method, params) for method, params in calls]
+
+
+def test_wallet_check_reads_no_chain_and_selection_once(context, monkeypatch):
+    _, rpc, cli, options = context
+    trips = Trips(rpc)
+    chain = ChainReader(trips, options["chain"].profile)
+    wallet = CircleAgentWallet(**{**options, "chain": chain})
+    monkeypatch.setattr(wallet, "_run", cli)
+    wallet.verify_wallet()
+    wallet.verify_wallet()
+    # No account code or implementation is pinned; the CLI version and its
+    # selection of this wallet cannot change for this object.
+    assert trips.trips == 0 and rpc.calls == []
+    assert cli.calls == [
+        ["--version"],
+        ["wallet", "list", "--type", "agent", "--chain", "ARC-TESTNET", "--output", "json"],
+    ]
+
+
+def test_version_1_journal_keeps_its_operations_and_drops_account_pins(context):
+    wallet, _, cli, options = context
+    result = wallet.execute(CALL, operation_ref="original-ref")
+    record = json.loads(cli.path.read_text())
+    assert (record["version"], record["wallet"]) == (2, hx(WALLET))
+    pins = {"address": hx(b"\x12" * 20), "code_hash": hx(b"\x01" * 32)}
+    legacy = record | {
+        "version": 1,
+        "wallet": {"address": hx(WALLET), "code_hash": hx(b"\x02" * 32)},
+        "implementation": pins,
+    }
+    cli.path.write_text(json.dumps(legacy))
+    restored = CircleAgentWallet(**options)
+    restored._run = cli
+    cli.pages = [[cli.transaction()]]
+    assert restored.reconcile(operation_ref="original-ref") == result
+    assert json.loads(cli.path.read_text()) == record  # Saved as version 2.
+    cli.path.write_text(json.dumps(legacy | {"wallet": {"address": hx(b"\x13" * 20)}}))
+    with pytest.raises(CircleAgentWalletError, match="^Circle journal could not be validated$"):
+        CircleAgentWallet(**options)

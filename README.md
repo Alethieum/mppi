@@ -18,7 +18,7 @@ Start with the [agent quickstart](docs/agent-quickstart.md) to onboard a wallet
 and make paid inference requests. Providers start with the
 [provider quickstart](docs/provider-quickstart.md) to initialize declarations,
 onboard and attach MPPI to their existing gateway. The agent SDK is version
-`0.1.3` with Python protocol package `0.1.2`; the published provider SDKs are
+`0.1.4` with Python protocol package `0.1.3`; the published provider SDKs are
 version `0.1.2` with protocol `0.1.1`. The built-in wallet
 integration uses Circle Agent Wallet for both roles.
 Both quickstarts select the packaged official Arc testnet profile and document
@@ -62,12 +62,11 @@ including usage capture, refund, explicit updates and unchanged reruns.
 The [official Arc testnet contracts](docs/deployment.md) are deployed. Configuration
 and Python/Rust verification of the explicit [testnet profile](deployments/arc-testnet.json)
 passed, including the scoped configuration/profile security review. The official
-deployment also passed an internal acceptance run using frozen release artifacts:
-a fresh Rust provider and Python agent onboarded in separate Apple containers,
-completed two real inference requests, and settled and refunded the session with
-independently verified exact accounting and zero remaining liability. This
-functional evidence covers the recorded testnet integration and its private
-endpoint.
+deployment also passed an end-to-end acceptance run using frozen release
+artifacts: a fresh Rust provider and Python agent, each in its own isolated
+environment, onboarded, completed two real inference requests, and settled and
+refunded the session with independently verified exact accounting and zero
+remaining liability. This functional evidence covers that testnet integration.
 
 There are two SDK roles. The Python packages share a small `mppi-protocol`
 support distribution containing generated wire types and common validation;

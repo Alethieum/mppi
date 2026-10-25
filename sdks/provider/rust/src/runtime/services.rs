@@ -726,6 +726,32 @@ impl Runtime {
         Ok(false)
     }
 
+    /// The agent records a run before its Complete reaches the provider, so a refused
+    /// or lost Complete stays pending at the agent although this provider never held
+    /// it. Admission is commit-before-effect, so when every admission is known
+    /// (`Session::admissions_known`) a requested pending run absent from them was
+    /// never admitted. It gets the protocol's NOT_ADMITTED answer (protocol.md,
+    /// Recovery); nothing is recorded, and the reattach's new generation refuses a
+    /// late Complete for it at the gate.
+    fn answer_unheld(session: &Session, pending: &[Vec<u8>], snapshot: &mut proto::SessionState) {
+        if !session.admissions_known {
+            return; // The attachment was refused had any such run been named.
+        }
+        for rid in pending {
+            if !session.runs.contains_key(&B256::from_slice(rid)) {
+                snapshot.run_states.push(proto::RunState {
+                    run_id: Some(rid.clone()),
+                    model: Some(String::new()),
+                    status: Some(proto::RunStatus::NotAdmitted as i32),
+                    input_tokens: Some(0),
+                    cache_tokens: Some(0),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     pub(super) fn attach(&self, id: u64, request: proto::ReconnectRequest) -> Result<(), Status> {
         let mut state = self.lock()?;
         let sid = B256::from_slice(request.session_id.as_deref().unwrap());
@@ -745,12 +771,13 @@ impl Runtime {
             if old != &request || session.owner != Some(id) {
                 return Err(Status::unauthenticated("replayed attachment proof"));
             }
-            let snapshot = self.session_state_locked(
+            let mut snapshot = self.session_state_locked(
                 &state,
                 session,
                 request.nonce.as_deref().unwrap(),
                 false,
             )?;
+            Self::answer_unheld(session, &request.pending_run_ids, &mut snapshot);
             return self.send_locked(
                 &mut state,
                 id,
@@ -772,12 +799,19 @@ impl Runtime {
                 request.signature.as_deref().unwrap(),
             )
             .map_err(|_| Status::unauthenticated("invalid attachment proof"))?;
+        // Unless every admission is known, an absent pending run is unknown, never
+        // NOT_ADMITTED: a restored checkpoint older than the host's newest may lack
+        // a run that was served. Nor before any Control generation: Complete needs
+        // generation 1 or more, so a session a new process re-created from its
+        // opening (a start block can lag a crashed one's) never admitted a run
+        // an agent names then.
         if !session.history_available
             || request.last_meter_seq.unwrap() > session.meter_seq
-            || request
-                .pending_run_ids
-                .iter()
-                .any(|rid| !session.runs.contains_key(&B256::from_slice(rid)))
+            || ((!session.admissions_known || session.generation == 0)
+                && request
+                    .pending_run_ids
+                    .iter()
+                    .any(|rid| !session.runs.contains_key(&B256::from_slice(rid))))
         {
             return Err(not_ready("STATE_UNAVAILABLE", Some(sid), None));
         }
@@ -797,7 +831,7 @@ impl Runtime {
         // Stage the complete response and its queue admission before consuming
         // the nonce or changing payment/ownership state. In particular an active
         // run or an unrepresentable snapshot must leave the old owner intact.
-        let snapshot = self.session_state_for_attachment_locked(
+        let mut snapshot = self.session_state_for_attachment_locked(
             &state,
             session,
             request.nonce.as_deref().unwrap(),
@@ -808,6 +842,7 @@ impl Runtime {
                 voucher: &voucher,
             }),
         )?;
+        Self::answer_unheld(session, &request.pending_run_ids, &mut snapshot);
         let message = control(proto::control_message::Kind::SessionState(snapshot));
         wire::validate_message_with_limits(&message, &self.limits.wire)
             .map_err(validation_status)?;
@@ -887,7 +922,6 @@ impl proto::chat_server::Chat for Mppi {
                 )));
             }
             let mut expires = None;
-            let mut last_guidance = None;
             loop {
                 let changed = self.inner.changed.notified();
                 tokio::pin!(changed);
@@ -895,7 +929,7 @@ impl proto::chat_server::Chat for Mppi {
                 let checked_at = Instant::now();
                 match self.inner.attempt_admission_before(&run, bound, expires)? {
                     Admission::Granted => return Ok(()),
-                    Admission::Wait(guidance) => {
+                    Admission::Authorizing => {
                         if expires.is_none() {
                             expires = Some(
                                 checked_at
@@ -907,37 +941,22 @@ impl proto::chat_server::Chat for Mppi {
                                     })?,
                             );
                         }
-                        let end = expires.expect("fixed authorization deadline");
-                        if Instant::now() >= end {
+                        if expires.is_some_and(|end| Instant::now() >= end) {
                             return Err(Box::new(not_ready(
                                 "AUTHORIZATION_REQUIRED",
                                 Some(run.context.session_id()),
                                 Some(run.context.run_id()),
                             )));
                         }
-                        let encoded = guidance.encode_to_vec();
-                        if last_guidance.as_ref() != Some(&encoded) {
-                            let mut state = self.inner.lock()?;
-                            let owner = state
-                                .sessions
-                                .get(&run.context.session_id())
-                                .and_then(|s| s.owner)
-                                .ok_or_else(|| {
-                                    not_ready(
-                                        "CONTROL_NOT_READY",
-                                        Some(run.context.session_id()),
-                                        Some(run.context.run_id()),
-                                    )
-                                })?;
-                            self.inner.send_locked(&mut state, owner, *guidance)?;
-                            last_guidance = Some(encoded);
-                        }
-                        // A changed follower also invalidates admission even without
-                        // an incoming Control message. This never resets the deadline.
-                        let wake = end.min(Instant::now() + Duration::from_millis(50));
-                        let _ = tokio::time::timeout_at(wake, changed).await;
                     }
+                    // Covered: its turn comes within TURN, before any expiry.
+                    Admission::Deferred => {}
                 }
+                // A changed follower also invalidates admission even without
+                // an incoming Control message. This never resets the deadline.
+                let poll = Instant::now() + Duration::from_millis(50);
+                let wake = expires.map_or(poll, |end| end.min(poll));
+                let _ = tokio::time::timeout_at(wake, changed).await;
             }
         };
         let result = if let Some(end) = deadline {

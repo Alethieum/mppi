@@ -11,6 +11,7 @@ Account APIs verified against eth-account v0.14.0 account.py:274,414,547 and
 messages.py:31-62; LocalAccount.sign_message in signers/local.py:107:
 https://github.com/ethereum/eth-account/tree/v0.14.0/eth_account
 Signature restrictions match the vendored OpenZeppelin v5.7.0 ECDSA.tryRecover.
+The funding digest is USDC's own EIP-3009 authorization, in the token's domain.
 """
 
 from Crypto.Hash import keccak
@@ -19,6 +20,7 @@ from eth_account.messages import SignableMessage
 from eth_account.signers.local import LocalAccount
 
 from .amounts import uint64
+from .capabilities import FundingAuthorization
 from .errors import ValidationCode, ValidationError
 from .types import Domain, RunContext, SessionDescriptor, fixed_bytes
 
@@ -41,6 +43,11 @@ _RUN_TYPEHASH = _keccak(
 )
 _RECONNECT_TYPEHASH = _keccak(b"ReconnectAuth(bytes32 sessionId,bytes32 nonce)")
 _CLOSE_TYPEHASH = _keccak(b"CloseAuth(bytes32 sessionId)")
+# USDC FiatTokenV2_2 EIP3009.sol RECEIVE_WITH_AUTHORIZATION_TYPEHASH.
+_RECEIVE_TYPEHASH = _keccak(
+    b"ReceiveWithAuthorization(address from,address to,uint256 value,"
+    b"uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+)
 
 
 def _check_domain(domain: Domain) -> None:
@@ -245,6 +252,48 @@ def verify_close_auth(domain: Domain, descriptor: SessionDescriptor, signature: 
         signature,
         descriptor.session_signer,
     )
+
+
+def _funding_message(authorization: FundingAuthorization) -> SignableMessage:
+    if not isinstance(authorization, FundingAuthorization):
+        raise ValidationError(ValidationCode.INVALID_VALUE, "invalid funding authorization")
+    auth = authorization
+    separator = _keccak(
+        _DOMAIN_TYPEHASH
+        + _keccak(auth.domain_name.encode())
+        + _keccak(auth.domain_version.encode())
+        + auth.chain_id.to_bytes(32, "big")
+        + auth.token.rjust(32, b"\0")
+    )
+    struct_hash = _keccak(
+        _RECEIVE_TYPEHASH
+        + auth.owner.rjust(32, b"\0")
+        + auth.recipient.rjust(32, b"\0")
+        + auth.value.to_bytes(32, "big")
+        + auth.valid_after.to_bytes(32, "big")
+        + auth.valid_before.to_bytes(32, "big")
+        + auth.nonce
+    )
+    return SignableMessage(b"\x01", separator, struct_hash)
+
+
+def funding_digest(authorization: FundingAuthorization) -> bytes:
+    """The digest USDC checks a receiveWithAuthorization signature against:
+    MessageHashUtils.toTypedDataHash of the token's domain and the struct."""
+    message = _funding_message(authorization)
+    return _keccak(b"\x19" + message.version + message.header + message.body)
+
+
+def funding_signer(authorization: FundingAuthorization, signature: bytes) -> bytes | None:
+    """The address USDC's ECRecover.recover returns for ``signature``, or ``None``
+    where it reverts: not 65 bytes, an upper-half s, v other than 27 or 28, or
+    no recoverable address. USDC applies this only to an owner without code."""
+    message = _funding_message(authorization)
+    try:
+        validate_signature(signature)
+        return bytes.fromhex(Account.recover_message(message, signature=signature)[2:])
+    except Exception:
+        return None
 
 
 class LocalSessionSigner:

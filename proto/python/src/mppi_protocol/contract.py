@@ -59,6 +59,16 @@ def encode_call(name: str, values: Sequence[object]) -> bytes:
     return selector + encode(types, values)
 
 
+def error_name(data: bytes) -> str | None:
+    """The MPPI custom error a revert's data names, by its selector."""
+    for item in ABI:
+        if item["type"] == "error":
+            types = ",".join(_abi_type(child) for child in item["inputs"])
+            if data[:4] == _hash(f"{item['name']}({types})".encode("ascii"))[:4]:
+                return cast(str, item["name"])
+    return None
+
+
 def decode_result(name: str, data: bytes) -> tuple[Any, ...]:
     types = [_abi_type(item) for item in _entry(name, "function")["outputs"]]
     return _decode_exact(types, data)

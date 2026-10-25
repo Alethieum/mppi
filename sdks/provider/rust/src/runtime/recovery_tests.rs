@@ -1109,3 +1109,193 @@ async fn unattached_recovery_preserves_refund_only_operation_identity() {
     assert_eq!(operation.result.state(), OperationState::Unknown);
     assert_eq!(operation.units, vec![(fixture.sid, 0)]);
 }
+
+// The agent SDK records a run before its Complete reaches the provider. When the gate
+// refuses it, or Control is lost before it arrives, this provider never holds it, yet
+// every later reconnect names it pending. Admission is commit-before-effect, so a
+// history known to hold every admission proves it was never admitted: the snapshot
+// answers NOT_ADMITTED (protocol.md, Recovery) instead of refusing the attachment.
+fn answer(queue_message: &[u8], rid: B256) -> proto::RunState {
+    let message = proto::ControlMessage::decode(queue_message).unwrap();
+    let Some(proto::control_message::Kind::SessionState(snapshot)) = message.kind else {
+        panic!("expected the attachment's SessionState");
+    };
+    snapshot
+        .run_states
+        .into_iter()
+        .find(|row| row.run_id.as_deref() == Some(rid.as_slice()))
+        .expect("every requested pending run has a RunState")
+}
+
+#[tokio::test]
+async fn a_pending_run_this_provider_never_held_is_answered_not_admitted() {
+    let (fixture, evidence) = final_history().await;
+    let provider = restarted(&fixture);
+    provider.recover_current(evidence).await.unwrap(); // The host's newest checkpoint.
+    let never = hash(2);
+    let mut request = unused_attachment(&provider, fixture.sid, 1, hash(0x72));
+    request.pending_run_ids = vec![never.to_vec()];
+    provider.inner.attach(1, request.clone()).unwrap();
+    let queue = provider.inner.lock().unwrap().attachments[&1].queue.clone();
+    let first = answer(&queue.get().await.unwrap(), never);
+    assert_eq!(first.status, Some(proto::RunStatus::NotAdmitted as i32));
+    assert_eq!(first.model.as_deref(), Some(""));
+    assert_eq!(
+        (first.input_tokens, first.cache_tokens, first.output_tokens),
+        (Some(0), Some(0), Some(0))
+    );
+    assert!(first.auth_signature.is_none() && first.control_generation.is_none());
+    // Nothing is recorded for it, and the reattach's generation refuses its late Complete.
+    assert!(
+        !provider.inner.lock().unwrap().sessions[&fixture.sid]
+            .runs
+            .contains_key(&never)
+    );
+    let late = provider.inner.begin_run(fixture.request(2)).err().unwrap();
+    assert_eq!(reason(&late).as_deref(), Some("CONTROL_NOT_READY"));
+    assert!(
+        !provider.inner.lock().unwrap().sessions[&fixture.sid]
+            .runs
+            .contains_key(&never)
+    );
+    // A re-ask gets the identical answer: the same request repeated on its stream, and
+    // a later reconnect on another.
+    provider.inner.attach(1, request).unwrap();
+    assert_eq!(answer(&queue.get().await.unwrap(), never), first);
+    let mut later = unused_attachment(&provider, fixture.sid, 2, hash(0x73));
+    later.pending_run_ids = vec![never.to_vec()];
+    provider.inner.attach(2, later).unwrap();
+    let queue = provider.inner.lock().unwrap().attachments[&2].queue.clone();
+    assert_eq!(answer(&queue.get().await.unwrap(), never), first);
+}
+
+#[tokio::test]
+async fn a_session_this_runtime_opened_answers_a_never_held_pending_run_not_admitted() {
+    let fixture = Fixture::new(7000).await; // Opened here: every admission is known.
+    let never = hash(2);
+    let mut request = unused_attachment(&fixture.provider, fixture.sid, 2, hash(0x72));
+    request.pending_run_ids = vec![never.to_vec()];
+    fixture.provider.inner.attach(2, request).unwrap();
+    let queue = fixture.provider.inner.lock().unwrap().attachments[&2]
+        .queue
+        .clone();
+    let answered = answer(&queue.get().await.unwrap(), never);
+    assert_eq!(answered.status, Some(proto::RunStatus::NotAdmitted as i32));
+}
+
+#[tokio::test]
+async fn a_session_never_attached_here_refuses_an_unknown_pending_run() {
+    // A new process re-creates a session from its opening before any Control
+    // generation; its start block lagged the crashed one's, so it counts every
+    // admission as known. An agent cannot hold pending runs at generation 0, so
+    // one it names was admitted by the earlier process: never NOT_ADMITTED.
+    let fixture = Fixture::new(7000).await;
+    {
+        let mut state = fixture.provider.inner.lock().unwrap();
+        let session = state.sessions.get_mut(&fixture.sid).unwrap();
+        (session.generation, session.owner) = (0, None);
+        assert!(session.admissions_known);
+    }
+    let mut request = unused_attachment(&fixture.provider, fixture.sid, 2, hash(0x72));
+    request.pending_run_ids = vec![hash(2).to_vec()];
+    let refused = fixture.provider.inner.attach(2, request).unwrap_err();
+    assert_eq!(reason(&refused).as_deref(), Some("STATE_UNAVAILABLE"));
+    let state = fixture.provider.inner.lock().unwrap();
+    assert_eq!(
+        (
+            state.sessions[&fixture.sid].generation,
+            state.sessions[&fixture.sid].owner
+        ),
+        (0, None)
+    );
+}
+
+#[tokio::test]
+async fn a_run_served_after_the_restored_checkpoint_is_never_answered_not_admitted() {
+    // The host restores a checkpoint older than its newest: run 2 was admitted
+    // and served after it, and the agent lost its meters. The restored history
+    // lacks run 2, so its absence proves nothing.
+    let (fixture, older) = final_history().await;
+    let run = fixture.admit(2);
+    fixture
+        .provider
+        .inner
+        .report_sync(&run.context, counts(750), Some(RunStatus::Completed))
+        .unwrap();
+    let provider = restarted(&fixture);
+    provider.recover(older).await.unwrap();
+    let mut request = unused_attachment(&provider, fixture.sid, 1, hash(0x72));
+    request.pending_run_ids = vec![hash(2).to_vec()];
+    let refused = provider.inner.attach(1, request).unwrap_err();
+    assert_eq!(reason(&refused).as_deref(), Some("STATE_UNAVAILABLE"));
+    assert_eq!(
+        provider.inner.lock().unwrap().sessions[&fixture.sid].owner,
+        None
+    );
+}
+
+#[tokio::test]
+async fn without_complete_history_an_unheld_pending_run_still_refuses_the_attachment() {
+    let (fixture, evidence) = final_history().await;
+    let provider = restarted(&fixture);
+    provider.recover(evidence).await.unwrap();
+    provider
+        .inner
+        .lock()
+        .unwrap()
+        .sessions
+        .get_mut(&fixture.sid)
+        .unwrap()
+        .history_available = false;
+    let mut request = unused_attachment(&provider, fixture.sid, 1, hash(0x72));
+    request.pending_run_ids = vec![hash(2).to_vec()];
+    let refused = provider.inner.attach(1, request).unwrap_err();
+    assert_eq!(reason(&refused).as_deref(), Some("STATE_UNAVAILABLE"));
+    let state = provider.inner.lock().unwrap();
+    assert_eq!(state.sessions[&fixture.sid].generation, 1);
+    assert_eq!(state.sessions[&fixture.sid].owner, None);
+}
+
+// After a crash between admission and dispatch, an admitted run with no meter and no
+// final is restored unresolved and refuses every reattachment. An application that
+// dispatched nothing (its restore finds no record of dispatch) reports it CANCELLED at
+// zero; the session then reattaches with that definitive outcome.
+#[tokio::test]
+async fn a_restored_never_metered_run_cancelled_at_zero_lets_its_session_reattach() {
+    let fixture = Fixture::new(7000).await;
+    fixture.voucher(100);
+    let run = fixture.admit(1);
+    let evidence = fixture.provider.checkpoint(fixture.sid).await.unwrap();
+    assert!(evidence.runs[0].admitted && evidence.runs[0].accounting.final_status().is_none());
+    let provider = restarted(&fixture);
+    provider.recover(evidence).await.unwrap();
+    assert!(provider.inner.lock().unwrap().sessions[&fixture.sid].runs[&hash(1)].unresolved);
+    let mut request = unused_attachment(&provider, fixture.sid, 1, hash(0x72));
+    request.pending_run_ids = vec![hash(1).to_vec()];
+    let refused = provider.inner.attach(1, request).unwrap_err();
+    assert_eq!(reason(&refused).as_deref(), Some("STATE_UNAVAILABLE"));
+    provider
+        .inner
+        .report_sync(&run.context, counts(0), Some(RunStatus::Cancelled))
+        .unwrap();
+    let mut request = unused_attachment(&provider, fixture.sid, 2, hash(0x73));
+    request.pending_run_ids = vec![hash(1).to_vec()];
+    provider.inner.attach(2, request).unwrap();
+    let queue = provider.inner.lock().unwrap().attachments[&2].queue.clone();
+    let outcome = answer(&queue.get().await.unwrap(), hash(1));
+    assert_eq!(outcome.status, Some(proto::RunStatus::Cancelled as i32));
+    assert_eq!(
+        (
+            outcome.input_tokens,
+            outcome.cache_tokens,
+            outcome.output_tokens
+        ),
+        (Some(0), Some(0), Some(0))
+    );
+    assert_eq!(
+        provider.inner.lock().unwrap().sessions[&fixture.sid]
+            .usage()
+            .unwrap(),
+        0
+    );
+}

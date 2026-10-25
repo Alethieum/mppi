@@ -43,11 +43,11 @@ Creation receipts: [proxy](https://explorer.testnet.arc.io/tx/0x560d1359f07a6993
 [timelock](https://explorer.testnet.arc.io/tx/0xd387f8bcd52f34fb1f7195c4da9536c8f1e05c7a8d40c0d701c050f9a9115f6f).
 Deployed configuration and Python/Rust SDK profile checks passed at block `0x3e41629`, hash
 `0x6537d97b8261210f225ac096c09abc97a00c98017689a995f200a455f1fc685c`.
-The scoped configuration/profile security review passed. An internal acceptance
-run using frozen release artifacts on this deployment passed fresh Rust provider
-and Python agent onboarding in separate Apple containers on one Mac, followed by
-two real inference completions, capture while the session was open, a top-up and
-cooperative close. Independent chain verification confirmed exact payment and
+The scoped configuration/profile security review passed. An end-to-end
+acceptance run using frozen release artifacts on this deployment passed fresh
+Rust provider and Python agent onboarding, each in its own isolated environment,
+followed by two real inference completions, capture while the session was open,
+a top-up and cooperative close. Independent chain verification confirmed exact payment and
 refund accounting with zero remaining liability. See the
 [v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0) for
 the exact source revision, artifact digests, published-install verification status and
@@ -64,7 +64,7 @@ Provider endpoint availability is independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Agent `0.1.3` and provider `0.1.2` built-in setup package the verified official
+Agent `0.1.4` and provider `0.1.2` built-in setup package the verified official
 profiles for both Arc networks. `--testnet` and `--mainnet` select the respective
 profile without a separate download. Version `0.1.1` packages testnet only. The
 provider composition helpers use those same pins; they still verify chain ID,
@@ -144,8 +144,8 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 ## SDK installation inputs
 
 The provider quickstart uses `mppi-provider==0.1.2` from PyPI and native
-`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.3`.
-The agent depends on `mppi-protocol==0.1.2` and the provider on
+`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.4`.
+The agent depends on `mppi-protocol==0.1.3` and the provider on
 `mppi-protocol==0.1.1`. Use the release record to
 identify the reviewed source revision and exact artifact digests. For development, the
 [public source tree can be built independently](build.md).

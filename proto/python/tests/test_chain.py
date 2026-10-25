@@ -6,19 +6,23 @@ compiler ABI, not the decoder under test. RPC honesty remains a trust assumption
 https://eips.ethereum.org/EIPS/eip-1898#specification
 """
 
+import asyncio
 import copy
 import json
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from eth_abi import encode
+from eth_abi import decode, encode
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
+from mppi_protocol import chain as chain_module
 from mppi_protocol.capabilities import FundingAuthorization
 from mppi_protocol.catalog import parse_catalog
 from mppi_protocol.chain import (
+    ChainContradictionError,
     ChainEvidenceError,
     ChainLagError,
     ChainReader,
@@ -28,6 +32,7 @@ from mppi_protocol.chain import (
 )
 from mppi_protocol.contract import ContractCalls
 from mppi_protocol.errors import ValidationError
+from mppi_protocol.follower import ChainFollower
 from mppi_protocol.http import TransportError
 from mppi_protocol.types import (
     ConfirmedSettlementRef,
@@ -60,6 +65,20 @@ SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 STATE_TYPE = "(uint64,uint64,uint8,uint64,uint64,bytes32)"
 CATALOG = b'[{"input":"2","model":"example/model","output":"3"}]'
 SIGNATURE = b"\x01" * 64 + b"\x1b"
+MULTICALL3 = bytes.fromhex("ca11bde05977b3631167028862be2a173976ca11")
+MULTICALL3_RUNTIME = b"multicall3 test runtime"
+
+
+@pytest.fixture
+def probabilistic(monkeypatch):
+    """A network without instant finality: proofs re-read state at the block."""
+    monkeypatch.setattr(chain_module, "_INSTANT_FINALITY", frozenset())
+
+
+@pytest.fixture(autouse=True)
+def multicall3_code(monkeypatch):
+    """Stand-in Multicall3 code; the real runtime's hash is checked elsewhere."""
+    monkeypatch.setattr(chain_module, "_MULTICALL3_CODE_HASH", keccak(MULTICALL3_RUNTIME))
 
 
 def hx(value: bytes) -> str:
@@ -177,6 +196,7 @@ class EvidenceRpc:
                 (PROXY, IMPLEMENTATION, REGISTRY, REGISTRY_IMPLEMENTATION), start=1
             )
         }
+        self.code[hx(MULTICALL3)] = hx(MULTICALL3_RUNTIME)
         self.slots = {
             hx(PROXY): hx(bytes(12) + IMPLEMENTATION),
             hx(REGISTRY): hx(bytes(12) + REGISTRY_IMPLEMENTATION),
@@ -196,13 +216,25 @@ class EvidenceRpc:
             assert params == [hx(TX)]
             return copy.deepcopy(self.receipt)
         if method == "eth_getBlockByNumber":
-            assert params in (["latest", False], [hex(BLOCK_NUMBER), False])
+            assert params in (
+                ["latest", False],
+                [hex(BLOCK_NUMBER), False],
+                [self.block["number"], False],
+            )
             self.block_reads += 1
             result = copy.deepcopy(self.block)
             if self.reorg_after is not None and self.block_reads > self.reorg_after:
                 result["hash"] = hx(b"\xdd" * 32)
             return result
-        assert params[-1] == {"blockHash": hx(BLOCK_HASH), "requireCanonical": True}
+        if params[-1] == "latest":
+            return self.latest(method, params)
+        assert params[-1]["requireCanonical"] is True and set(params[-1]) == {
+            "blockHash",
+            "requireCanonical",
+        }
+        if params[-1]["blockHash"] != hx(BLOCK_HASH):
+            # EIP-1898: an unknown block hash is "Resource not found" (-32001).
+            raise ChainEvidenceError("RPC request returned no usable result")
         if method == "eth_call":
             assert len(params) == 2 and set(params[0]) == {"to", "data"}
             return self.responses[(params[0]["to"], params[0]["data"])]
@@ -213,6 +245,36 @@ class EvidenceRpc:
             assert len(params) == 3 and params[1] == SLOT
             return self.slots[params[0]]
         raise AssertionError(f"unexpected RPC method: {method}")
+
+    def latest(self, method: str, params: list) -> object:
+        """Reads at the head, including one Multicall3 aggregate3 of views."""
+        if method == "eth_getCode":
+            return self.code[params[0].lower()]
+        if method == "eth_getStorageAt":
+            assert len(params) == 3 and params[1] == SLOT
+            return self.slots[params[0]]
+        assert method == "eth_call" and params[0]["to"] == hx(MULTICALL3)
+        data = bytes.fromhex(params[0]["data"][2:])
+        assert data[:4] == keccak(text="aggregate3((address,bool,bytes)[])")[:4]
+        (calls,) = decode(["(address,bool,bytes)[]"], data[4:])
+        head = {
+            keccak(text="getBlockNumber()")[:4]: encode(
+                ["uint256"], [int(self.block["number"], 16)]
+            ),
+            keccak(text="getCurrentBlockTimestamp()")[:4]: encode(
+                ["uint256"], [int(self.block["timestamp"], 16)]
+            ),
+            keccak(text="getLastBlockHash()")[:4]: bytes.fromhex(self.block["parentHash"][2:]),
+        }
+        answers = []
+        for target, allow_failure, calldata in calls:
+            assert allow_failure is False  # One failing view fails the snapshot.
+            if target.lower() == hx(MULTICALL3):
+                answers.append((True, head[calldata]))
+            else:
+                key = (target.lower(), "0x" + calldata.hex())
+                answers.append((True, bytes.fromhex(self.responses[key][2:])))
+        return hx(encode(["(bool,bytes)[]"], [answers]))
 
     def response(
         self,
@@ -286,7 +348,7 @@ def reconcile(reader: ChainReader, operation):
     )
 
 
-def test_open_requires_actual_proxy_event_and_matching_state(context) -> None:
+def test_open_requires_actual_proxy_event_and_matching_state(context, probabilistic) -> None:
     reader, rpc, calls = context
     rpc.logs(event_log("SessionOpened", opened()))
     result = reconcile(reader, opening(calls))
@@ -295,7 +357,7 @@ def test_open_requires_actual_proxy_event_and_matching_state(context) -> None:
     assert result.tx_hash == TX and result.observation.block_hash == BLOCK_HASH
     assert result.sessions[0].session_id == descriptor_id(DESCRIPTOR)
     assert result.sessions[0].settlement_reference is None
-    assert rpc.block_reads == 2
+    assert rpc.block_reads == 1  # Read once, in the batch with the session state.
 
 
 def test_opening_retains_exact_catalog_despite_later_same_block_update(context) -> None:
@@ -365,7 +427,9 @@ def test_opening_notice_requires_unambiguous_canonical_success(context, mutation
         reader.opening(TX, descriptor_id(DESCRIPTOR), accepted_catalog=catalog)
 
 
-def test_close_result_and_settlement_reference_require_event_state_agreement(context) -> None:
+def test_close_result_and_settlement_reference_require_event_state_agreement(
+    context, probabilistic
+) -> None:
     reader, rpc, _ = context
     sid = descriptor_id(DESCRIPTOR)
     rpc.session(paid=5_420_000)
@@ -388,7 +452,7 @@ def test_close_result_and_settlement_reference_require_event_state_agreement(con
 
 
 @pytest.mark.parametrize("mode", ["inner-wallet-failed", "spoof-emitter", "different-session"])
-def test_outer_wallet_success_does_not_prove_open(context, mode: str) -> None:
+def test_outer_wallet_success_does_not_prove_open(context, probabilistic, mode: str) -> None:
     reader, rpc, calls = context
     if mode == "spoof-emitter":
         rpc.logs(event_log("SessionOpened", opened(), emitter=b"\xef" * 20))
@@ -482,11 +546,16 @@ def test_receipt_absence_ambiguity_and_revert_are_distinct(context) -> None:
 
 
 @pytest.mark.parametrize("status", ["0x0", "0x1"])
-def test_reorg_during_observation_never_produces_definitive_result(context, status: str) -> None:
+def test_reorg_during_observation_never_produces_definitive_result(
+    context, probabilistic, status: str
+) -> None:
+    # The receipt names a block that is no longer canonical, and the endpoint
+    # ignores requireCanonical: it still serves state at the old hash. The
+    # block read in the same batch shows another hash at that number.
     reader, rpc, calls = context
     rpc.receipt["status"] = status
     rpc.logs(event_log("SessionOpened", opened()))
-    rpc.reorg_after = 1
+    rpc.reorg_after = 0
     assert reconcile(reader, opening(calls)).state is OperationState.UNKNOWN
 
 
@@ -494,7 +563,7 @@ def test_chain_mismatch_and_transport_failure_are_not_payment_failures(context) 
     reader, rpc, calls = context
     rpc.chain = hex(5042)
     assert reconcile(reader, opening(calls)).state is OperationState.UNKNOWN
-    with pytest.raises(ChainEvidenceError):
+    with pytest.raises(ChainContradictionError, match="RPC chain differs"):
         reader.block()
     rpc.chain = hex(CHAIN)
     rpc.failure = TransportError("unavailable")
@@ -614,7 +683,7 @@ def test_batch_ambiguous_duplicate_does_not_hide_an_independent_confirmed_item(c
     assert result.sessions[2].settlement_reference is None
 
 
-def test_paid_state_and_opening_catalog_cannot_contradict_events(context) -> None:
+def test_paid_state_and_opening_catalog_cannot_contradict_events(context, probabilistic) -> None:
     reader, rpc, calls = context
     rpc.logs(event_log("Settled", settled()))
     rpc.session(paid=5_419_999)
@@ -652,7 +721,9 @@ def test_settlement_event_must_match_target_and_descriptor(
 
 
 @pytest.mark.parametrize("kind", ["top_up", "request_close", "close", "withdraw", "release_idle"])
-def test_each_remaining_operation_requires_its_own_event_and_state(context, kind: str) -> None:
+def test_each_remaining_operation_requires_its_own_event_and_state(
+    context, probabilistic, kind: str
+) -> None:
     reader, rpc, calls = context
     sid = descriptor_id(DESCRIPTOR)
     if kind == "top_up":
@@ -719,7 +790,8 @@ def test_profile_checks_every_runtime_slot_and_domain_at_one_canonical_hash(cont
     reader, rpc, _ = context
     install_domain_response(rpc)
     reader.verify_deployment(reader.block())
-    assert {params[0] for method, params in rpc.calls if method == "eth_getCode"} == set(rpc.code)
+    pinned = set(rpc.code) - {hx(MULTICALL3)}  # Multicall3 is checked by snapshots only.
+    assert {params[0] for method, params in rpc.calls if method == "eth_getCode"} == pinned
     assert {params[0] for method, params in rpc.calls if method == "eth_getStorageAt"} == set(
         rpc.slots
     )
@@ -731,7 +803,7 @@ def test_each_code_pin_is_enforced(context, address: bytes) -> None:
     reader, rpc, _ = context
     install_domain_response(rpc)
     rpc.code[hx(address)] = "0x60006000"
-    with pytest.raises(ChainEvidenceError, match="code differs"):
+    with pytest.raises(ChainContradictionError, match="code differs"):
         reader.verify_deployment(reader.block())
 
 
@@ -740,7 +812,7 @@ def test_both_implementation_slots_are_enforced(context, address: bytes) -> None
     reader, rpc, _ = context
     install_domain_response(rpc)
     rpc.slots[hx(address)] = hx(bytes(12) + b"\xee" * 20)
-    with pytest.raises(ChainEvidenceError, match="implementation differs"):
+    with pytest.raises(ChainContradictionError, match="implementation differs"):
         reader.verify_deployment(reader.block())
 
 
@@ -754,7 +826,7 @@ def test_domain_and_post_read_canonicality_are_enforced(context) -> None:
         ["bytes32"],
         [bytes(32)],
     )
-    with pytest.raises(ChainEvidenceError, match="signing domain"):
+    with pytest.raises(ChainContradictionError, match="signing domain"):
         reader.verify_deployment(reader.block())
     install_domain_response(rpc)
     rpc.block_reads = 0
@@ -1023,14 +1095,35 @@ def test_rpc_retries_json_rpc_rate_limit_codes_only(monkeypatch) -> None:
     assert len(transport.calls) == 3
 
 
-def test_rpc_retries_stay_within_one_transport_timeout(monkeypatch) -> None:
+def test_rpc_retries_start_within_one_transport_timeout_and_their_delays(monkeypatch) -> None:
+    # Each attempt here takes the whole 1 s timeout and fails transiently. The
+    # first repeat starts at 1.25 s, inside 1 s + 1.25 s; the next would start
+    # at 3.25 s, outside it. So a timed-out read is repeated once.
+    clock = [0.0]
     delays: list[float] = []
-    monkeypatch.setattr(time, "sleep", delays.append)
-    transport = RateLimitedTransport([-32005, -32005])
-    transport.timeout_ms = 1_000  # Room for the 250 ms repeat, not the 1 s one.
-    with pytest.raises(ChainEvidenceError):
-        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
-    assert len(transport.calls) == 2 and delays == [0.25]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    def sleep(delay: float) -> None:
+        delays.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(time, "sleep", sleep)
+
+    class Slow:
+        timeout_ms = 1_000
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, url: str, *, body: bytes | None = None) -> bytes:
+            self.calls += 1
+            clock[0] += 1.0
+            raise TransportError("HTTP request failed", transient=True)
+
+    transport = Slow()
+    with pytest.raises(TransportError):
+        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])  # type: ignore[arg-type]
+    assert transport.calls == 2 and delays == [0.25]
 
 
 def test_rpc_retries_a_backend_that_has_not_imported_the_block(monkeypatch) -> None:
@@ -1056,3 +1149,418 @@ def test_an_unserved_numbered_block_is_lag_not_missing_evidence(context) -> None
     rpc.call = call
     with pytest.raises(ChainLagError):
         reader.block(7)
+
+
+class Trips:
+    """Counts round trips to the RPC: one per call, or one per batch."""
+
+    def __init__(self, rpc: EvidenceRpc) -> None:
+        self.rpc, self.trips = rpc, 0
+
+    def call(self, method: str, params: list[object]) -> object:
+        self.trips += 1
+        return self.rpc.call(method, params)
+
+    def call_many(self, calls: list[tuple[str, list[object]]]) -> list[object]:
+        self.trips += 1
+        return [self.rpc.call(method, params) for method, params in calls]
+
+
+def registered(rpc: EvidenceRpc, catalog: bytes = CATALOG) -> None:
+    """A verified deployment, unpaused, with one registered provider."""
+    install_domain_response(rpc)
+    rpc.response(PROXY, "pauseLevel()", [], [], ["uint8"], [0])
+    provider = DESCRIPTOR.provider_id
+    for name, output, value in (
+        ("ownerOf", "address", DESCRIPTOR.operator),
+        ("getAgentWallet", "address", DESCRIPTOR.recipient),
+        ("tokenURI", "string", "https://provider.example/discover"),
+    ):
+        rpc.response(REGISTRY, name + "(uint256)", ["uint256"], [provider], [output], [value])
+    rpc.response(
+        REGISTRY,
+        "getMetadata(uint256,string)",
+        ["uint256", "string"],
+        [provider, "mppi.catalog"],
+        ["bytes"],
+        [catalog],
+    )
+
+
+def test_each_read_step_is_one_round_trip_and_fixed_facts_are_read_once(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    trips = Trips(rpc)
+    reader = ChainReader(trips, reader.profile)
+    block = reader.block()
+    reader.verify_deployment(block)
+    reader.identity(DESCRIPTOR.provider_id, block)
+    pause, identities, sessions = reader.observe(
+        block, providers=(DESCRIPTOR.provider_id,), sessions=(descriptor_id(DESCRIPTOR),)
+    )
+    assert pause is PauseLevel.NONE and sessions[descriptor_id(DESCRIPTOR)].exists
+    assert identities[DESCRIPTOR.provider_id].recipient == DESCRIPTOR.recipient
+    assert trips.trips == 4
+    # The chain id and the code at each pinned address never change for a reader.
+    methods = Counter(method for method, _ in rpc.calls)
+    assert (methods["eth_chainId"], methods["eth_getCode"], methods["eth_getStorageAt"]) == (
+        1,
+        4,
+        4,
+    )
+
+
+def test_a_receipt_proof_is_two_round_trips(context, probabilistic) -> None:
+    reader, rpc, calls = context
+    rpc.logs(event_log("SessionOpened", opened()))
+    trips = Trips(rpc)
+    assert reconcile(ChainReader(trips, reader.profile), opening(calls)).state is (
+        OperationState.CONFIRMED
+    )
+    assert trips.trips == 2  # The receipt; then its block with the session state.
+    accepted = parse_catalog(CATALOG)
+    rpc.session(rate_hash=accepted.rate_card_hash)
+    rpc.logs(event_log("SessionOpened", opened(initialRateCardHash=accepted.rate_card_hash)))
+    trips = Trips(rpc)
+    ChainReader(trips, reader.profile).opening(
+        TX, descriptor_id(DESCRIPTOR), accepted_catalog=accepted
+    )
+    assert trips.trips == 2
+
+
+def test_a_follower_refresh_is_one_round_trip(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    trips = Trips(rpc)
+    follower = ChainFollower(
+        ChainReader(trips, reader.profile),
+        max_age_ms=60_000,
+        collection_margin_ms=1000,
+        wall_clock=lambda: TIMESTAMP + 1,
+    )
+
+    async def scenario() -> None:
+        await follower.start()
+        await follower.watch_provider(DESCRIPTOR.provider_id)
+        await follower.watch_session(descriptor_id(DESCRIPTOR))
+        await follower.stop()
+
+    asyncio.run(scenario())
+    # Arc blocks are final: one Multicall3 snapshot per refresh, anchored to the
+    # header in the same batch; fixed facts and the signing domain read once.
+    assert trips.trips == 3
+    methods = Counter(method for method, _ in rpc.calls)
+    assert (methods["eth_chainId"], methods["eth_getCode"], methods["eth_getStorageAt"]) == (
+        1,
+        5,
+        6,
+    )
+
+
+class TimesOutOnce:
+    """A JSON-RPC transport over the evidence fake whose first request times out:
+    it spends the whole attempt timeout on ``clock`` before failing."""
+
+    timeout_ms = 1_000
+
+    def __init__(self, rpc: EvidenceRpc, clock: list[float]) -> None:
+        self.rpc, self.clock, self.requests = rpc, clock, 0
+
+    def request(self, url: str, *, body: bytes | None = None) -> bytes:
+        self.requests += 1
+        if self.requests == 1:
+            self.clock[0] += self.timeout_ms / 1000
+            raise TransportError("HTTP request failed", transient=True)  # A slow backend.
+        assert body is not None
+        payload = json.loads(body)
+
+        def answer(call: dict) -> dict:
+            try:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": call["id"],
+                    "result": self.rpc.call(call["method"], call["params"]),
+                }
+            except ChainEvidenceError:
+                return {"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32001}}
+
+        reply = [answer(call) for call in payload] if isinstance(payload, list) else answer(payload)
+        return json.dumps(reply).encode()
+
+
+@pytest.mark.parametrize("read", ["receipt", "closing", "composition"])
+def test_a_proof_read_that_times_out_once_still_proves(context, read, monkeypatch) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    reader, rpc, _ = context
+    sid = descriptor_id(DESCRIPTOR)
+    transport = TimesOutOnce(rpc, clock)
+    chain = ChainReader(
+        HttpJsonRpc("https://rpc.example/private-api-key", transport),  # type: ignore[arg-type]
+        reader.profile,
+    )
+    if read == "receipt":
+        rpc.session(paid=5_420_000)
+        rpc.logs(event_log("Settled", settled()))
+        reference = ConfirmedSettlementRef(
+            reader.block().observation, TX, sid, 5_420_000, 5_420_000
+        )
+        chain.verify_settlement(reference, DESCRIPTOR)
+    elif read == "closing":
+        rpc.session(paid=5_420_000, status=2)
+        rpc.logs(
+            event_log(
+                "SessionClosed",
+                {"sessionId": sid, "captureAmount": 5_420_000, "refunded": 580_000},
+            )
+        )
+        assert chain.closing(TX, sid).capture_amount == 5_420_000
+    else:
+        install_domain_response(rpc)
+        chain.verify_deployment(chain.block())
+    assert transport.requests >= 2  # The timed-out request was repeated.
+
+
+def test_a_snapshot_is_one_round_trip_anchored_to_the_header_it_ran_at(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    trips = Trips(rpc)
+    reader = ChainReader(trips, reader.profile)
+    sid = descriptor_id(DESCRIPTOR)
+    block, pause, identities, states = reader.latest(
+        providers=(DESCRIPTOR.provider_id,), sessions=(sid,)
+    )
+    assert trips.trips == 1
+    assert block.observation.block_number == BLOCK_NUMBER and pause is PauseLevel.NONE
+    assert identities[DESCRIPTOR.provider_id].recipient == DESCRIPTOR.recipient
+    assert states[sid].exists
+    original = rpc.latest
+
+    def other_head(method, params):
+        # A load-balanced RPC answering the views at another block than the header.
+        if method == "eth_call":
+            rpc.block = dict(rpc.block, number=hex(BLOCK_NUMBER + 1))
+        return original(method, params)
+
+    rpc.latest = other_head
+    block, _, _, _ = reader.latest(sessions=(sid,))
+    # Anchored to the block the views ran at: its header, read by number.
+    assert block.observation.block_number == BLOCK_NUMBER + 1 and trips.trips == 3
+    assert rpc.calls[-1] == ("eth_getBlockByNumber", [hex(BLOCK_NUMBER + 1), False])
+
+    def another_block(method, params):
+        # That number's header has another parent than the block the views saw.
+        if method != "eth_call":
+            return original(method, params)
+        rpc.block = dict(rpc.block, number=hex(BLOCK_NUMBER + 2))
+        answer = original(method, params)
+        rpc.block = dict(rpc.block, parentHash=hx(b"\xee" * 32))
+        return answer
+
+    rpc.latest = another_block
+    with pytest.raises(ChainEvidenceError, match="different blocks"):
+        reader.latest(sessions=(sid,))
+
+
+def test_one_call_at_a_time_a_snapshot_anchors_to_the_block_its_views_ran_at(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+
+    class OneCall:
+        """An adapter without ``call_many``: each read is its own request."""
+
+        def call(self, method: str, params: list[object]) -> object:
+            return rpc.call(method, params)
+
+    reader = ChainReader(OneCall(), reader.profile)
+    reader.latest()
+    original = rpc.latest
+
+    def new_block(method, params):
+        # A block arrives between the header and the views.
+        if method == "eth_call":
+            rpc.block = dict(
+                rpc.block,
+                number=hex(BLOCK_NUMBER + 1),
+                hash=hx(b"\xee" * 32),
+                parentHash=hx(BLOCK_HASH),
+                timestamp=hex(TIMESTAMP + 1),
+            )
+        return original(method, params)
+
+    rpc.latest = new_block
+    block, pause, _, _ = reader.latest()
+    assert block.observation.block_number == BLOCK_NUMBER + 1
+    assert block.observation.block_hash == b"\xee" * 32 and block.timestamp == TIMESTAMP + 1
+    assert pause is PauseLevel.NONE
+
+
+def test_unverified_multicall3_code_falls_back_to_batched_reads_for_good(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    rpc.code[hx(MULTICALL3)] = hx(b"some other contract")
+    trips = Trips(rpc)
+    reader = ChainReader(trips, reader.profile)
+    block, pause, _, _ = reader.latest()
+    assert block.observation.block_number == BLOCK_NUMBER and pause is PauseLevel.NONE
+    # Sent once before its code was known, and its answer discarded.
+    multicalls = [p for m, p in rpc.calls if m == "eth_call" and p[0]["to"] == hx(MULTICALL3)]
+    assert len(multicalls) == 1 and trips.trips == 3
+    first = trips.trips
+    reader.latest()
+    assert trips.trips - first == 2  # The head, then a batch pinned to it.
+    assert (
+        sum(params[0] == hx(MULTICALL3) for method, params in rpc.calls if method == "eth_getCode")
+        == 1
+    )
+
+
+def test_a_snapshot_refuses_a_changed_implementation_slot(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    rpc.slots[hx(PROXY)] = hx(bytes(12) + b"\x55" * 20)
+    with pytest.raises(ChainContradictionError, match="implementation differs"):
+        reader.latest()
+
+
+def remaining_operation(calls, rpc, kind):
+    """An agent operation, and the event that proves it."""
+    sid = descriptor_id(DESCRIPTOR)
+    if kind == "open":
+        return opening(calls), "SessionOpened", opened()
+    if kind == "top_up":
+        auth = FundingAuthorization(
+            CHAIN, TOKEN, "USDC", "2", DESCRIPTOR.agent, PROXY, 490_000,
+            TIMESTAMP - 1, TIMESTAMP + 100, b"\x77" * 32,
+        )  # fmt: skip
+        operation = calls.top_up(DESCRIPTOR, 490_000, auth, b"smart-account-proof")
+        return operation, "ToppedUp", {"sessionId": sid, "amount": 490_000, "newDeposit": 6_000_000}
+    if kind == "request_close":
+        return (
+            calls.request_close(DESCRIPTOR),
+            "CloseRequested",
+            {"sessionId": sid, "graceEnd": TIMESTAMP + 3600},
+        )
+    closed = {"sessionId": sid, "captureAmount": 5_420_000, "refunded": 580_000}
+    if kind == "close":
+        return calls.close(DESCRIPTOR, 5_510_000, 5_420_000, SIGNATURE), "SessionClosed", closed
+    if kind == "withdraw":
+        return calls.withdraw(DESCRIPTOR), "SessionClosed", closed
+    return calls.release_idle(DESCRIPTOR), "IdleReleased", {"sessionId": sid, "amount": 580_000}
+
+
+@pytest.mark.parametrize(
+    "kind", ["open", "top_up", "request_close", "close", "withdraw", "release_idle"]
+)
+def test_on_a_final_network_the_event_alone_proves_an_operation(context, kind) -> None:
+    """One receipt read: status 1 and our own decoded event from the pinned proxy."""
+    reader, rpc, calls = context
+    operation, name, values = remaining_operation(calls, rpc, kind)
+    rpc.logs(event_log(name, values))
+    trips = Trips(rpc)
+    proven = reconcile(ChainReader(trips, reader.profile), operation)
+    assert proven.state is OperationState.CONFIRMED and trips.trips == 1
+    assert proven.observation.block_hash == BLOCK_HASH and rpc.block_reads == 0
+    assert not any(method == "eth_call" for method, _ in rpc.calls)  # No state read.
+    rpc.logs()  # Mined, but the MPPI call did not take effect in it.
+    failed = reconcile(reader, operation)
+    assert failed.state is OperationState.FAILED and failed.tx_hash == TX
+    assert failed.cause == "the MPPI call did not take effect in its transaction"
+
+
+@pytest.mark.parametrize("mode", ["spoof-emitter", "different-session"])
+def test_on_a_final_network_another_contract_or_session_event_proves_nothing(context, mode):
+    reader, rpc, calls = context
+    if mode == "spoof-emitter":
+        rpc.logs(event_log("SessionOpened", opened(), emitter=b"\xef" * 20))
+    else:
+        rpc.logs(event_log("SessionOpened", opened(sessionId=b"\xef" * 32)))
+    assert reconcile(reader, opening(calls)).state is OperationState.FAILED
+
+
+ENTRYPOINT = bytes.fromhex("0000000071727de22e5e9d8baf0edac6f37da032")
+
+
+def revert_reason(reason: bytes, *, emitter: bytes = ENTRYPOINT, sender=None) -> dict:
+    """EntryPoint v0.7 UserOperationRevertReason for the agent's UserOperation."""
+    return {
+        "address": hx(emitter),
+        "topics": [
+            hx(keccak(text="UserOperationRevertReason(bytes32,address,uint256,bytes)")),
+            hx(b"\x44" * 32),
+            hx(bytes(12) + (sender or DESCRIPTOR.agent)),
+        ],
+        "data": hx(encode(["uint256", "bytes"], [7, reason])),
+        "logIndex": "0x0",
+        "removed": False,
+        "transactionHash": hx(TX),
+        "transactionIndex": "0x2",
+        "blockNumber": hex(BLOCK_NUMBER),
+        "blockHash": hx(BLOCK_HASH),
+    }
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        (
+            keccak(text="Error(string)")[:4]
+            + encode(["string"], ["FiatTokenV2: invalid signature"]),
+            ": FiatTokenV2: invalid signature",
+        ),
+        (keccak(text="NotAgent()")[:4], ": NotAgent"),
+        (
+            keccak(text="Error(string)")[:4] + encode(["string"], ["see https://scam.example"]),
+            ": the wallet operation reverted (0x08c379a0)",
+        ),
+        (b"\x12\x34\x56\x78", ": the wallet operation reverted (0x12345678)"),
+    ],
+)
+def test_an_erc4337_inner_revert_is_a_definite_failure_with_its_known_reason(
+    context, reason, expected
+) -> None:
+    """A bundle succeeds while its UserOperation reverts: FAILED, never UNKNOWN,
+    and the cause holds only a USDC reason or MPPI error the SDK knows."""
+    reader, rpc, calls = context
+    operation, _, _ = remaining_operation(calls, rpc, "top_up")
+    rpc.logs(revert_reason(reason))
+    failed = reconcile(reader, operation)
+    assert failed.state is OperationState.FAILED
+    assert failed.cause == "the MPPI call did not take effect in its transaction" + expected
+    # The same event from another contract, or for another wallet, names nothing.
+    for log in (
+        revert_reason(reason, emitter=b"\xef" * 20),
+        revert_reason(reason, sender=b"\xef" * 20),
+    ):
+        rpc.logs(log)
+        plain = reconcile(reader, operation)
+        assert plain.state is OperationState.FAILED
+        assert plain.cause == "the MPPI call did not take effect in its transaction"
+
+
+def test_on_a_final_network_opening_and_closing_proofs_are_one_round_trip(context) -> None:
+    reader, rpc, _ = context
+    sid = descriptor_id(DESCRIPTOR)
+    accepted = parse_catalog(CATALOG)
+    rpc.logs(event_log("SessionOpened", opened(initialRateCardHash=accepted.rate_card_hash)))
+    trips = Trips(rpc)
+    proof = ChainReader(trips, reader.profile).opening(TX, sid, accepted_catalog=accepted)
+    assert trips.trips == 1 and proof.deposit == 5_510_000
+    assert proof.observation.block_hash == BLOCK_HASH
+    closed = {"sessionId": sid, "captureAmount": 5_420_000, "refunded": 580_000}
+    rpc.logs(event_log("SessionClosed", closed))
+    trips = Trips(rpc)
+    evidence = ChainReader(trips, reader.profile).closing(TX, sid)
+    assert trips.trips == 1
+    assert (evidence.capture_amount, evidence.refunded) == (5_420_000, 580_000)
+    # Settlements still read state: a no-op or skipped item emits no event.
+    rpc.session(paid=5_420_000)
+    rpc.logs(event_log("Settled", settled()))
+    trips = Trips(rpc)
+    settle = reconcile(ChainReader(trips, reader.profile), reader_calls_settle())
+    assert settle.state is OperationState.CONFIRMED and trips.trips == 2
+
+
+def reader_calls_settle():
+    return ContractCalls(DOMAIN, "USDC", "2").settle(DESCRIPTOR, 5_510_000, 5_420_000, SIGNATURE)

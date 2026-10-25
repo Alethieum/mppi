@@ -1,9 +1,9 @@
 """Installed Circle onboarding and client composition with explicit Arc selection.
 
-The SDK supplies reviewed public deployment/account pins. RPC observations are
+The SDK supplies reviewed public deployment pins. RPC observations are
 compared with them, never promoted into trust anchors. Wallet custody remains
 with Circle; the separate local session credential authorizes MPPI vouchers.
-Sources and supported account version: docs/agent-quickstart.md.
+Any Circle account generation is accepted (docs/agent-quickstart.md).
 Network identifiers and separate Circle login sessions verified 2026-10-06:
 https://developers.circle.com/agent-stack/agent-wallets/supported-blockchains
 https://developers.circle.com/agent-stack/agent-wallets/quickstart
@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mppi_protocol.amounts import uint64
-from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile, HttpJsonRpc
-from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError, supported_account_pins
+from mppi_protocol.chain import ChainReader, DeploymentProfile, HttpJsonRpc
+from mppi_protocol.circle import CircleAgentWallet
 from mppi_protocol.contract import (
     ARC_USDC,
     ContractCalls,
@@ -68,15 +68,6 @@ def _profile(*, testnet: bool = True, profile: DeploymentProfile | None = None) 
     ):
         raise OnboardingError("deployment profile differs from the selected network")
     return profile_to_mapping(profile)
-
-
-def _account_pins(chain_id: int) -> tuple[bytes, CodePin]:
-    try:
-        return supported_account_pins(chain_id)
-    except CircleAgentWalletError:
-        raise OnboardingError(
-            "verified Circle account pins are unavailable for this network"
-        ) from None
 
 
 def _rpc(env_name: str, *, chain_id: int = 5042002) -> HttpJsonRpc:
@@ -134,11 +125,9 @@ def _reader(record: dict[str, Any]) -> ChainReader:
 
 
 def _wallet(record: dict[str, Any], reader: ChainReader, config: Path) -> CircleAgentWallet:
-    proxy_hash, implementation = _account_pins(reader.profile.domain.chain_id)
     return CircleAgentWallet(
         chain=reader,
-        wallet=CodePin(parse_address(record["wallet"]), proxy_hash),
-        implementation=implementation,
+        address=parse_address(record["wallet"]),
         checkpoint_path=_path(config, ".wallet.json"),
         allow_registration_activation=True,
     )
@@ -196,7 +185,6 @@ def onboard_circle(
     """
     address = parse_address(wallet_address)
     selected = _profile(testnet=testnet, profile=profile)
-    _account_pins(selected["chain_id"])
     if rpc_env is None:
         rpc_env = DEFAULT_RPC_ENV if testnet else MAINNET_RPC_ENV
     _rpc(rpc_env, chain_id=selected["chain_id"])  # Validate before retained setup.
@@ -313,9 +301,12 @@ def client_from_config(
     One stable payment checkpoint belongs to this setup. Its existing provider,
     signer and pending-operation guards apply unchanged. Funding is explicit.
     Select the same network and trusted deployment used during onboarding.
-    Chain evidence must be younger than ``max_age_ms``; the follower polls every
-    ``poll_interval_ms`` (default a quarter of it, 15 s), as the explicit
-    composition does. Each poll costs about 24 RPC reads (docs/agent-quickstart.md).
+    Requests within an attached session read no chain. Opening, attachment,
+    top-up and close use evidence younger than ``max_age_ms``, refreshing first
+    when it is older. The follower also polls every ``poll_interval_ms``
+    (default ``max_age_ms``) to keep that view current; a failed poll reaches
+    the error hook; an unavailable RPC never blocks requests, but evidence
+    contradicting the deployment stops them until a refresh is accepted.
     """
     from .client import Client
 
@@ -327,7 +318,6 @@ def client_from_config(
         if poll_interval_ms > max_age_ms:
             raise OnboardingError("poll_interval_ms exceeds max_age_ms")
     selected = _profile(testnet=testnet, profile=profile)
-    _account_pins(selected["chain_id"])
     config = Path(config_path).absolute()
     with private_directory(config.parent):
         pass
@@ -370,7 +360,7 @@ def client_from_config(
                 reader,
                 max_age_ms=max_age_ms,
                 collection_margin_ms=30_000,
-                poll_interval_ms=poll_interval_ms,
+                poll_interval_ms=max_age_ms if poll_interval_ms is None else poll_interval_ms,
             ),
             contract=ContractCalls(reader.profile.domain, "USDC", "2"),
             checkpoint_path=payment_path,

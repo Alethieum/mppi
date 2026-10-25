@@ -99,6 +99,7 @@ accepted catalog hash. It correlates provider facts; it does not grant execution
 | `ProviderRuns.report_terminal(context, counts, status)` | Definitive final counts/status together → final accounting result. |
 | `ProviderSessions.checkpoint(session_id)` | Detached payment evidence for caller-owned retention; no storage is added. |
 | `ProviderSessions.recover(evidence)` | Supplied snapshot, reservation and chain evidence → validated session view. It does not load or save provider data, authenticate Control or establish readiness by itself. |
+| `ProviderSessions.recover_current(evidence)` | As `recover`, for evidence the host asserts is current: checkpointed after every admission and before dispatch, never older than its newest. A pending run absent from it is then answered `NOT_ADMITTED`; after `recover` it refuses the attachment. |
 
 The pure `report_transition` helper already rejects decreasing counters,
 decreasing exact recognized cost, unpriceable cache counts, usage exceeding its
@@ -165,7 +166,11 @@ state or submitting another transaction.
 
 `SessionSigner` declares the four fixed-key MPPI signing capabilities: Voucher,
 RunAuth, CloseAuth and ReconnectAuth. `FundingWallet` separately declares USDC
-authorization signing and wallet execution/reconciliation. `FundingAuthorization`
+authorization signing and wallet execution/reconciliation; any wallet provider
+fits behind it ([adapter contract](python-onboarding.md#funding-wallet-adapters)).
+Funding requires the agent's ERC-8004 id. Before submitting an opening, the
+agent checks the registry binds that id to the wallet and checks the signature
+as USDC will. `FundingAuthorization`
 uses the token's separate domain and uint256 token-interface fields; MPPI amount
 validation still precedes execution. `WalletCall` represents a nonpayable
 MPPI/registry call. No provider credential or secret is stored in these records.

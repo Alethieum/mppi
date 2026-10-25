@@ -142,10 +142,11 @@ Admission reserves shared session coverage atomically. Streaming reports consume
 that reservation; they do not change the admitted run's prices.
 
 Only unadmitted requests wait for authorization, within one fixed bounded wait.
-An insufficient deposit fails with payment guidance; the SDK does not fund the
-session. `TopUpNotice` is a hint, and independently confirmed chain evidence
-establishes the deposit. Readiness uses cached coherent observations rather than
-per-token RPC calls.
+They are admitted in the order they first waited, each for a turn of at most two
+seconds. An insufficient deposit fails with payment guidance; the SDK does not
+fund the session. `TopUpNotice` is a hint, and independently confirmed chain
+evidence establishes the deposit. Readiness uses cached coherent observations
+rather than per-token RPC calls.
 
 A valid voucher from the current authenticated attachment that exceeds the
 cached deposit triggers one canonical refresh, bounded by `max_age_ms` and
@@ -196,6 +197,22 @@ agent must authenticate a fresh attachment. Unfinished recovered runs remain
 stopped and retain their reservations until the provider supplies definitive
 reports using their original `RunContext`. Repeated reports do not add usage.
 Accepted prices remain fixed per run across catalog updates.
+
+An admitted run that your host never dispatched before a crash has no meter and
+no final, so it stays unresolved and blocks its session. If your own records
+prove nothing reached the inference backend, report it `CANCELLED` at zero
+through `report_terminal`; the session then reattaches with that outcome. A run
+that may have done billable work stays unresolved for the operator. A reconnect
+may also name a pending run this provider never held: the agent records a run
+before its Complete arrives. When every admission is known, the snapshot answers
+it `NOT_ADMITTED` and records nothing, and the new generation refuses a late
+Complete for it. Every admission is known for a session this runtime opened, or
+one restored with `sessions().recover_current(evidence)`. After
+`sessions().recover(evidence)` such a run refuses the attachment instead: an
+older checkpoint may lack a run that was admitted and served, and answering it
+`NOT_ADMITTED` would leave that work uncollected. Use `recover_current` only if
+your host checkpoints durably after every admission and before dispatch, and
+never restores a checkpoint older than its newest.
 
 `sessions().settle_batch(&ids)` preserves the requested order, including repeated
 session IDs and an empty batch. The SDK sizes and simulates the prepared call

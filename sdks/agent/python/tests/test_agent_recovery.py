@@ -17,15 +17,22 @@ import grpc
 import pytest
 from mppi.v1 import mppi_pb2 as pb
 from mppi.v1 import mppi_pb2_grpc as services
-from mppi_agent import Client, ClientError, PaymentError
+from mppi_agent import Client, ClientError, FundingAuthorizationError, PaymentError
 from mppi_agent.checkpoint import Checkpoint
 from mppi_agent.client import _Output
 from mppi_agent.state import Ledger
 from mppi_protocol import CatalogRow, Rates, ValidationError, publish_catalog
 from mppi_protocol._observers import Observers
-from mppi_protocol.chain import Block, ChainSession
+from mppi_protocol.chain import (
+    Block,
+    ChainEvidenceError,
+    ChainLagError,
+    ChainSession,
+    FundingEvidence,
+)
 from mppi_protocol.contract import ContractCalls, OperationKind
 from mppi_protocol.discovery import ProviderIdentity
+from mppi_protocol.http import TransportError
 from mppi_protocol.signing import LocalSessionSigner, verify_reconnect_auth
 from mppi_protocol.types import (
     ChainObservation,
@@ -48,6 +55,7 @@ DESCRIPTOR = SessionDescriptor(
     b"a" * 20, SIGNER.address, 7, b"r" * 20, b"o" * 20, bytes.fromhex("36" + "00" * 19), b"s" * 32
 )
 NONCE = b"n" * 32
+AGENT_ID = 43
 
 
 def ledger_with_runs(count=1):
@@ -76,7 +84,10 @@ def component_client():
     state = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
     current = SimpleNamespace(sessions={client._ledger.session_id: state})
     client.chain = SimpleNamespace(
-        current=current, snapshot=lambda: current, readiness=lambda _=None: Readiness(True)
+        current=current,
+        snapshot=lambda: current,
+        readiness=lambda _=None: Readiness(True),
+        confirmed_readiness=lambda _=None: Readiness(True),
     )
     client.signer, client.timeout = SIGNER, 1
     client._persist = AsyncMock()
@@ -215,8 +226,15 @@ def attachment_client(*, catalog=CATALOG):
         current=current,
         snapshot=lambda: current,
         refresh=AsyncMock(return_value=current),
+        refresh_at=AsyncMock(return_value=current),
+        follow=Mock(),
         readiness=lambda _=None: Readiness(True),
-        reader=SimpleNamespace(block=Mock(return_value=block), session=Mock(return_value=state)),
+        confirmed_readiness=lambda _=None: Readiness(True),
+        reader=SimpleNamespace(
+            block=Mock(return_value=block),
+            session=Mock(return_value=state),
+            session_at=Mock(return_value=(block, state)),
+        ),
     )
     client._identity = identity
     return client
@@ -312,8 +330,8 @@ def test_attachment_failure_does_not_commit_partial_snapshot(tamper):
         elif tamper == "missing_pending":
             del message.run_states[:]
         else:
-            block = client.chain.reader.block.return_value
-            client.chain.reader.block.side_effect = [block, replace(block, timestamp=101)]
+            # The follower is at the snapshot's block number, with another hash.
+            message.chain_block_hash = b"x" * 32
         before = deepcopy(original.__dict__)
         deliver_snapshot(client, message)
         with pytest.raises((ClientError, ValidationError)):
@@ -352,25 +370,41 @@ def test_attachment_refreshes_chain_evidence_newer_than_cached_follower(change):
             pause_level=PauseLevel.PAYMENTS if change == "pause" else PauseLevel.NONE,
         )
 
-        async def refresh():
+        async def refresh_at(number, block_hash):
+            assert (number, block_hash) == (2, newer_block.observation.block_hash)
             client.chain.current = refreshed
             return refreshed
 
         client.chain.snapshot = lambda: client.chain.current
-        client.chain.refresh = AsyncMock(side_effect=refresh)
+        client.chain.refresh_at = AsyncMock(side_effect=refresh_at)
         client.chain.readiness = lambda _=None: Readiness(
             client.chain.current.pause_level is PauseLevel.NONE
         )
-        client.chain.reader.block.return_value = newer_block
-        client.chain.reader.session.return_value = state
         deliver_snapshot(client, message)
         await client._attach(b"t" * 32, require_ready=False)
-        client.chain.refresh.assert_awaited_once()
+        client.chain.refresh_at.assert_awaited_once()
+        client.chain.refresh.assert_not_awaited()
         assert client._ledger is not original
         assert client._ledger.generation == 2 and client._ledger.usage_amount == 2
         assert client._ledger.ready is (change != "pause")
         assert client._attached_generation == 2
         client._persist.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_an_attachment_renews_once_attached():
+    """A top-up confirmed while attaching, or restored usage, may already need a
+    higher voucher; renewal waits for the attached stream, then runs once."""
+
+    async def scenario():
+        client = attachment_client()
+        client._renew = AsyncMock()
+        client._renew_task = None
+        deliver_snapshot(client, snapshot(client._ledger))
+        await client._attach(b"t" * 32, require_ready=False)
+        await asyncio.gather(*client._background)
+        client._renew.assert_awaited_once()
 
     asyncio.run(scenario())
 
@@ -390,24 +424,18 @@ def test_attachment_rejects_unusable_refreshed_chain_evidence_atomically(failure
         )
         message.chain_block_number = 2
         message.chain_block_hash = newer_block.observation.block_hash
-        client.chain.reader.block.return_value = newer_block
-        refreshed = SimpleNamespace(**vars(old))
-        refreshed.block = newer_block
-        if failure == "behind":
-            refreshed.block = old.block
-        elif failure == "conflict":
-            refreshed.block = replace(
-                newer_block,
-                observation=replace(newer_block.observation, block_hash=b"x" * 32),
-            )
-        elif failure == "reorg":
-            client.chain.reader.block.side_effect = [
-                newer_block,
-                replace(newer_block, timestamp=newer_block.timestamp + 1),
-            ]
-        client.chain.refresh = AsyncMock(
-            side_effect=ClientError("refresh unavailable") if failure == "unavailable" else None,
-            return_value=refreshed,
+        client.chain.refresh_at = AsyncMock(
+            side_effect={
+                # The RPC never serves the snapshot's block within the wait.
+                "behind": ChainLagError("RPC has not served that block yet"),
+                # Another block is canonical at that number.
+                "conflict": ChainEvidenceError(
+                    "canonical block evidence changed during observation"
+                ),
+                "unavailable": ClientError("refresh unavailable"),
+                # The follower's accepted block is no longer canonical.
+                "reorg": ChainEvidenceError("previously accepted canonical block changed"),
+            }[failure]
         )
         deliver_snapshot(client, message)
         with pytest.raises(ClientError):
@@ -460,14 +488,21 @@ def test_native_control_waits_for_snapshot_commit_before_later_messages():
         client = attachment_client()
         message = snapshot(client._ledger)
         entered, release = threading.Event(), threading.Event()
-        original_block = client.chain.reader.block.return_value
+        old = client.chain.current
+        newer = SimpleNamespace(**vars(old))
+        newer.block = replace(
+            old.block,
+            observation=replace(old.block.observation, block_number=2, block_hash=b"d" * 32),
+        )
+        message.chain_block_number = 2
+        message.chain_block_hash = newer.block.observation.block_hash
 
-        def read_block(_):
+        async def refresh_at(number, block_hash):
             entered.set()
-            assert release.wait(3)
-            return original_block
+            assert await asyncio.to_thread(release.wait, 3)
+            return newer
 
-        client.chain.reader.block.side_effect = read_block
+        client.chain.refresh_at = AsyncMock(side_effect=refresh_at)
         finished, hold = asyncio.Event(), asyncio.Event()
 
         class Peer(services.ControlServicer):
@@ -609,6 +644,12 @@ def opening_intent_client():
     client.chain.reader.session.return_value = ChainSession(
         0, 0, SessionStatus.OPEN, 0, 0, bytes(32)
     )
+    client.agent_id = AGENT_ID
+    client.chain.reader.funding = Mock(
+        side_effect=lambda auth, signature, agent_id, block: FundingEvidence(
+            block, True, DESCRIPTOR.agent
+        )
+    )
     client._submit = AsyncMock(
         return_value=OperationResult(client._opening_ref, OperationState.UNKNOWN)
     )
@@ -632,6 +673,147 @@ def test_never_submitted_opening_reuses_exact_authorization_and_reference():
         assert operation.descriptors == (DESCRIPTOR,) and operation.amounts == (100,)
         assert operation.expected_rate_card_hash == CATALOG.rate_card_hash
         assert client._saved == original
+
+    asyncio.run(scenario())
+
+
+def test_an_opening_needs_fresh_evidence_when_the_follower_is_stale():
+    """Requests use confirmed state; an opening still reads the chain first."""
+
+    async def scenario():
+        client = opening_intent_client()
+
+        def stale():
+            raise ChainEvidenceError("chain observation is unavailable or stale")
+
+        client.chain.snapshot = stale
+        client.chain.refresh = AsyncMock(side_effect=TransportError("HTTP request failed"))
+        with pytest.raises(TransportError):
+            await client._submit_open_intent()
+        client.chain.refresh.assert_awaited_once()
+        client.wallet.sign_funding_authorization.assert_not_called()
+        client._submit.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_funding_without_an_agent_id_is_refused_before_any_signature():
+    async def scenario():
+        client = opening_intent_client()
+        client.agent_id = None
+        original = deepcopy(client._saved)
+        with pytest.raises(FundingAuthorizationError) as refused:
+            await client._submit_open_intent()
+        assert refused.value.reason == "AGENT_ID_REQUIRED"
+        client.wallet.sign_funding_authorization.assert_not_called()
+        client.chain.reader.funding.assert_not_called()
+        client._submit.assert_not_awaited()
+        assert client._saved == original
+
+    asyncio.run(scenario())
+
+
+def test_a_fresh_opening_without_an_agent_id_never_asks_the_provider():
+    async def scenario():
+        client, _ = retained_open_client(OperationState.FAILED)
+        client._ledger = client._opening_ref = None
+        client._saved = {"version": 1}
+        client.agent_id = None
+        client._challenge = AsyncMock(side_effect=AssertionError("no challenge"))
+        with pytest.raises(FundingAuthorizationError, match="^AGENT_ID_REQUIRED$"):
+            await client._open(MODEL, 200)
+        assert client._ledger is None and client._saved == {"version": 1}
+        client._start.assert_not_awaited()  # No discovery, chain read or exchange.
+        client._connect.assert_not_awaited()
+        client.wallet.sign_funding_authorization.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "bound,valid,reason",
+    [
+        (b"z" * 20, True, "AGENT_WALLET_MISMATCH"),
+        (bytes(20), True, "AGENT_WALLET_MISMATCH"),  # Cleared on an ERC-8004 transfer.
+        (DESCRIPTOR.agent, False, "INVALID_SIGNATURE"),
+    ],
+)
+def test_a_funding_the_provider_or_usdc_would_refuse_is_never_submitted(bound, valid, reason):
+    async def scenario():
+        client = opening_intent_client()
+        block = client.chain.current.block
+        client.chain.reader.funding = Mock(return_value=FundingEvidence(block, valid, bound))
+        original = deepcopy(client._saved)
+        with pytest.raises(FundingAuthorizationError) as refused:
+            await client._submit_open_intent()
+        assert refused.value.reason == reason
+        auth = client.wallet.sign_funding_authorization.call_args.args[0]
+        client.chain.reader.funding.assert_called_once_with(auth, b"w" * 65, AGENT_ID, block)
+        client._submit.assert_not_awaited()
+        assert client._saved == original and client._operations == {}
+        # Nothing was sent: the same intent goes out once the wallet can fund it.
+        client.chain.reader.funding.return_value = FundingEvidence(block, True, DESCRIPTOR.agent)
+        await client._submit_open_intent()
+        operation, ref = client._submit.call_args.args
+        assert ref == "original-opening-reference" and operation.amounts == (100,)
+
+    asyncio.run(scenario())
+
+
+def test_a_wallet_that_signs_at_execute_opens_with_its_placeholder_once_its_id_binds():
+    """Its service signs when it executes: the agent checks the agent id's
+    binding, never the placeholder, and hands the placeholder to execute."""
+
+    async def scenario():
+        client = opening_intent_client()
+        client.wallet.sign_funding_authorization.return_value = bytes(65)
+        client.wallet.signs_at_execute = True
+        observation = client.chain.current.block.observation
+        client.chain.reader.agent_wallet = Mock(return_value=b"z" * 20)
+        with pytest.raises(FundingAuthorizationError, match="^AGENT_WALLET_MISMATCH$"):
+            await client._submit_open_intent()
+        client._submit.assert_not_awaited()
+        client.chain.reader.agent_wallet.return_value = DESCRIPTOR.agent
+        await client._submit_open_intent()
+        client.chain.reader.agent_wallet.assert_called_with(AGENT_ID, observation)
+        client.chain.reader.funding.assert_not_called()
+        auth = client.wallet.sign_funding_authorization.call_args.args[0]
+        operation, _ = client._submit.call_args.args
+        assert operation == client.contract.open(
+            DESCRIPTOR, 100, CATALOG.rate_card_hash, auth, bytes(65)
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("declared", [None, 1, "yes"])
+def test_a_placeholder_from_a_wallet_that_never_declared_it_is_refused(declared):
+    async def scenario():
+        client = opening_intent_client()
+        client.wallet.sign_funding_authorization.return_value = bytes(65)
+        if declared is not None:
+            client.wallet.signs_at_execute = declared  # Only True declares it.
+        block = client.chain.current.block
+        client.chain.reader.funding = Mock(
+            return_value=FundingEvidence(block, False, DESCRIPTOR.agent)
+        )
+        with pytest.raises(FundingAuthorizationError, match="^SIGNATURE_DEFERRED_UNDECLARED$"):
+            await client._submit_open_intent()
+        client._submit.assert_not_awaited()
+        assert client._operations == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signature", [b"", b"x" * 65537, "not bytes"])
+def test_an_unusable_wallet_signature_is_refused_without_a_read(signature):
+    async def scenario():
+        client = opening_intent_client()
+        client.wallet.sign_funding_authorization.return_value = signature
+        with pytest.raises(FundingAuthorizationError, match="^INVALID_SIGNATURE$"):
+            await client._submit_open_intent()
+        client.chain.reader.funding.assert_not_called()
+        client._submit.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -681,6 +863,121 @@ def test_retained_opening_never_replaces_uncertain_expired_or_changed_intent(cau
         client.wallet.sign_funding_authorization.assert_not_called()
         client._submit.assert_not_awaited()
         assert client._saved == original
+
+    asyncio.run(scenario())
+
+
+def retained_open_client(previous_state, **result):
+    """A retained opening intent whose first submission ended in ``previous_state``."""
+    client = opening_intent_client()
+    client._start = client._local_start = client._connect = AsyncMock()
+    client._open_lock = asyncio.Lock()
+    client._resync = client._snapshot_waiter = client._control = None
+    original = client._opening_ref
+    client._operations[original] = (None, OperationResult(original, previous_state, **result))
+    return client, original
+
+
+def test_a_definitely_failed_opening_is_sent_again_with_the_same_intent():
+    """The adapter proved nothing reached its service: the same intent, a new reference."""
+
+    async def scenario():
+        client, original = retained_open_client(
+            OperationState.FAILED, cause="NotSubmittedError: CircleAgentWalletError"
+        )
+        opened = await client._open(MODEL, None)
+        assert opened.operation.state is OperationState.UNKNOWN and opened.session is None
+        operation, ref = client._submit.call_args.args
+        assert ref != original and client._opening_ref == ref
+        auth = client.wallet.sign_funding_authorization.call_args.args[0]
+        assert (auth.value, auth.nonce, auth.valid_before) == (100, b"u" * 32, 200)
+        assert operation.descriptors == (DESCRIPTOR,) and operation.amounts == (100,)
+        assert client._operations[original][1].state is OperationState.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_an_earlier_success_of_a_failed_opening_is_refused_not_funded_twice():
+    """If the first attempt did fund the session after all, the same intent is
+    refused before any new signature or submission."""
+
+    async def scenario():
+        client, _ = retained_open_client(OperationState.FAILED, cause="NotSubmittedError")
+        client.chain.reader.session.return_value = ChainSession(
+            100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash
+        )
+        with pytest.raises(ClientError, match="already exists"):
+            await client._open(MODEL, None)
+        client.wallet.sign_funding_authorization.assert_not_called()
+        client._submit.assert_not_awaited()
+        assert client._ledger is not None  # Kept: it names the funded session.
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["void", "funded", "unproven"])
+def test_an_expired_failed_opening_is_retired_only_once_proven_void(case):
+    """A FAILED report alone never forgets an opening: a status-0 bundle can be
+    front-run while the same authorization funds the session elsewhere."""
+
+    async def scenario():
+        client, original = retained_open_client(OperationState.FAILED, cause="NotSubmittedError")
+        client._saved["funding_intent"]["valid_before"] = 100  # The head's timestamp.
+        block = client.chain.current.block
+        state = ChainSession(0, 0, SessionStatus.OPEN, 0, 0, bytes(32))
+        if case == "funded":
+            state = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+        client.chain.reader.session_at = Mock(return_value=(block, state))
+        if case == "unproven":
+            client.chain.reader.session_at.side_effect = TransportError("HTTP request failed")
+        kept = deepcopy(client._saved)
+        opened = await client._open(MODEL, None)
+        assert opened.operation.state is OperationState.FAILED
+        assert client._operations[original][1].state is OperationState.FAILED  # History.
+        client._submit.assert_not_awaited()
+        if case == "void":
+            assert client._ledger is None and client._opening_ref is None
+            assert "funding_intent" not in client._saved and "ledger" not in client._saved
+        else:
+            assert client._opening_ref == original and client._ledger is not None
+            assert client._saved == kept
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["at_valid_before", "before", "funded", "noncanonical"])
+def test_an_uncertain_opening_is_void_only_at_a_canonical_block_past_its_authorization(case):
+    async def scenario():
+        client = opening_intent_client()
+        await client._submit_open_intent()
+        operation, ref = client._submit.call_args.args
+        client._operations[ref] = (operation, OperationResult(ref, OperationState.UNKNOWN))
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        client._local_start = AsyncMock()
+        block = client.chain.current.block  # Timestamp 100.
+        empty = ChainSession(0, 0, SessionStatus.OPEN, 0, 0, bytes(32))
+        client.chain.reader.session_at = Mock(return_value=(block, empty))
+        client._saved["funding_intent"]["valid_before"] = 100  # Reached exactly.
+        if case == "before":
+            client._saved["funding_intent"]["valid_before"] = 101
+        elif case == "funded":
+            funded = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+            client.chain.reader.session_at.return_value = (block, funded)
+        elif case == "noncanonical":
+            client.chain.reader.session_at.side_effect = ChainEvidenceError(
+                "canonical block evidence changed during observation"
+            )
+        result = await client._reconcile_ref(ref)
+        if case == "at_valid_before":
+            assert result.state is OperationState.FAILED
+            assert result.cause == "authorization expired before any opening"
+            assert client.chain.reader.session_at.call_args.args == (
+                block.observation.block_number,
+                block.observation.block_hash,
+                client._ledger.session_id,
+            )
+        else:
+            assert result.state is OperationState.UNKNOWN
 
     asyncio.run(scenario())
 
@@ -853,7 +1150,7 @@ def test_open_reconnects_after_funding_outlives_control_setup(monkeypatch):
         original_tx = b"t" * 32
         client.chain.watch_session = AsyncMock(return_value=funded)
         client.chain.reader.opening = Mock(
-            return_value=OpeningEvidence(DESCRIPTOR, block, 100, CATALOG, original_tx)
+            return_value=OpeningEvidence(DESCRIPTOR, block.observation, 100, CATALOG, original_tx)
         )
         finish = asyncio.Event()
         connections, notices, authentications = [], [], []
@@ -987,7 +1284,7 @@ def test_open_reconnects_after_funding_outlives_control_setup(monkeypatch):
 
 
 def test_unsent_run_is_not_admitted_when_control_is_lost_before_submission():
-    """MPPI-38/41: a run registered but never sent must not stay pending."""
+    """A run registered but never sent must not stay pending."""
 
     async def scenario():
         client = component_client()
@@ -998,6 +1295,7 @@ def test_unsent_run_is_not_admitted_when_control_is_lost_before_submission():
             identities={DESCRIPTOR.provider_id: SimpleNamespace(catalog=CATALOG)},
         )
         client.chain.snapshot = lambda: current
+        client.chain.current = current  # Requests read the last confirmed publication.
         client._open = AsyncMock(return_value=SimpleNamespace(session=object()))
 
         async def persist():
@@ -1048,13 +1346,14 @@ def test_attachment_waits_briefly_for_a_lagging_rpc_to_reach_the_snapshot_block(
         )
         message.chain_block_number = 2
         message.chain_block_hash = newer_block.observation.block_hash
-        client.chain.reader.block.return_value = newer_block
-        behind, caught_up = SimpleNamespace(**vars(old)), SimpleNamespace(**vars(old))
+        caught_up = SimpleNamespace(**vars(old))
         caught_up.block = newer_block
-        client.chain.refresh = AsyncMock(side_effect=[behind, caught_up])
+        client.chain.refresh_at = AsyncMock(
+            side_effect=[ChainLagError("RPC has not served that block yet"), caught_up]
+        )
         deliver_snapshot(client, message)
         await client._attach(b"t" * 32, require_ready=False)
-        assert client._attached_generation == 2 and client.chain.refresh.await_count == 2
+        assert client._attached_generation == 2 and client.chain.refresh_at.await_count == 2
 
     asyncio.run(scenario())
 

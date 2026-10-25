@@ -395,7 +395,7 @@ def low_voucher_ledger(count: int) -> Ledger:
 
 
 def test_coverage_computed_before_another_streams_final_is_superseded_not_fatal() -> None:
-    """MPPI-40: Complete's Terminal can be applied before an older Control request.
+    """Complete's Terminal can be applied before an older Control request.
 
     The provider computed run 1's rows while run 0 was still preparing (only the
     candidate's bound); run 0's Terminal then arrived first on its own stream.

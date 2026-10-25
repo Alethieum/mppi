@@ -1,5 +1,71 @@
 # MPPI agent SDK for Python
 
+Version `0.1.4` keeps the wire protocol, contract, signatures and payment
+semantics and works with the providers running `0.1.2`. It reads the chain in
+a few batched round trips over kept-alive connections, and resolves outcomes
+that `0.1.3` left uncertain:
+
+- each chain lookup is one request: a refresh is one batch around one
+  Multicall3 call anchored to its block, and opening, top-up and close are each
+  proved by their transaction's receipt and event. Arc blocks are final, so
+  none is re-read. A mined transaction whose call did not take effect is
+  `FAILED` with its cause, and a retried top-up resends the same authorization
+  while it is valid;
+- requests within an attached session read no chain: a slow or unreachable
+  RPC no longer refuses them with `CHAIN_STATE_STALE`. They use the confirmed
+  deposit, accepted prices and attachment; opening, attachment, top-up, close
+  and accepting new prices refresh first when evidence is older than
+  `max_age_ms`. The built-in client polls once a minute, and a failed
+  background refresh reaches the error hook. A refresh that finds evidence
+  contradicting the deployment (another chain, code, implementation or
+  signing domain, or state going backwards) stops requests with
+  `INCONSISTENT_STATE` until a later refresh is accepted;
+
+- each step reads everything it needs at one block in one JSON-RPC batch.
+  Top-up and close repeat no whole refresh; an attachment reads only its
+  session once the follower has reached the provider's block, and everything
+  at that block otherwise, as a new session's first attachment does. Fixed
+  facts (the chain id, deployed code, the Circle CLI and wallet selection) are
+  read once, implementation slots every time;
+- any Circle Agent Wallet account generation works: no account code is pinned.
+  Before submitting an opening, the agent checks in one read that the registry
+  binds its agent id to the wallet and that USDC would accept the signature,
+  and otherwise raises `FundingAuthorizationError` (`reason`
+  `AGENT_ID_REQUIRED`, `AGENT_WALLET_MISMATCH` or `INVALID_SIGNATURE`) with
+  nothing sent; a top-up relies on its opening's proof. A wallet whose service
+  signs as it executes declares `signs_at_execute = True`: the opening then
+  checks only the binding and hands the placeholder to `execute`, and an
+  undeclared all-zero placeholder is `SIGNATURE_DEFERRED_UNDECLARED`. Funding
+  now requires `Client(..., agent_id=...)`; exits do not;
+- a timed-out read is repeated once; a reported cooperative close whose proof
+  cannot be read yet is `PENDING` with its transaction, and calling
+  `sessions.close` again proves it without a second close request;
+- a wallet call the adapter proves never reached its service is `FAILED`, with
+  `cause` beginning `NotSubmittedError`; the next `sessions.open` sends the same
+  intent again while its authorization is valid. An uncertain opening is
+  `FAILED` once its authorization has expired with no session funded;
+- a request the provider refuses before admission is recorded never admitted,
+  so a cleanly closed session shuts down with nothing unresolved;
+- a plain low-credit notice never replaces an undelivered shortfall, and a
+  top-up confirmed while Control reattaches renews vouchers once attached;
+- integrations read a session's accepted prices (`sessions.terms`) and a run's
+  outcome (`sessions.run`) through public types instead of client internals.
+  `Hooks(on_timing=...)` reports where each opening, top-up and close spent
+  its time: chain reads, the wallet's signing and submission, and the rest.
+
+Composed integrations keep the `ChainReader`, `ChainFollower` and `Client`
+constructors and `FundingNotice`; new fields and methods are additive. Three
+interfaces changed: `OpeningEvidence` and `ClosingEvidence` carry a
+`ChainObservation` as `observation` instead of `block`;
+`ChainReader.agent_wallet(agent_id, observation)` takes one too; and
+`CircleAgentWallet(chain=..., address=..., checkpoint_path=...)` takes the
+wallet address instead of account pins, so `supported_account_pins` is gone.
+A follower passed to `Client` keeps its own `on_refresh_failure`; give it
+`poll_interval_ms=max_age_ms` for the built-in cadence.
+
+Do not downgrade to `0.1.3` over a checkpoint that holds a close not yet proven,
+or over a Circle wallet journal `0.1.4` has rewritten (format 2).
+
 Version `0.1.3` keeps the wire protocol, contract, signatures and payment
 semantics of `0.1.2` and works with the providers running `0.1.2`. It changes
 how the client survives concurrency, rate limits and lagging RPCs:
@@ -19,16 +85,9 @@ how the client survives concurrency, rate limits and lagging RPCs:
 - settled runs are forgotten, so the payment checkpoint stays bounded. It is
   written as format 2; do not downgrade to `0.1.2` over it.
 
-Known in `0.1.3`, planned for `0.1.4`:
-
-- `on_low_credit` receives fewer notices than in `0.1.2`: only shortfalls the
-  deposit cannot cover and plain low-credit notices, coalesced to the latest
-  undelivered one.
-- While a funding callback is running, a newer plain notice can replace an
-  undelivered shortfall, which then arrives without its amount. The provider
-  re-sends coverage while the requirement stands.
-- A top-up confirmed while Control is reattaching renews vouchers at the next
-  Meter rather than at once. Nothing stalls.
+Since `0.1.3`, `on_low_credit` receives fewer notices than in `0.1.2`: only
+shortfalls the deposit cannot cover and plain low-credit notices, coalesced to
+the latest undelivered one.
 
 Version `0.1.2` supports explicit Arc mainnet and testnet selection with built-in Circle CLI onboarding and
 `Client.from_config(...)`. See the
@@ -56,10 +115,12 @@ The result is six-decimal USDC base units. This calculation transfers no funds.
 The caller selects funding; actual usage retains its individual accepted rates.
 
 Construct `Client(provider, wallet=..., signer=..., chain=..., contract=...,
-checkpoint_path=..., signer_reference=..., initial_session_tokens=...)` with
+checkpoint_path=..., signer_reference=..., initial_session_tokens=..., agent_id=...)` with
 the shared `ChainFollower` and `ContractCalls` configured for the verified
 deployment. The funding wallet and fixed ECDSA signer are distinct capabilities.
 The caller supplies wallet integration; no login or key creation is implicit.
+Funding requires `agent_id`, the ERC-8004 identity the registry binds to the
+funding wallet.
 
 - `sessions.open(provider, model=..., initial_session_tokens=...)` explicitly
   prewarms a positively funded session. `chat.completions.create(...)` can open
@@ -71,6 +132,12 @@ The caller supplies wallet integration; no login or key creation is implicit.
   catalog for subsequent runs. Active and historical runs keep their prices.
 - `sessions.topUp(session_id, amount)` takes positive USDC base units. Funding
   is explicit; low-credit guidance never triggers a wallet transfer.
+- `sessions.terms(session_id)` returns the session's accepted catalogs by
+  rate-card hash, its initial one and the provider's current one
+  (`SessionTerms.rates(model)`). `sessions.run(session_id, run_id)` returns a
+  retained run's `RunOutcome`: its signed prices, accepted counts, charge and
+  `RunOutcomeStatus` (`PENDING`, `COMPLETED`, `FAILED`, `CANCELLED` or
+  `NOT_ADMITTED`, which the provider never held). Neither reads the chain.
 - `Client(..., on_low_credit=callback)` delivers funding notices to caller
   code outside the Control event loop, as a detached `pb.LowCredit`. A
   provider's `LowCredit` both asks for a voucher and signals low funding: the

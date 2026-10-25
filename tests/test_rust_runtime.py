@@ -18,14 +18,20 @@ document interval mining used to keep the independently observed head fresh.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import http.client
+import http.server
 import importlib.util
 import json
 import os
 import socket
 import ssl
 import subprocess
+import threading
 import time
+from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import grpc
 import pytest
@@ -62,6 +68,8 @@ COMMON = importlib.util.module_from_spec(COMMON_SPEC)
 COMMON_SPEC.loader.exec_module(COMMON)
 RUST = Path(__file__).resolve().parents[1] / "sdks/provider/rust"
 MODEL, CATALOG = COMMON.MODEL, COMMON.CATALOG
+AGENT_ID = 43  # Its registry entry binds the agent wallet, as the provider checks.
+MULTICALL3 = bytes.fromhex("ca11bde05977b3631167028862be2a173976ca11")
 
 # Whitespace and Unicode make reserialization observable in the upstream log.
 REQUEST = (
@@ -75,6 +83,88 @@ CHUNKS = (
     b'{"choices":[],"usage":{"prompt_tokens":4510,"completion_tokens":910,'
     b'"total_tokens":5420,"prompt_tokens_details":{"cached_tokens":0}}}',
 )
+
+
+class RpcMeter:
+    """Relays the agent's chain reads to Anvil and records each HTTP round trip.
+
+    A round trip is one HTTP request and its response. Sequential round trips
+    are the longest chain of requests that each start after the previous one
+    ended, so concurrent requests count once. Connections are the distinct TCP
+    connections those requests used.
+    """
+
+    def __init__(self, upstream: str) -> None:
+        target = urlsplit(upstream)
+        meter = self
+        self.lock = threading.Lock()
+        self.records: list[tuple[int, float, float, tuple[str, ...]]] = []
+        self.accepted = 0
+
+        class Relay(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                super().setup()
+                with meter.lock:
+                    meter.accepted += 1
+                    self.number = meter.accepted
+                self.upstream = http.client.HTTPConnection(target.hostname, target.port, timeout=10)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                started = time.monotonic()
+                self.upstream.request(
+                    "POST", target.path or "/", body, {"Content-Type": "application/json"}
+                )
+                response = self.upstream.getresponse()
+                data = response.read()
+                ended = time.monotonic()
+                calls = json.loads(body)
+                methods = tuple(
+                    call["method"] for call in (calls if isinstance(calls, list) else [calls])
+                )
+                with meter.lock:
+                    meter.records.append((self.number, started, ended, methods))
+                self.send_response(response.status)
+                self.send_header("Content-Type", response.getheader("Content-Type", ""))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def finish(self) -> None:
+                super().finish()
+                self.upstream.close()
+
+            def log_message(self, *_: object) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def mark(self) -> int:
+        with self.lock:
+            return len(self.records)
+
+    def summary(self, mark: int) -> dict:
+        with self.lock:
+            records = self.records[mark:]
+        sequential, last = 0, float("-inf")
+        for _, started, ended, _ in sorted(records, key=lambda record: record[2]):
+            if started >= last:
+                sequential, last = sequential + 1, ended
+        return {
+            "sequential_round_trips": sequential,
+            "requests": len(records),
+            "connections": len({record[0] for record in records}),
+            "calls": dict(Counter(method for record in records for method in record[3])),
+        }
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def tls_context(directory: Path) -> ssl.SSLContext:
@@ -293,6 +383,14 @@ def deploy(node, origin: str) -> tuple[dict, bytes, str]:
         ),
     )
     node.send(node.deployer, registry, registry_artifact.call("setURI", (42, origin + "/discover")))
+    # The agent's own identity: funding needs an agent id bound to its wallet.
+    node.send(
+        node.deployer,
+        registry,
+        registry_artifact.call(
+            "setProvider", (AGENT_ID, node.agent.address, node.agent.address, b"")
+        ),
+    )
     timelock = node.deploy(
         Artifact("TimelockController"), (60, [node.deployer.address], [bytes(20)], bytes(20))
     )
@@ -308,6 +406,9 @@ def deploy(node, origin: str) -> tuple[dict, bytes, str]:
     )
     template = node.deploy(token)
     node.call("anvil_setCode", [hx(USDC), node.call("eth_getCode", [hx(template), "latest"])])
+    # Snapshots read through Multicall3's interface at its canonical address.
+    stand_in = node.deploy(Artifact("TestMulticall3"))
+    node.call("anvil_setCode", [hx(MULTICALL3), node.call("eth_getCode", [hx(stand_in), "latest"])])
     node.send(node.deployer, USDC, token.call("mint", (node.agent.address, 5_510_000)))
 
     def pin(address: bytes) -> dict:
@@ -407,6 +508,28 @@ def reject_first_meter():
     return lambda: setattr(Ledger, "apply_meter", original), rejected
 
 
+@contextlib.contextmanager
+def multicall_stand_in(node):
+    """The agent's one-time Multicall3 code check accepts the test stand-in."""
+    import mppi_protocol.chain as chain_module
+
+    original = chain_module._MULTICALL3_CODE_HASH
+    code = raw(node.call("eth_getCode", [hx(MULTICALL3), "latest"]))
+    chain_module._MULTICALL3_CODE_HASH = keccak(code)
+    try:
+        yield
+    finally:
+        chain_module._MULTICALL3_CODE_HASH = original
+
+
+@contextlib.contextmanager
+def meter_closed(meter: RpcMeter):
+    try:
+        yield meter
+    finally:
+        meter.close()
+
+
 def paid_agent(
     node, origin: str, profile: dict, directory: Path, recovery: bool = False, mode: str = ""
 ) -> dict:
@@ -415,29 +538,46 @@ def paid_agent(
     )
     signer = LocalSessionSigner((7).to_bytes(32, "big"))
     assert wallet.address != signer.address
-    reader = ChainReader(HttpJsonRpc(node.endpoint), profile_from_mapping(profile))
+    meter = RpcMeter(node.endpoint)
+    reader = ChainReader(HttpJsonRpc(meter.endpoint), profile_from_mapping(profile))
+    # No background refresh runs during the test (its first poll is ten minutes
+    # away), so each metered window holds only the reads of the step it brackets.
     follower = ChainFollower(
-        reader, max_age_ms=10000, collection_margin_ms=60000, poll_interval_ms=100
+        reader, max_age_ms=600_000, collection_margin_ms=60000, poll_interval_ms=600_000
     )
-    with Client(
-        origin,
-        wallet=wallet,
-        signer=signer,
-        chain=follower,
-        contract=ContractCalls(reader.profile.domain, "USDC", "2"),
-        checkpoint_path=directory / "agent-checkpoint.json",
-        signer_reference="fixture:distinct-public-session-key",
-        initial_session_tokens=5510,
-        ca_file=str(directory / "ca.pem"),
-        timeout_ms=15000,
-        request_timeout_ms=30000,
-    ) as client:
+    with (
+        multicall_stand_in(node),
+        meter_closed(meter),
+        Client(
+            origin,
+            wallet=wallet,
+            signer=signer,
+            chain=follower,
+            contract=ContractCalls(reader.profile.domain, "USDC", "2"),
+            checkpoint_path=directory / "agent-checkpoint.json",
+            signer_reference="fixture:distinct-public-session-key",
+            initial_session_tokens=5510,
+            agent_id=AGENT_ID,
+            ca_file=str(directory / "ca.pem"),
+            timeout_ms=15000,
+            request_timeout_ms=30000,
+        ) as client,
+    ):
+        mark = meter.mark()
         opened = client.sessions.open(origin, model=MODEL)
+        opening = meter.summary(mark)
+        # Each sequential chain read costs the agent one network round trip: the
+        # first snapshot, the funding check, the opening's receipt and the
+        # attachment's read at the provider's block, over one kept-alive
+        # connection. Before batching it was 108 on 108 connections.
+        assert opening["sequential_round_trips"] <= 4, opening
+        assert opening["connections"] == 1, opening
         assert opened.operation.state is OperationState.CONFIRMED
         assert opened.session is not None and opened.session.readiness.ready
         identifier = opened.session.session_id
         assert opened.session.deposit == 5_510_000
         restore, rejected = reject_first_meter() if mode == "rejected-meter" else (None, None)
+        mark = meter.mark()
         try:
             with client.chat.completions.create_raw(REQUEST, model=MODEL, stream=True) as stream:
                 # A rejected Meter mid-run must not end Control while the run is
@@ -459,6 +599,12 @@ def paid_agent(
         while (receipt := stream.receipt) is None:
             assert time.monotonic() < deadline, "Control receipt was not delivered"
             time.sleep(0.02)
+        streamed = meter.summary(mark)
+        if mode != "rejected-meter":  # Its re-sync may read once to reattach.
+            # The request reads no chain. In the background, never gating it, the
+            # agent proves its Receipt's settled total: the block, the session at
+            # it, and the block again. No refresh (its batch reads the slots).
+            assert streamed["calls"] == {"eth_getBlockByNumber": 2, "eth_call": 1}, streamed
         for field in (
             "session_id",
             "run_id",
@@ -505,7 +651,10 @@ def paid_agent(
         assert state.status is SessionStatus.OPEN
         view = client.sessions.get(identifier)
         assert view.usage_amount == 5_420_000 and view.accepted_authorization == 5_510_000
+        mark = meter.mark()
         closed = client.sessions.close(identifier)
+        closing = meter.summary(mark)
+        assert closing["sequential_round_trips"] <= 1, closing  # The close's receipt.
         assert closed.state is OperationState.CONFIRMED
         state = reader.session(identifier, reader.block())
         assert state.status is SessionStatus.CLOSED and state.settled_cumulative == 5_420_000
@@ -518,6 +667,8 @@ def paid_agent(
         "usage": view.usage_amount,
         "wallet_submissions": wallet.submissions,
         "funding_authorizations": wallet.authorization_count,
+        "opening_reads": opening,
+        "closing_reads": closing,
     }
 
 

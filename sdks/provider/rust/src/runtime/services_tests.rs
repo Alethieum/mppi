@@ -313,7 +313,7 @@ async fn atomic_admission_rejects_expired_authorization_before_reserving() {
             .inner
             .attempt_admission_before(&run, counts(1000), None)
             .unwrap(),
-        Admission::Wait(_)
+        Admission::Authorizing
     ));
     let deadline = Instant::now() + Duration::from_millis(10_000);
     tokio::time::advance(Duration::from_millis(10_001)).await;
@@ -330,4 +330,210 @@ async fn atomic_admission_rejects_expired_authorization_before_reserving() {
     assert!(matches!(stored.phase, RunPhase::Preparing));
     assert_eq!(stored.accounting.remaining_numerator(), U256::ZERO);
     assert!(!run.stop.is_cancelled());
+}
+
+/// The first run needs this many output tokens; every later one needs 1,000.
+struct SteadyLoad(u64);
+#[tonic::async_trait]
+impl CoverageProvider for SteadyLoad {
+    async fn coverage(
+        &self,
+        _: &PreparedRequest,
+        context: &RunContext,
+    ) -> IntegrationResult<TokenCounts> {
+        Ok(counts(if context.run_id() == hash(1) {
+            self.0
+        } else {
+            1000
+        }))
+    }
+}
+impl ExecutionProvider for SteadyLoad {
+    fn execute(
+        &self,
+        _: PreparedRequest,
+        _: RunContext,
+        _: Arc<dyn ProviderRuns>,
+        _: CancellationToken,
+    ) -> ExecutionStream {
+        Box::pin(PendingOutput) // Admitted runs keep streaming and reserving.
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_runs_are_admitted_in_the_order_they_first_waited_under_steady_load() {
+    use proto::chat_server::Chat;
+    // The agent answers each coverage request one round trip later, signing
+    // exactly its target, while a new run arrives every round trip.
+    const RTT: Duration = Duration::from_millis(100);
+    let mut fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    {
+        let runtime = Arc::get_mut(&mut fixture.provider.inner).unwrap();
+        runtime.coverage = Arc::new(SteadyLoad(3000));
+        runtime.execution = Arc::new(SteadyLoad(3000));
+    }
+    fixture.voucher(1);
+    let sid = fixture.sid;
+    let queue = fixture.provider.inner.lock().unwrap().attachments[&1]
+        .queue
+        .clone();
+    let asked = Arc::new(Mutex::new(BTreeMap::<Vec<u8>, usize>::new()));
+    let agent = {
+        let (provider, asked) = (fixture.provider.clone(), asked.clone());
+        tokio::spawn(async move {
+            while let Ok(bytes) = queue.get().await {
+                let message = proto::ControlMessage::decode(bytes.as_slice()).unwrap();
+                let Some(proto::control_message::Kind::LowCredit(notice)) = message.kind else {
+                    continue;
+                };
+                let request = notice.coverage_request.unwrap();
+                let tokens = request
+                    .required_by_price
+                    .iter()
+                    .map(|row| row.output_tokens.unwrap())
+                    .sum::<u64>();
+                *asked
+                    .lock()
+                    .unwrap()
+                    .entry(request.run_id.unwrap())
+                    .or_default() += 1;
+                let provider = provider.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(RTT).await;
+                    let target = tokens.div_ceil(1000);
+                    {
+                        let mut state = provider.inner.lock().unwrap();
+                        let session = state.sessions.get_mut(&sid).unwrap();
+                        if session.voucher.as_ref().and_then(|v| v.cumulative) < Some(target) {
+                            session.voucher = Some(proto::Voucher {
+                                session_id: Some(sid.to_vec()),
+                                cumulative: Some(target),
+                                signature: Some(sign(&Voucher {
+                                    sessionId: sid,
+                                    cumulativeAmount: target,
+                                })),
+                            });
+                        }
+                    }
+                    provider.inner.changed.notify_waiters();
+                });
+            }
+        })
+    };
+    let start = Instant::now();
+    let calls = (1..=21u8)
+        .map(|id| {
+            let arrival = match id {
+                1 => start,
+                _ => start + Duration::from_millis(10) + RTT * u32::from(id - 2),
+            };
+            let (provider, request) = (fixture.provider.clone(), fixture.request(id));
+            tokio::spawn(async move {
+                tokio::time::sleep_until(arrival).await;
+                let response = provider.completions(tonic::Request::new(request)).await;
+                (arrival, Instant::now(), response)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut admitted = Vec::new();
+    let mut streams = Vec::new(); // Dropping one would cancel its run.
+    for call in calls {
+        let (arrival, at, response) = call.await.unwrap();
+        assert!(
+            response.is_ok(),
+            "a run was refused after {:?}",
+            at - arrival
+        );
+        admitted.push((at - arrival, at));
+        streams.push(response);
+    }
+    agent.abort();
+    for (index, (wait, _)) in admitted.iter().enumerate() {
+        assert!(*wait <= 2 * RTT, "run {} waited {wait:?}", index + 1);
+    }
+    assert!(admitted.windows(2).all(|pair| pair[0].1 < pair[1].1));
+    // The first run's target never moved, so it was asked for only once.
+    assert_eq!(asked.lock().unwrap()[hash(1).as_slice()], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_covered_run_behind_a_silent_head_is_admitted_within_its_turn() {
+    use proto::chat_server::Chat;
+    // Nobody answers the first run's coverage request, as when an agent will
+    // not sign it. Later runs the voucher covers must not wait on it for long,
+    // and must never fail for it.
+    let mut fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    {
+        let runtime = Arc::get_mut(&mut fixture.provider.inner).unwrap();
+        runtime.coverage = Arc::new(SteadyLoad(9000));
+        runtime.execution = Arc::new(SteadyLoad(9000));
+    }
+    fixture.voucher(5);
+    let start = Instant::now();
+    let calls = [(1u8, 0u64), (2, 0), (3, 1), (4, 1000), (5, 5000)].map(|(id, delay)| {
+        let (provider, request) = (fixture.provider.clone(), fixture.request(id));
+        let arrival = start + Duration::from_millis(delay);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(arrival).await;
+            let response = provider.completions(tonic::Request::new(request)).await;
+            (arrival, Instant::now(), response)
+        })
+    });
+    let mut results = Vec::new();
+    for call in calls {
+        results.push(call.await.unwrap());
+    }
+    let (_, _, head) = &results[0];
+    let error = head
+        .as_ref()
+        .err()
+        .expect("the silent head is never covered");
+    assert_eq!(reason(error).as_deref(), Some("AUTHORIZATION_REQUIRED"));
+    for (index, (arrival, at, response)) in results.iter().enumerate().skip(1) {
+        assert!(response.is_ok(), "covered run {} failed", index + 1);
+        let waited = *at - *arrival;
+        assert!(
+            waited <= Duration::from_millis(2050),
+            "run {} waited {waited:?}",
+            index + 1
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn control_loss_ends_every_run_waiting_in_the_queue_at_once() {
+    use proto::chat_server::Chat;
+    let mut fixture = Fixture::new(1000).await; // 1,000 output tokens cost one unit.
+    {
+        let runtime = Arc::get_mut(&mut fixture.provider.inner).unwrap();
+        runtime.coverage = Arc::new(SteadyLoad(9000));
+        runtime.execution = Arc::new(SteadyLoad(9000));
+    }
+    fixture.voucher(5);
+    let calls = [1u8, 2].map(|id| {
+        let (provider, request) = (fixture.provider.clone(), fixture.request(id));
+        tokio::spawn(async move { provider.completions(tonic::Request::new(request)).await })
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // Head waits, the next defers.
+    let lost = Instant::now();
+    {
+        let mut state = fixture.provider.inner.lock().unwrap();
+        fixture.provider.inner.detach_locked(&mut state, 1);
+    }
+    for call in calls {
+        let error = call
+            .await
+            .unwrap()
+            .err()
+            .expect("no run is admitted after Control loss");
+        assert_eq!(reason(&error).as_deref(), Some("CONTROL_NOT_READY"));
+    }
+    assert!(Instant::now() - lost <= Duration::from_millis(100));
+    let state = fixture.provider.inner.lock().unwrap();
+    assert!(
+        state.sessions[&fixture.sid]
+            .runs
+            .values()
+            .all(|run| run.waiting().is_none())
+    );
 }

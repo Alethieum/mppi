@@ -386,6 +386,7 @@ impl Runtime {
                     unresolved: item.admitted && accounting.final_status().is_none(),
                     retained_bytes: 0,
                     last_low_credit: None,
+                    queued: None,
                 },
             );
         }
@@ -642,9 +643,12 @@ impl Runtime {
 }
 
 impl Mppi {
+    /// `current`: the host asserts this evidence is the session's current
+    /// history (`ProviderSessions::recover_current`).
     pub(super) async fn recover_evidence(
         &self,
         evidence: RecoveryEvidence,
+        current: bool,
     ) -> IntegrationResult<SessionView> {
         let runtime = &self.inner;
         runtime.check_recovery_limits(&evidence)?;
@@ -661,7 +665,8 @@ impl Mppi {
                 return Err(Status::resource_exhausted("session retention limit").into());
             }
         }
-        let candidate = runtime.restore_history(&evidence).await?;
+        let mut candidate = runtime.restore_history(&evidence).await?;
+        candidate.admissions_known = current;
         runtime.chain.watch_session(sid).await?;
         let mut state = runtime.lock()?;
         let current = runtime.snapshot_locked(&state)?;

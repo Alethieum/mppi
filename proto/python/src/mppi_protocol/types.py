@@ -1,6 +1,6 @@
 """Shared SDK value records. Structural validity is not verified chain evidence."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 
 from .amounts import TokenCounts, uint64
@@ -192,11 +192,15 @@ class SessionOperationOutcome:
     target_covered: bool | None = None
     settlement_reference: ConfirmedSettlementRef | None = None
     failure: PaymentFailure | None = None
+    # The session's deposit after a proven opening or top-up, from its event.
+    deposit: int | None = None
 
     def __post_init__(self) -> None:
         fixed_bytes(self.session_id, 32, field="session_id")
         if self.target is not None:
             uint64(self.target, field="target")
+        if self.deposit is not None:
+            uint64(self.deposit, field="deposit", positive=True)
         if self.target_covered is not None and type(self.target_covered) is not bool:
             raise ValidationError(
                 ValidationCode.INVALID_VALUE, "target_covered must be a boolean when present"
@@ -218,10 +222,15 @@ class OperationResult:
     tx_hash: bytes | None = None
     observation: ChainObservation | None = None
     sessions: tuple[SessionOperationOutcome, ...] = ()
+    # Why a wallet call ended this way: the kind of error an adapter raised,
+    # SDK-written, never remote text. Diagnostic only; not part of equality.
+    cause: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.operation_ref) is not str or not self.operation_ref:
             raise ValidationError(ValidationCode.INVALID_VALUE, "operation_ref is required")
+        if self.cause is not None and (type(self.cause) is not str or not self.cause):
+            raise ValidationError(ValidationCode.INVALID_VALUE, "invalid operation cause")
         if not isinstance(self.state, OperationState):
             raise ValidationError(ValidationCode.INVALID_VALUE, "unknown operation state")
         if self.tx_hash is not None:

@@ -104,6 +104,16 @@ backend. Missing or contradictory evidence fails without replacing live state.
 Recovery never restarts execution or restores an old Control stream's authority.
 Unresolved runs retain their reservations until definitive provider reports.
 
+A reconnect may name a pending run this provider never held: the agent records
+a run before its Complete arrives. When every admission is known, the snapshot
+answers it `NOT_ADMITTED` and records nothing. Every admission is known for a
+session this runtime opened, or one restored with
+`await sdk.sessions.recover_current(evidence)`. After `recover` such a run
+refuses the attachment instead: an older checkpoint may lack a run that was
+admitted and served. Use `recover_current` only if your host checkpoints durably
+after every admission and before dispatch, and never restores a checkpoint
+older than its newest.
+
 Before the first authenticated attachment, a known unused opening can be
 exported and recovered at generation zero in private `RecoveryEvidence`.
 It has no accepted voucher, usage, runs or reservations and is never ready.
@@ -133,6 +143,7 @@ with Client(
     checkpoint_path=Path("agent-state/provider.json"),
     signer_reference="wallet-service/session-key-reference",
     initial_session_tokens=1_000_000,
+    agent_id=agent_id,  # Required to fund; the registry must bind it to the wallet.
 ) as client:
     with client.chat.completions.create(
         model="example/model",
@@ -171,9 +182,11 @@ keys or prompts. Its size stays bounded in a long session: a run is forgotten
 once its final and final Meter are applied, its stream has ended and its
 Receipt was verified (or a snapshot resolved it, the session closed, or 1,024
 settled runs already wait for Receipts). Usage stays exact in per-price totals,
-and one run per price is kept as signed price acceptance. `mppi-agent` 0.1.3
-writes this checkpoint as format 2 and still reads format 1; 0.1.2 refuses
-format 2, so do not downgrade over a checkpoint 0.1.3 has written. Failure to retain required intent stops submission/signing.
+and one run per price is kept as signed price acceptance. Since 0.1.3,
+`mppi-agent` writes this checkpoint as format 2 and still reads format 1; 0.1.2
+refuses format 2, so do not downgrade over a checkpoint 0.1.3 or later has
+written. A 0.1.4 checkpoint can also hold a reported close not yet proven,
+which 0.1.3 would not know: do not downgrade over it either. Failure to retain required intent stops submission/signing.
 Wallet-service credentials and durable transaction idempotency remain in the
 wallet adapter. A changed signer never silently opens a second funded session.
 
@@ -188,7 +201,16 @@ reference; recovery never creates a replacement deposit.
 `client.sessions.open` supports explicit positive pre-warming. `topUp` uses raw
 positive USDC base units. `sessions.close` requests cooperative close; transaction
 exits retain `requestClose`, `withdraw` and `releaseIdle`. Inspect operation
-states and reconcile original references after uncertainty. `stream.close()`
+states and reconcile original references after uncertainty. An
+`OperationResult` keeps the kind of error a wallet call raised as `cause`
+(SDK-written, never remote text), and the same goes to `on_error`. A wallet
+adapter raises `NotSubmittedError` only when its own durable record proves the
+call never reached its service; the result is then `FAILED` and the call may be
+sent again. Any other wallet error leaves the result `UNKNOWN`. A request the
+provider refuses before admission (`INSUFFICIENT_DEPOSIT`, or
+`SESSION_NOT_READY` for `AUTHORIZATION_REQUIRED` or `PRICE_CHANGED`) raises
+`PaymentError` and is recorded never admitted, so it does not stay unresolved
+after the session closes. `stream.close()`
 cancels that request, and `client.close()` releases local resources while
 preserving unresolved evidence. Neither implicitly closes escrow.
 
@@ -198,6 +220,13 @@ close first establishes authenticated Control. A canonical close above validated
 usage raises `CloseAccountingError` with its confirmed operation result; the
 client retains that evidence and never treats the discrepancy as a failed
 transaction to resubmit.
+
+The client retains the provider's close report before proving it on chain. If
+that proof cannot be read yet, `sessions.close` returns `PENDING` with the close
+transaction instead of failing. Calling `sessions.close(session_id)` again, or
+`sessions.reconcile("close-" + session_id.hex())`, proves the same close; it never
+sends a second close request. Only the canonical event and state make it
+`CONFIRMED`.
 
 ## Fresh chain state
 
@@ -215,17 +244,21 @@ outside the accounting lock, then rechecks ownership, readiness and the deposit
 bound. Covered vouchers use the cache. Execution continues under its existing
 funded limit while refresh is pending; a denied grant still terminates the run.
 
-**Read cost.** One refresh for one provider and one session makes 24 RPC
-requests (22 on the first): the new head (2), the previous head again (2), the
-deployment's code, implementation slots and signing domain (10), the pause level
-(1), the provider identity and catalog (6), the session (1) and the head once
-more (2). Each further watched session adds 1. With the default
-`max_age_ms // 4` poll, a 60 s freshness limit polls every 15 s, about 1.6
-requests per second per client. An agent's Receipt costs 5 requests only for the
-first Receipt carrying a given provider block observation; later Receipts with
-that observation reuse the total this agent read itself. A Receipt or Terminal
-with a settlement reference adds 8. JSON-RPC batches do not reduce what most
-paid plans count.
+**Read cost.** Arc commits each block with final, irreversible settlement
+([deterministic finality](https://docs.arc.io/arc/concepts/deterministic-finality)),
+so no earlier block is re-read. A refresh is one round trip: one JSON-RPC batch
+with the latest header, one Multicall3 `aggregate3` call reading the pause level,
+each watched provider's registry entry and each watched session, and the two
+implementation slots. The multicall's own block number, time and parent hash
+must match the header; views that ran at another block, as through an adapter
+that sends one call at a time, must match that block's header, read by number
+in one more round trip. The first refresh also checks the chain id, the pinned
+contracts' code and Multicall3's code; without verified Multicall3 code a
+refresh is two round trips. Opening, top-up and close are each proved by one
+transaction receipt holding the contract's own event; a mined transaction
+without that event is a definite failure, never unknown. A settlement also
+reads the session at its block. JSON-RPC batches do not reduce what most paid
+plans count.
 
 A failed refresh is repeated once, 250 ms later, before it fails closed, and
 `last_refresh_failure` keeps the last failure's error class, SDK reason and
@@ -237,7 +270,18 @@ never extended. A different block at an accepted height still fails.
 
 `snapshot()` returns fresh evidence or fails; `current` exposes the last evidence
 for accounting even when stale. `readiness(session_id)` checks positive existence,
-status, pause and the collection margin. A pending transaction extends no
+status, pause and the collection margin on fresh evidence; a provider admits on
+it. `confirmed_readiness(session_id)` applies the same rules to the last accepted
+evidence whatever its age: an agent's requests within an attached session use it
+and read no chain. Deposits and activity only grow, so older evidence only
+understates the deposit and the collection deadline. A refresh that finds
+evidence contradicting the pinned deployment or accepted evidence
+(`ChainContradictionError`: another chain id, deployed code, implementation or
+signing domain, or a changed or regressed block or session) holds it at
+`INCONSISTENT_STATE` until a later refresh is accepted; unavailable, rate-limited,
+lagging or timed-out reads never do. The agent refreshes before
+opening, attachment, top-up and close when its evidence is older than
+`max_age_ms`, and `on_refresh_failure` reports a failed background refresh. A pending transaction extends no
 deposit or deadline. The observer requires an RPC supporting EIP-1898 canonical
 block-hash reads, and retains the existing RPC-honesty trust assumption.
 
@@ -352,9 +396,15 @@ runtime must retain prior confirmed results and reject observation regressions.
 outside the gRPC I/O loop. `HttpJsonRpc` is a bounded read-only adapter: no wallet
 submissions or redirects. Its methods only read, so it repeats a transient
 failure up to twice, 250 ms and then 1 s later: HTTP 408, 425, 429, 500, 502,
-503 or 504, a refused or dropped connection, or JSON-RPC error -32005 or -32007
-(rate limits) or -32014 (a backend that has not imported the block yet). A timeout or any other failure is not repeated, and a repeat
-starts only within one transport timeout of the first attempt. TLS verifies certificate and host;
+503 or 504, a refused or dropped connection, a timeout, or JSON-RPC error -32005
+or -32007 (rate limits) or -32014 (a backend that has not imported the block
+yet), including one entry of a batch. Any other failure is not repeated. Repeats
+start within one transport timeout plus those delays of the first attempt, so a
+timed-out attempt is repeated once; by default each attempt is bounded at 5 s.
+It keeps connections alive and sends the reads one step needs as one JSON-RPC
+batch of at most 32 calls; an endpoint that answers a batch with a single object,
+or refuses a batch request and then serves a single call, is read one call at a
+time. TLS verifies certificate and host;
 `HttpTransport(ca_file=...)` can trust a provider's private CA. Its timeout bounds
 individual blocking I/O operations, not an entire SDK operation's lifetime.
 

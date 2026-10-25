@@ -50,7 +50,10 @@ def retention_client(path: Path) -> Client:
     state = ChainSession(DEPOSIT, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
     current = SimpleNamespace(sessions={ledger.session_id: state})
     client.chain = SimpleNamespace(
-        current=current, snapshot=lambda: current, readiness=lambda _=None: Readiness(True)
+        current=current,
+        snapshot=lambda: current,
+        readiness=lambda _=None: Readiness(True),
+        confirmed_readiness=lambda _=None: Readiness(True),
     )
     client.contract = SimpleNamespace(domain=DOMAIN)
     client.wallet, client.signer = SimpleNamespace(address=DESCRIPTOR.agent), SIGNER

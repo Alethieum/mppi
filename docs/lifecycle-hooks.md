@@ -20,6 +20,7 @@ of the typed record below; mutating that snapshot cannot change SDK state.
 | `on_settle` (provider) | `OperationResult` | Confirmed capture/batch result, including reconciliation. Read its per-session outcomes: a successful outer transaction is not success for every batch item. Repeated reconciliation can emit again. |
 | `on_close` (provider) | `CloseResult` | Canonical closing evidence retained, independently of Control delivery. Reconciliation can emit again. |
 | `on_receipt` (agent) | `Receipt` | Receipt passes accounting and canonical chain checks. Repeated valid receipts can emit again. |
+| `on_timing` (agent) | `OperationTiming` | Once per opening, top-up, close or exit, when it returns or raises: its total time split into this SDK's chain reads (`chain_ms`), the wallet adapter's signing (`wallet_sign_ms`) and its execute call until it returned (`wallet_submit_ms`, including a wallet service's own submission and any wait for mining), and the rest (`provider_ms`: the provider exchange and local work). Requests within a session emit nothing. |
 | `on_error` | `HookError` | Runtime Control/Complete failures; agent also reports errors crossing its synchronous API boundary. One failure can cross multiple boundaries. Error records omit prompts, secrets, upstream bodies and raw exception text. |
 
 Session/run/request identifiers are in the corresponding protocol payload.

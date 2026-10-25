@@ -163,6 +163,21 @@ class _Attachment:
     setup_deadline: float | None = None
 
 
+# How long a waiting run keeps its place ahead of later covered runs, and how
+# often a head the agent has not covered repeats its request: a few voucher
+# round trips. The turn is also at most half the authorization wait, so a
+# covered run never waits out its turn into that wait's expiry.
+_TURN = 2.0
+
+
+@dataclass(slots=True)
+class _Queued:
+    position: int
+    since: float
+    # The last coverage request sent for it, when, and the voucher then.
+    sent: tuple[bytes, float, int | None] | None = None
+
+
 @dataclass(slots=True)
 class _Run:
     context: RunContext
@@ -180,6 +195,8 @@ class _Run:
     meter_seq: int = 0
     unresolved: bool = False
     low_credit_marker: tuple[int, int] | None = None
+    # Its place among runs waiting for admission, from its first wait.
+    queued: _Queued | None = None
 
 
 @dataclass(slots=True)
@@ -205,11 +222,17 @@ class _Session:
     close_reference: str | None = None
     inconsistent: bool = False
     history_available: bool = True
+    # Every admission is in ``runs``: the session was opened by this runtime, or
+    # restored from history its host asserts is current. Only then does a pending
+    # run absent from ``runs`` prove it was never admitted.
+    admissions_known: bool = True
     operation: _PendingOperation | None = None
     baseline: _PendingOperation | None = None
     close_result: pb.CloseResult | None = None
     confirmed_units: int = 0
     last_collection: float = field(default_factory=time.monotonic)
+    # Runs that have waited for admission so far: the next one's position.
+    waited: int = 0
 
     @property
     def usage_numerator(self) -> int:
@@ -744,7 +767,7 @@ class Mppi:
             agent_wallet = await asyncio.to_thread(
                 self.chain.reader.agent_wallet,
                 int.from_bytes(notice.agent_id, "big"),
-                evidence.block,
+                evidence.observation,
             )
             if agent_wallet != descriptor.agent:
                 raise _RpcFailure(
@@ -770,7 +793,7 @@ class Mppi:
                 evidence,
                 {initial.rate_card_hash: initial},
                 history_available=self._start_block is not None
-                and evidence.block.observation.block_number > self._start_block,
+                and evidence.observation.block_number > self._start_block,
             )
 
         self._observers.emit("on_session_open", notice)
@@ -870,8 +893,15 @@ class Mppi:
                 ) from None
             if not session.history_available:
                 raise _not_ready("STATE_UNAVAILABLE", session.sid)
-            if request.last_meter_seq > session.meter_seq or any(
-                rid not in session.runs for rid in request.pending_run_ids
+            # Unless every admission is known, an absent pending run is unknown, never
+            # NOT_ADMITTED: a restored checkpoint older than the host's newest may
+            # lack a run that was served. Nor before any Control generation:
+            # Complete needs generation 1 or more, so a session a new process
+            # re-created from its opening (a start block can lag a crashed one's)
+            # never admitted a run an agent names then.
+            if request.last_meter_seq > session.meter_seq or (
+                (not session.admissions_known or session.generation == 0)
+                and any(rid not in session.runs for rid in request.pending_run_ids)
             ):
                 raise _not_ready("STATE_UNAVAILABLE", session.sid)
             generation = uint64(session.generation + 1, field="control generation", positive=True)
@@ -960,8 +990,22 @@ class Mppi:
                 acceptance_control_generation=run.context.control_generation,
                 acceptance_signature=run.signature,
             )
-        # Return all known definitive outcomes. Never replace an unknown id by
-        # NOT_ADMITTED; observed rejected requests alone establish that status.
+        # Return all known definitive outcomes. An unknown id is NOT_ADMITTED only
+        # when every admission is known: the agent records a run before its
+        # Complete arrives, so a refused or lost one stays pending there although
+        # this provider never held it. Nothing is recorded for it, and the
+        # reattachment's new generation refuses a late Complete at the gate.
+        if session.admissions_known and not private:
+            for rid in request.pending_run_ids:
+                if rid not in session.runs:
+                    result.run_states.add(
+                        run_id=rid,
+                        model="",
+                        status=pb.RUN_STATUS_NOT_ADMITTED,
+                        input_tokens=0,
+                        cache_tokens=0,
+                        output_tokens=0,
+                    )
         for run in session.runs.values():
             if run.not_admitted:
                 result.run_states.add(
@@ -1274,7 +1318,6 @@ class Mppi:
 
     async def _admit(self, session: _Session, run: _Run, bound: TokenCounts) -> None:
         expires: float | None = None
-        previous_guidance: bytes | None = None
         async with self._condition:
             while True:
                 snapshot = self._gate(session, run.context)
@@ -1297,7 +1340,24 @@ class Mppi:
                 now = asyncio.get_running_loop().time()
                 if expires is not None and now >= expires:
                     raise _not_ready("AUTHORIZATION_REQUIRED", session.sid, run.context.run_id)
-                if session.voucher is not None and session.voucher.cumulative >= amount:
+                voucher = session.voucher.cumulative if session.voucher is not None else None
+                covered = voucher is not None and voucher >= amount
+                # Admit runs in the order they first waited, but only for a turn. A
+                # later run admitted on headroom an earlier run is waiting for raises
+                # that run's target, so under steady load the earlier run would chase
+                # it until its wait ended. A turn ends after _TURN, so a run the agent
+                # never covers cannot hold back covered work for longer than that.
+                turn = min(_TURN, self.config.payment.authorization_wait_ms / 2000)
+                position = run.queued.position if run.queued is not None else None
+                earlier = [
+                    other.queued.since
+                    for other in session.runs.values()
+                    if other is not run
+                    and other.queued is not None
+                    and not (other.admitted or other.not_admitted or other.stop.is_set())
+                    and (position is None or other.queued.position < position)
+                ]
+                if covered and not any(now < since + turn for since in earlier):
                     if len(self._active(session)) >= 1024:
                         raise _RpcFailure(
                             grpc.StatusCode.RESOURCE_EXHAUSTED, "active run recovery limit"
@@ -1305,16 +1365,32 @@ class Mppi:
                     run.covered_counts = bound
                     run.accounting = RunAccounting(_ZERO, priced_numerator(bound, run.rates))
                     run.admitted = True
+                    self._condition.notify_all()  # The next waiting run may now be covered.
                     return
-                if expires is None:
-                    expires = now + self.config.payment.authorization_wait_ms / 1000
-                encoded = guidance.SerializeToString()
-                if previous_guidance != encoded:
-                    assert session.owner is not None
-                    self._send(session.owner, guidance)
-                    previous_guidance = encoded
+                if run.queued is None:
+                    run.queued = _Queued(session.waited, now)
+                    session.waited += 1
+                # A covered run waiting its turn needs no voucher, so no guidance,
+                # and its turn comes within _TURN, before any authorization expiry.
+                if not covered:
+                    if expires is None:
+                        expires = now + self.config.payment.authorization_wait_ms / 1000
+                    # Send guidance when it changes. The head also repeats it when a
+                    # new voucher still leaves it short, and once a turn: the agent may
+                    # have declined it while its own view of the deposit was behind.
+                    encoded = guidance.SerializeToString()
+                    sent = run.queued.sent
+                    if (
+                        sent is None
+                        or sent[0] != encoded
+                        or (not earlier and (sent[2] != voucher or now >= sent[1] + turn))
+                    ):
+                        run.queued.sent = (encoded, now, voucher)
+                        assert session.owner is not None
+                        self._send(session.owner, guidance)
                 try:
-                    await asyncio.wait_for(self._condition.wait(), min(expires - now, 0.05))
+                    timeout = 0.05 if expires is None else min(expires - now, 0.05)
+                    await asyncio.wait_for(self._condition.wait(), timeout)
                 except TimeoutError:
                     pass
 
@@ -1904,7 +1980,7 @@ class _Sessions:
             block.observation != evidence.observation
             or record.chain_block_number != block.observation.block_number
             or record.chain_block_hash != block.observation.block_hash
-            or block.observation.block_number < opening.block.observation.block_number
+            or block.observation.block_number < opening.observation.block_number
         ):
             raise _not_ready("INCONSISTENT_STATE", sid)
         chain_state = reader.session(sid, block)
@@ -2137,6 +2213,18 @@ class _Sessions:
         return session
 
     async def recover(self, evidence: RecoveryEvidence) -> SessionView:
+        return await self._recover(evidence, history_current=False)
+
+    async def recover_current(self, evidence: RecoveryEvidence) -> SessionView:
+        """As ``recover``, for evidence the host asserts is the session's current
+        history: checkpointed after every admission and before dispatch, and
+        never older than its newest checkpoint. A pending run absent from that
+        history was then never admitted, and a reattachment answers it
+        NOT_ADMITTED. After ``recover`` such a run refuses the attachment
+        instead, since an older checkpoint may lack a run that was served."""
+        return await self._recover(evidence, history_current=True)
+
+    async def _recover(self, evidence: RecoveryEvidence, *, history_current: bool) -> SessionView:
         provider = self._provider
         validate_recovery_snapshot(evidence.snapshot)
         if (
@@ -2167,6 +2255,7 @@ class _Sessions:
         sid = evidence.snapshot.session_id
         async with self._operations:
             candidate = await asyncio.to_thread(self._restore, evidence)
+            candidate.admissions_known = history_current
             await provider.chain.watch_session(sid)
             async with provider._condition:
                 current = provider.chain.snapshot().sessions[sid]

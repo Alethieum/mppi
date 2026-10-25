@@ -14,8 +14,8 @@ import re
 from importlib.resources import files
 from pathlib import Path
 
-from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile, HttpJsonRpc
-from mppi_protocol.circle import CircleAgentWallet, supported_account_pins
+from mppi_protocol.chain import ChainReader, DeploymentProfile, HttpJsonRpc
+from mppi_protocol.circle import CircleAgentWallet
 from mppi_protocol.contract import ARC_USDC, ContractCalls, _decode_exact, _hash
 from mppi_protocol.deployment import profile_from_mapping
 from mppi_protocol.discovery import parse_document
@@ -63,11 +63,9 @@ def _wallet(
 ) -> CircleAgentWallet:
     path = Path(config_path)
     try:
-        proxy_hash, implementation = supported_account_pins(config.chain.chain_id)
         return CircleAgentWallet(
             chain=reader,
-            wallet=CodePin(config.identity.wallet_address, proxy_hash),
-            implementation=implementation,
+            address=config.identity.wallet_address,
             checkpoint_path=path.with_name(path.name + ".wallet-operations.json"),
             require_existing=True,
         )

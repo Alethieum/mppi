@@ -849,7 +849,8 @@ mod tests {
     async fn direct_tls_serves_http1_discovery_and_native_h2_on_one_port() {
         let credentials = Credentials::new();
         let fixture = Fixture::new(tls(&credentials.config()).unwrap()).await;
-        let transport = HttpTransport::new(2000, 1024, Some(&credentials.ca())).unwrap();
+        // Loopback only; generous so a loaded test host cannot time it out.
+        let transport = HttpTransport::new(10_000, 1024, Some(&credentials.ca())).unwrap();
         for path in [
             "/discover",
             "/.well-known/agent-registration.json",

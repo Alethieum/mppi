@@ -1,20 +1,17 @@
-//! Exact synthetic CLI/RPC responses; no Circle account or external network.
+//! Exact synthetic CLI responses; no Circle account, chain read or network.
 use super::*;
 use crate::{
-    chain::{ChainError, DeploymentProfile, Rpc},
-    signing::Voucher,
+    chain::{ChainError, CodePin, DeploymentProfile, Rpc},
     types::Domain,
 };
+use alloy_primitives::keccak256;
 use std::sync::{
     Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 fn operator() -> Address {
     Address::repeat_byte(0x11)
-}
-fn implementation() -> Address {
-    Address::repeat_byte(0x55)
 }
 fn profile(chain: u64) -> DeploymentProfile {
     let pin = |n| CodePin::new(Address::repeat_byte(n), keccak256([0x60, 0])).unwrap();
@@ -28,65 +25,16 @@ fn profile(chain: u64) -> DeploymentProfile {
     )
     .unwrap()
 }
+/// The adapter pins no account code, so it never reads the chain.
 struct TestRpc {
     chain: u64,
-    deployed: AtomicBool,
-    fault: StdMutex<Option<&'static str>>,
+    reads: AtomicUsize,
 }
 #[tonic::async_trait]
 impl Rpc for TestRpc {
-    async fn call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
-        let fault = *self.fault.lock().unwrap();
-        Ok(match method {
-            "eth_chainId" => json!(format!(
-                "0x{:x}",
-                if fault == Some("network") {
-                    1
-                } else {
-                    self.chain
-                }
-            )),
-            "eth_getBlockByNumber" => {
-                json!({"number":"0x1","hash":encoded(B256::repeat_byte(7)),"parentHash":encoded(B256::repeat_byte(6)),"timestamp":"0x123456"})
-            }
-            "eth_getCode" => {
-                assert_eq!(
-                    params[1],
-                    json!({"blockHash":encoded(B256::repeat_byte(7)),"requireCanonical":true})
-                );
-                if params[0] == encoded(operator()) && !self.deployed.load(Ordering::SeqCst) {
-                    json!("0x")
-                } else if params[0] == encoded(operator()) && fault == Some("code") {
-                    json!("0x6001")
-                } else {
-                    json!("0x6000")
-                }
-            }
-            "eth_getStorageAt" => {
-                let target = if params[0] == encoded(operator()) {
-                    if fault == Some("slot") {
-                        Address::repeat_byte(9)
-                    } else {
-                        implementation()
-                    }
-                } else if params[0] == encoded(Address::repeat_byte(1)) {
-                    Address::repeat_byte(2)
-                } else {
-                    Address::repeat_byte(4)
-                };
-                json!(encoded(target.into_word()))
-            }
-            "eth_call" => json!(encoded(
-                profile(self.chain)
-                    .domain()
-                    .signing_context()
-                    .digest(&Voucher {
-                        sessionId: B256::ZERO,
-                        cumulativeAmount: 0
-                    })
-            )),
-            _ => panic!("unexpected RPC {method}"),
-        })
+    async fn call(&self, method: &str, _params: Value) -> Result<Value, ChainError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        panic!("unexpected RPC {method}")
     }
 }
 const ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -182,8 +130,7 @@ impl Fixture {
             directory,
             rpc: Arc::new(TestRpc {
                 chain,
-                deployed: AtomicBool::new(true),
-                fault: StdMutex::new(None),
+                reads: AtomicUsize::new(0),
             }),
             service: Arc::new(Service {
                 chain,
@@ -194,8 +141,7 @@ impl Fixture {
     fn wallet(&self, activate: bool, existing: bool) -> Result<CircleAgentWallet, CircleError> {
         CircleAgentWallet::with_command(
             Arc::new(ChainReader::new(self.rpc.clone(), profile(self.rpc.chain))),
-            CodePin::new(operator(), keccak256([0x60, 0])).unwrap(),
-            CodePin::new(implementation(), keccak256([0x60, 0])).unwrap(),
+            operator(),
             &self.path,
             CircleOptions {
                 allow_registration_activation: activate,
@@ -232,18 +178,6 @@ impl Drop for Fixture {
     }
 }
 
-#[test]
-fn official_account_pins_are_network_specific_and_unsupported_chains_fail() {
-    let (test_proxy, test_impl) = supported_account_pins(5_042_002).unwrap();
-    let (main_proxy, main_impl) = supported_account_pins(5042).unwrap();
-    assert_eq!(test_proxy, main_proxy);
-    assert_ne!(test_impl, main_impl);
-    assert_eq!(
-        encoded(main_impl.address()),
-        "0x9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed"
-    );
-    assert!(supported_account_pins(1).is_err());
-}
 #[tokio::test]
 async fn exact_execution_on_both_networks_retains_id_and_never_reexecutes() {
     for chain in [5042, 5_042_002] {
@@ -287,24 +221,21 @@ async fn exact_execution_on_both_networks_retains_id_and_never_reexecutes() {
     }
 }
 #[tokio::test]
-async fn fresh_activation_only_allows_exact_register_and_checks_deployed_pins_later() {
+async fn registration_activation_sends_only_its_exact_call_directly() {
     let f = Fixture::new(5042);
-    f.rpc.deployed.store(false, Ordering::SeqCst);
     let wallet = f.wallet(true, false).unwrap();
     wallet.verify_registration_wallet().await.unwrap();
-    assert!(wallet.verify_wallet().await.is_err());
-    assert!(wallet.execute(&f.call(), "other").await.is_err());
     let string_register = RegistryCalls::new(5042, profile(5042).registry_address())
         .unwrap()
         .register(operator(), Some("https://provider.example/discover"))
         .unwrap();
-    assert!(
-        wallet
-            .execute(string_register.call(), "uri-register")
-            .await
-            .is_err()
-    );
-    assert_eq!(f.executions(), 0);
+    wallet
+        .execute(string_register.call(), "uri-register")
+        .await
+        .unwrap();
+    assert_eq!(f.row()["operations"]["uri-register"]["route"], "self");
+    let f = Fixture::new(5042);
+    let wallet = f.wallet(true, false).unwrap();
     let result = wallet
         .execute(&wallet.registration_call().unwrap(), "registration")
         .await
@@ -314,11 +245,11 @@ async fn fresh_activation_only_allows_exact_register_and_checks_deployed_pins_la
         f.row()["operations"]["registration"]["route"],
         "direct_register"
     );
-    f.rpc.deployed.store(true, Ordering::SeqCst);
-    wallet.verify_wallet().await.unwrap();
-    *f.rpc.fault.lock().unwrap() = Some("slot");
-    assert!(wallet.verify_wallet().await.is_err());
+    let unopted = f.wallet(false, false).unwrap();
+    assert!(unopted.verify_registration_wallet().await.is_err());
+    unopted.verify_wallet().await.unwrap(); // Any account generation, deployed or not.
     assert_eq!(f.executions(), 1);
+    assert_eq!(f.rpc.reads.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
 async fn lost_or_mismatched_submission_result_never_acquires_a_history_guess() {
@@ -382,7 +313,7 @@ async fn altered_history_keeps_original_handles_without_accepting_new_evidence()
     }
 }
 #[tokio::test]
-async fn version_session_identity_and_canonical_code_are_required_before_dispatch() {
+async fn version_session_and_identity_are_required_before_dispatch() {
     for fault in ["version", "auth", "wallet", "type"] {
         let f = Fixture::new(5042);
         *f.service.fault.lock().unwrap() = Some(fault);
@@ -393,13 +324,6 @@ async fn version_session_identity_and_canonical_code_are_required_before_dispatc
             assert_eq!(error, CircleError::Authentication);
             assert!(error.to_string().contains("circle wallet login"));
         }
-        assert!(wallet.execute(&f.call(), "original").await.is_err());
-        assert_eq!(f.executions(), 0);
-    }
-    for fault in ["network", "code", "slot"] {
-        let f = Fixture::new(5042);
-        *f.rpc.fault.lock().unwrap() = Some(fault);
-        let wallet = f.wallet(false, false).unwrap();
         assert!(wallet.execute(&f.call(), "original").await.is_err());
         assert_eq!(f.executions(), 0);
     }
@@ -422,7 +346,7 @@ async fn journal_scope_fields_unique_keys_and_symlinks_fail_without_replacement(
     .enumerate()
     {
         match altered.0 {
-            0 => altered.1["wallet"]["address"] = json!(encoded(Address::repeat_byte(9))),
+            0 => altered.1["wallet"] = json!(encoded(Address::repeat_byte(9))),
             1 => {
                 altered.1["operations"]["original"]
                     .as_object_mut()
@@ -445,6 +369,27 @@ async fn journal_scope_fields_unique_keys_and_symlinks_fail_without_replacement(
         std::os::unix::fs::symlink(&retained, &f.path).unwrap();
         assert!(f.wallet(false, true).is_err());
     }
+}
+#[tokio::test]
+async fn version_1_shared_record_keeps_its_operations_and_drops_account_pins() {
+    let f = Fixture::new(5042);
+    let wallet = f.wallet(false, false).unwrap();
+    let result = wallet.execute(&f.call(), "original").await.unwrap();
+    let current = f.row();
+    assert_eq!(current["version"], 2);
+    assert_eq!(current["wallet"], json!(encoded(operator())));
+    let mut legacy = current.clone();
+    legacy["version"] = json!(1);
+    legacy["wallet"] =
+        json!({"address":encoded(operator()),"code_hash":encoded(B256::repeat_byte(2))});
+    legacy["implementation"] = json!({"address":encoded(Address::repeat_byte(0x55)),"code_hash":encoded(B256::repeat_byte(1))});
+    std::fs::write(&f.path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let restored = f.wallet(false, true).unwrap();
+    assert_eq!(restored.reconcile("original").await.unwrap(), result);
+    assert_eq!(f.row(), current); // The reconciliation saved it as version 2.
+    legacy["wallet"]["address"] = json!(encoded(Address::repeat_byte(9)));
+    std::fs::write(&f.path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(f.wallet(false, true).is_err());
 }
 #[tokio::test]
 async fn legacy_shared_self_route_record_is_accepted_without_rewriting() {

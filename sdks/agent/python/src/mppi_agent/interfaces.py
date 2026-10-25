@@ -1,14 +1,62 @@
 """Typed agent integration contracts implemented by the network Client."""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from types import TracebackType
 from typing import Protocol
 
 from mppi.v1 import mppi_pb2 as pb
-from mppi_protocol import ValidationCode, ValidationError
+from mppi_protocol import Catalog, Rates, TokenCounts, ValidationCode, ValidationError
 from mppi_protocol.capabilities import FundingWallet, SessionSigner
 from mppi_protocol.types import OperationResult, OperationState, SessionPage, SessionView
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTerms:
+    """The prices this agent accepted for a session, by rate-card hash.
+
+    ``initial_rate_card_hash`` funded the session; ``catalogs`` holds it and
+    every catalog accepted since. ``current_rate_card_hash`` is the provider's
+    last confirmed publication, or ``None`` when it has none. A new run uses it
+    only if it is accepted; an admitted run keeps the prices it signed.
+    """
+
+    session_id: bytes
+    initial_rate_card_hash: bytes
+    current_rate_card_hash: bytes | None
+    catalogs: Mapping[bytes, Catalog]
+
+    def rates(self, model: str, rate_card_hash: bytes | None = None) -> Rates:
+        """A model's rates in an accepted catalog, the initial one by default."""
+        catalog = self.catalogs[
+            self.initial_rate_card_hash if rate_card_hash is None else rate_card_hash
+        ]
+        return catalog.rates_for(model)
+
+
+class RunOutcomeStatus(StrEnum):
+    PENDING = "PENDING"  # No final yet: running, or still to be reconciled.
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    NOT_ADMITTED = "NOT_ADMITTED"  # The provider never held it: no usage.
+
+
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    """One retained run: its signed prices, accepted usage and outcome.
+
+    ``counts`` are the tokens accepted so far; ``amount`` is the run's charge in
+    USDC base units once it has a final, else ``None``.
+    """
+
+    run_id: bytes
+    model: str
+    rate_card_hash: bytes
+    status: RunOutcomeStatus
+    counts: TokenCounts
+    amount: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,5 +137,18 @@ class AgentSessions(Protocol):
 
     def list(self, *, cursor: str | None = None, limit: int = 100) -> SessionPage: ...
 
+    def terms(self, session_id: bytes) -> SessionTerms: ...
 
-__all__ = ["AgentSessions", "CompletionStream", "FundingWallet", "OpenResult", "SessionSigner"]
+    def run(self, session_id: bytes, run_id: bytes) -> RunOutcome: ...
+
+
+__all__ = [
+    "AgentSessions",
+    "CompletionStream",
+    "FundingWallet",
+    "OpenResult",
+    "RunOutcome",
+    "RunOutcomeStatus",
+    "SessionSigner",
+    "SessionTerms",
+]

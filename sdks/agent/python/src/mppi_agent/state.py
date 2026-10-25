@@ -134,15 +134,16 @@ class Ledger:
             raise invalid("only a final run can be forgotten")
         del self.runs[identifier]
 
-    def abandon_unsent(self, identifier: bytes) -> None:
-        """Record a registered run whose Complete was never sent as NOT_ADMITTED.
+    def record_not_admitted(self, identifier: bytes) -> None:
+        """Record a run the provider never admitted as NOT_ADMITTED.
 
-        The provider never held it, so it has no usage, no Meter cursor and no
-        final sequence (``recovered_through``), and is never named pending again.
+        Its Complete was never sent, or the provider refused it before admission.
+        It has no usage, no Meter cursor and no final sequence
+        (``recovered_through``), and is never named pending again.
         """
         run = self._run(identifier)
         if run.final is not None or run.meter_seq or run.counts != TokenCounts(0, 0, 0):
-            raise invalid("only an unreported pending run can be recorded unsent")
+            raise invalid("only an unreported pending run can be recorded not admitted")
         run.final = (0, 0, 0, pb.RUN_STATUS_NOT_ADMITTED, self.meter_seq, 0)
         run.recovered_through = self.meter_seq
 

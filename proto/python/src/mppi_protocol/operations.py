@@ -11,12 +11,14 @@ An exception carrying no structured result can preserve only the supplied ref.
 The caller retains the original PreparedOperation for reconciliation. These
 helpers maintain no storage and do not prescribe provider persistence.
 
-An adapter's FAILED result asserts a verified terminal rejection. Its success
-signal only triggers canonical MPPI receipt verification through ChainReader.
+An adapter's FAILED result asserts a verified terminal rejection. So does its
+``NotSubmittedError``: its own durable record proves the call never reached the
+wallet service. Its success signal only triggers canonical MPPI receipt
+verification through ChainReader. A result keeps the error kind as ``cause``.
 No vendor-specific wallet adapter is implemented here.
 """
 
-from .capabilities import TransactionWallet
+from .capabilities import NotSubmittedError, TransactionWallet
 from .chain import ChainReader
 from .contract import OperationKind, PreparedOperation
 from .errors import ValidationCode, ValidationError
@@ -120,8 +122,11 @@ def submit_operation(
     _validate(wallet, operation, operation_ref, chain)
     try:
         response = wallet.execute(operation.call, operation_ref=operation_ref)
-    except Exception:
-        return OperationResult(operation_ref, OperationState.UNKNOWN)
+    except NotSubmittedError as error:
+        # The adapter proves nothing reached its service: a definite failure.
+        return OperationResult(operation_ref, OperationState.FAILED, cause=_cause(error))
+    except Exception as error:
+        return OperationResult(operation_ref, OperationState.UNKNOWN, cause=_cause(error))
     return _result(response, operation, operation_ref, chain)
 
 
@@ -140,6 +145,16 @@ def reconcile_operation(
     _validate(wallet, operation, operation_ref, chain)
     try:
         response = wallet.reconcile(operation_ref=operation_ref)
-    except Exception:
-        return OperationResult(operation_ref, OperationState.UNKNOWN)
+    except Exception as error:
+        return OperationResult(operation_ref, OperationState.UNKNOWN, cause=_cause(error))
     return _result(response, operation, operation_ref, chain)
+
+
+def _cause(error: BaseException) -> str:
+    """The error kinds, outermost first, without any message text. Any proof of
+    no handoff reads ``NotSubmittedError``, whatever the adapter's subclass."""
+    if not isinstance(error, NotSubmittedError):
+        return type(error).__name__
+    if error.__cause__ is None:
+        return "NotSubmittedError"
+    return "NotSubmittedError: " + type(error.__cause__).__name__

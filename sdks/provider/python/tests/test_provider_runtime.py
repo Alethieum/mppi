@@ -297,7 +297,7 @@ class Facts:
         self.opening_block = 101
         self.operations = []
         self.reader = SimpleNamespace(
-            profile=SimpleNamespace(domain=DOMAIN),
+            profile=SimpleNamespace(domain=DOMAIN, instant_finality=True),  # Arc.
             opening=self.opening,
             agent_wallet=lambda *_: AGENT,
             reconcile=self.reconcile,
@@ -371,7 +371,7 @@ class Facts:
             assert accepted_catalog.rate_card_hash == self.config.catalog.rate_card_hash
         return OpeningEvidence(
             DESCRIPTOR,
-            self.block(self.opening_block),
+            self.block(self.opening_block).observation,
             self.state.deposit,
             self.config.catalog,
             OPEN_TX,
@@ -396,7 +396,7 @@ class Facts:
     def closing(self, tx, sid):
         assert sid == SID and self.state.status is SessionStatus.CLOSED
         return ClosingEvidence(
-            self.block(self.height),
+            self.block(self.height).observation,
             self.state.settled_cumulative,
             self.state.deposit - self.state.settled_cumulative,
             tx,
@@ -720,6 +720,267 @@ def test_concurrent_runs_cannot_reuse_reserved_deposit():
             assert len(peer.work.calls) == 1
             peer.work.release.set()
             assert (await first)[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+
+    asyncio.run(scenario())
+
+
+class SteadyLoad(Work):
+    """The first run needs ``first`` output tokens; every later one needs 1,000."""
+
+    def __init__(self, *, first=3000, **options):
+        super().__init__(**options)
+        self.first, self.admitted_at = first, {}
+
+    async def coverage(self, request, context):
+        self.preparations.append(context)
+        return TokenCounts(10, 0, self.first if context.run_id == b"\x01" * 32 else 1000)
+
+    async def execute(self, request, context, reports, stop):
+        self.admitted_at[context.run_id] = asyncio.get_running_loop().time()
+        async for chunk in super().execute(request, context, reports, stop):
+            yield chunk
+
+
+def test_concurrent_runs_are_admitted_in_the_order_they_first_waited_under_steady_load():
+    """A new run arrives every round trip while the first, larger one waits.
+
+    The agent answers each coverage request one round trip later, signing
+    exactly its target. Admitted runs hold their reservations. A later run
+    admitted on headroom the first run is waiting for would raise that run's
+    target again, so it would chase it while runs keep arriving.
+    """
+    rtt = 0.1
+
+    async def scenario():
+        work = SteadyLoad(hold=True)
+        work.final_counts = TokenCounts(10, 0, 10)
+        cfg = config(wait=5000, input_rate=0, output_rate=1000)  # 1,000 output tokens: 1 unit
+        async with serving(work=work, cfg=cfg) as peer:
+            await peer.attach(voucher=1)
+            signed, asked, writing = [1], {}, asyncio.Lock()
+
+            async def answer(target):
+                await asyncio.sleep(rtt)
+                async with writing:
+                    if target > signed[0]:
+                        signed[0] = target
+                        await peer.control.write(pb.ControlMessage(voucher=peer.voucher(target)))
+
+            async def agent():
+                replies = set()
+                while True:
+                    message = await peer.control.read()
+                    if message.WhichOneof("kind") != "low_credit":
+                        continue
+                    request = message.low_credit.coverage_request
+                    asked[request.run_id] = asked.get(request.run_id, 0) + 1
+                    tokens = sum(row.output_tokens for row in request.required_by_price)
+                    reply = asyncio.create_task(answer(-(-tokens // 1000)))
+                    replies.add(reply)
+                    reply.add_done_callback(replies.discard)
+
+            async def arrive(rid, delay):
+                await asyncio.sleep(delay)
+                return await peer.complete(peer.request(rid))
+
+            responder = asyncio.create_task(agent())
+            ids = [bytes([n]) * 32 for n in range(1, 10)]
+            calls = [
+                asyncio.create_task(arrive(rid, 0 if n == 0 else 0.01 + rtt * (n - 1)))
+                for n, rid in enumerate(ids)
+            ]
+            async with asyncio.timeout(1.8):
+                while len(work.calls) < len(ids):
+                    await asyncio.sleep(0.01)
+            assert [context.run_id for context in work.calls] == ids
+            assert asked[ids[0]] == 1  # Its target never moved.
+            work.release.set()
+            for call in calls:
+                assert (await call)[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+            responder.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_a_covered_run_behind_a_silent_head_is_admitted_within_its_turn():
+    """Nobody answers the first run's coverage request, as when an agent will
+    not sign it. Later runs the voucher covers must not wait on it for long, and
+    must never fail for it. A 1 s authorization wait gives a 0.5 s turn.
+    """
+
+    async def scenario():
+        work = SteadyLoad(first=9000, hold=True)
+        work.final_counts = TokenCounts(10, 0, 10)
+        cfg = config(wait=1000, input_rate=0, output_rate=1000)  # 1,000 output tokens: 1 unit
+        async with serving(work=work, cfg=cfg) as peer:
+            await peer.attach(voucher=5)
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+
+            async def arrive(rid, delay):
+                await asyncio.sleep(delay)
+                arrival = loop.time()
+                try:
+                    return arrival, await peer.complete(peer.request(rid))
+                except grpc.aio.AioRpcError as error:
+                    return arrival, error
+
+            ids = [bytes([n]) * 32 for n in range(1, 6)]
+            calls = [
+                asyncio.create_task(arrive(rid, delay))
+                for rid, delay in zip(ids, (0, 0.001, 0.002, 0.2, 0.8), strict=True)
+            ]
+            async with asyncio.timeout(1.8):
+                while len(work.calls) < 4:
+                    await asyncio.sleep(0.01)
+            work.release.set()
+            results = [await call for call in calls]
+            _, head = results[0]
+            assert isinstance(head, grpc.aio.AioRpcError)
+            failure = parse_payment_error(head.code(), head.trailing_metadata())
+            assert failure.reason == "AUTHORIZATION_REQUIRED"
+            for rid, (arrival, outcome) in zip(ids[1:], results[1:], strict=True):
+                assert not isinstance(outcome, grpc.aio.AioRpcError), outcome
+                assert work.admitted_at[rid] - arrival <= 0.5 + 0.2
+            assert loop.time() - start < 1.8
+
+    asyncio.run(scenario())
+
+
+def test_a_run_waiting_its_turn_asks_for_nothing_and_moves_up_when_the_head_leaves():
+    from mppi_provider import Hooks
+
+    async def scenario():
+        asked = []
+        hooks = Hooks(on_low_credit=lambda notice: asked.append(notice.coverage_request.run_id))
+        work = SteadyLoad()
+        work.final_counts = TokenCounts(10, 0, 10)
+        cfg = config(wait=5000, input_rate=0, output_rate=1000)  # 1,000 output tokens: 1 unit
+        async with serving(work=work, cfg=cfg, hooks=hooks) as peer:
+            await peer.attach(voucher=1)
+            first, second = b"\x01" * 32, b"\x02" * 32
+            head = asyncio.create_task(peer.complete(peer.request(first)))
+            assert (await peer.next_kind("low_credit")).coverage_request.run_id == first
+            # Covered on its own, the next run waits its turn without guidance.
+            later = asyncio.create_task(peer.complete(peer.request(second)))
+            runs = peer.provider._sessions[SID].runs
+            while second not in runs:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)  # Several rechecks.
+            assert work.calls == [] and asked == [first]
+            head.cancel()
+            assert (await later)[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+            assert [context.run_id for context in work.calls] == [second] and asked == [first]
+
+    asyncio.run(scenario())
+
+
+def queued_scenario(*, first, deposit=100000, wait=1000):
+    """A first run of ``first`` output tokens; every later one needs 1,000.
+
+    The turn is half the authorization wait; 1,000 output tokens cost 1 unit.
+    """
+    work = SteadyLoad(first=first, hold=True)
+    work.final_counts = TokenCounts(10, 0, 10)
+    return work, config(wait=wait, input_rate=0, output_rate=1000), deposit
+
+
+def test_a_waiting_run_is_not_overtaken_by_a_covered_run_that_first_waits_after_it():
+    async def scenario():
+        work, cfg, deposit = queued_scenario(first=3000)
+        async with serving(work=work, cfg=cfg, deposit=deposit) as peer:
+            await peer.attach(voucher=1)
+            first, later = b"\x01" * 32, b"\x02" * 32
+            calls = [asyncio.create_task(peer.complete(peer.request(first)))]
+            assert (await peer.next_kind("low_credit")).coverage_request.run_id == first
+            calls.append(asyncio.create_task(peer.complete(peer.request(later))))
+            runs = peer.provider._sessions[SID].runs
+            while later not in runs:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)  # Covered alone, but behind a run within its turn.
+            assert work.calls == []
+            await peer.control.write(pb.ControlMessage(voucher=peer.voucher(3)))
+            async with asyncio.timeout(1):
+                while not work.calls:
+                    await asyncio.sleep(0.01)
+            assert work.calls[0].run_id == first
+            work.release.set()
+            await asyncio.gather(*calls, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_an_uncovered_head_repeats_its_request_after_a_short_voucher_or_a_turn():
+    from mppi_provider import Hooks
+
+    async def scenario():
+        asked = []
+        hooks = Hooks(on_low_credit=lambda notice: asked.append(notice.coverage_request.run_id))
+        work, cfg, deposit = queued_scenario(first=3000, wait=3000)  # A 1.5 s turn.
+        async with serving(work=work, cfg=cfg, deposit=deposit, hooks=hooks) as peer:
+            await peer.attach(voucher=1)
+            first = b"\x01" * 32
+            call = asyncio.create_task(peer.complete(peer.request(first)))
+            async with asyncio.timeout(1):
+                while not asked:
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.3)  # Several rechecks within the turn.
+            assert asked == [first]  # Unchanged, so not repeated.
+            await peer.control.write(pb.ControlMessage(voucher=peer.voucher(2)))
+            async with asyncio.timeout(1):
+                while len(asked) < 2:  # A voucher that still leaves it short.
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(1.7)  # A turn later it asks again.
+            assert len(asked) == 3 and set(asked) == {first}
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_head_refused_for_its_deposit_on_recheck_leaves_the_queue():
+    async def scenario():
+        # Alone, the head needs 99.5 -> 100 units of a 100-unit deposit. Once the
+        # later run is admitted after the head's turn, it needs 101.
+        work, cfg, deposit = queued_scenario(first=99_500, deposit=100)
+        async with serving(work=work, cfg=cfg, deposit=deposit) as peer:
+            await peer.attach(voucher=1)
+            first, later = b"\x01" * 32, b"\x02" * 32
+            head = asyncio.create_task(peer.complete(peer.request(first)))
+            assert (await peer.next_kind("low_credit")).coverage_request.run_id == first
+            behind = asyncio.create_task(peer.complete(peer.request(later)))
+            with pytest.raises(grpc.aio.AioRpcError) as refused:
+                await asyncio.wait_for(head, 2)
+            failure = parse_payment_error(refused.value.code(), refused.value.trailing_metadata())
+            assert failure.code is PaymentCode.INSUFFICIENT_DEPOSIT
+            assert [context.run_id for context in work.calls] == [later]
+            work.release.set()
+            assert (await behind)[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_control_loss_ends_every_run_waiting_in_the_queue_at_once():
+    async def scenario():
+        work, cfg, deposit = queued_scenario(first=9000)
+        async with serving(work=work, cfg=cfg, deposit=deposit) as peer:
+            await peer.attach(voucher=5)
+            first, later = b"\x01" * 32, b"\x02" * 32
+            calls = [asyncio.create_task(peer.complete(peer.request(first)))]
+            assert (await peer.next_kind("low_credit")).coverage_request.run_id == first
+            calls.append(asyncio.create_task(peer.complete(peer.request(later))))
+            runs = peer.provider._sessions[SID].runs
+            while later not in runs:
+                await asyncio.sleep(0.01)
+            lost = asyncio.get_running_loop().time()
+            peer.control.cancel()
+            for call in calls:
+                with pytest.raises(grpc.aio.AioRpcError) as ended:
+                    await call
+                failure = parse_payment_error(ended.value.code(), ended.value.trailing_metadata())
+                assert failure.reason == "CONTROL_NOT_READY"
+            assert asyncio.get_running_loop().time() - lost < 0.3  # Not after a turn.
+            assert work.calls == []
 
     asyncio.run(scenario())
 
@@ -1970,6 +2231,100 @@ def test_checkpoint_recovery_preserves_actual_usage_and_requires_new_attachment(
                 assert again.runs == checkpoint.runs
                 assert again.snapshot.meter_seq == checkpoint.snapshot.meter_seq
                 assert peer.wallet.calls == []
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def reconnect(provider, pending, meter_seq=0):
+    """A fresh Control attachment that names ``pending`` runs."""
+    candidate = runtime._Attachment(runtime.ByteQueue())
+    request = pb.ReconnectRequest(
+        session_id=SID,
+        nonce=candidate.nonce,
+        signature=SIGNER.sign_reconnect(DOMAIN, SID, candidate.nonce),
+        last_meter_seq=meter_seq,
+        pending_run_ids=list(pending),
+    )
+    return candidate, provider._attach(candidate, request)
+
+
+async def answered(candidate, rid):
+    state = pb.ControlMessage.FromString(await candidate.queue.get()).session_state
+    (row,) = [row for row in state.run_states if row.run_id == rid]
+    return row
+
+
+def test_a_session_this_runtime_opened_answers_a_never_held_pending_run_not_admitted():
+    never = b"\x09" * 32
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            candidate, attaching = reconnect(peer.provider, [never])
+            await attaching
+            row = await answered(candidate, never)
+            assert row.status == pb.RUN_STATUS_NOT_ADMITTED and row.model == ""
+            assert (row.input_tokens, row.cache_tokens, row.output_tokens) == (0, 0, 0)
+            assert never not in peer.provider._sessions[SID].runs
+
+    asyncio.run(scenario())
+
+
+def test_a_session_never_attached_here_refuses_an_unknown_pending_run():
+    """A new process re-creates a session from its opening before any Control
+    generation; a start block lagging the crashed one's counts every admission
+    as known. An agent cannot hold pending runs at generation 0, so one it names
+    was admitted earlier: never NOT_ADMITTED."""
+    never = b"\x09" * 32
+
+    async def scenario():
+        async with serving() as peer:
+            await unused_checkpoint(peer)
+            session = peer.provider._sessions[SID]
+            assert session.generation == 0 and session.admissions_known
+            _, attaching = reconnect(peer.provider, [never])
+            with pytest.raises(_RpcFailure) as refused:
+                await attaching
+            assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+            assert peer.provider._sessions[SID].owner is None
+            assert peer.provider._sessions[SID].generation == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("asserted_current", [False, True])
+def test_a_run_served_after_the_restored_checkpoint_is_never_answered_not_admitted(
+    asserted_current,
+):
+    """The host restores a checkpoint older than its newest; run 3 was served after it."""
+    served = b"\x03" * 32
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=2020)
+            assert len([chunk async for chunk in peer.chat.Completions(peer.request())]) == 2
+            older = await peer.provider.sessions.checkpoint(SID)
+            chunks = [chunk async for chunk in peer.chat.Completions(peer.request(served))]
+            assert chunks[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                if asserted_current:
+                    # A host that asserts its history is current takes that on.
+                    await restored.sessions.recover_current(older)
+                    candidate, attaching = reconnect(restored, [served], older.snapshot.meter_seq)
+                    await attaching
+                    row = await answered(candidate, served)
+                    assert row.status == pb.RUN_STATUS_NOT_ADMITTED
+                else:
+                    await restored.sessions.recover(older)
+                    _, attaching = reconnect(restored, [served], older.snapshot.meter_seq)
+                    with pytest.raises(_RpcFailure) as refused:
+                        await attaching
+                    assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+                    assert restored._sessions[SID].owner is None
             finally:
                 await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
 

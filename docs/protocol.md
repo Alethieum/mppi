@@ -271,8 +271,9 @@ no inference resumes and no replacement funded session opens automatically.
 1. After confirmed funding and a ready authenticated attachment, the agent
    submits one signed Complete with a fresh session-unique run id. The provider
    supplies the prepared prefill and output bound before paid execution.
-2. With sufficient accepted A, the gate checks the current attachment, prices,
-   fresh chain/pause/deadline state and aggregate coverage. It records the
+2. With sufficient accepted A and no earlier request of the session within its
+   turn (step 4), the gate checks the current attachment, prices, fresh
+   chain/pause/deadline state and aggregate coverage. It records the
    immutable run binding and reservation before authorizing dispatch once.
 3. When D suffices but A is absent/short, send `LowCredit.coverage_request` and
    wait on this unadmitted Complete. There is no execution reservation or usage
@@ -283,7 +284,15 @@ no inference resumes and no replacement funded session opens automatically.
    configured `payment.authorization_wait_ms` starts at the first prepared
    D-sufficient/A-short check, uses monotonic time and never resets. Earlier RPC
    deadline/cancel wins. Recheck all current state before dispatch; two waiting
-   calls cannot reuse the same headroom.
+   calls cannot reuse the same headroom. Waiting calls are admitted in the order
+   they first waited, each for a turn of 2 s, or half the authorization wait if
+   shorter. While an earlier call is within its turn, a later covered one waits
+   too, without sending guidance; otherwise each later admission would raise a
+   waiting call's target again. A call the agent never covers delays covered
+   ones by at most a turn and never fails them. The earliest uncovered call
+   repeats its guidance after a voucher that leaves it short, and once a turn.
+   Order holds while the agent's voucher round trip is shorter than a turn; a
+   call whose voucher takes longer may be overtaken once its turn ends.
 5. Wait expiry is request-scoped `SESSION_NOT_READY/AUTHORIZATION_REQUIRED`.
    If D is short, enqueue the correlated LowCredit and fail Complete with
    `INSUFFICIENT_DEPOSIT`. Delivery may occur in either order; the failed request

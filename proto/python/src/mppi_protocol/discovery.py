@@ -88,6 +88,14 @@ def parse_document(raw: bytes, *, max_bytes: int = MAX_DOCUMENT_BYTES) -> dict[s
 
 def _parse_document(raw: bytes, *, max_bytes: int) -> dict[str, object]:
     """Strict object decoding with a bound selected by the calling boundary."""
+    result = _parse_json(raw, max_bytes=max_bytes)
+    if not isinstance(result, dict):
+        raise _invalid("document must be a JSON object")
+    return cast(dict[str, object], result)
+
+
+def _parse_json(raw: bytes, *, max_bytes: int) -> object:
+    """Strict JSON decoding: unique keys, no constants, bounded size and depth."""
     if type(raw) is not bytes:
         raise _invalid("document must be bytes")
     if len(raw) > max_bytes:
@@ -101,9 +109,7 @@ def _parse_document(raw: bytes, *, max_bytes: int) -> dict[str, object]:
         if isinstance(error, ValidationError):
             raise
         raise _invalid("document must contain valid UTF-8 JSON") from None
-    if not isinstance(result, dict):
-        raise _invalid("document must be a JSON object")
-    return cast(dict[str, object], result)
+    return cast(object, result)
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,7 +11,6 @@ from importlib.resources import files
 from pathlib import Path
 
 import mppi_provider.runtime as runtime_module
-import mppi_provider.setup as provider_setup
 import pytest
 from eth_abi import encode
 from eth_utils import keccak
@@ -116,12 +115,10 @@ class Boundary:
                 for name in ("proxy", "implementation", "registry", "registry_implementation")
             },
         )
-        self.account_implementation = CodePin(b"i" * 20, keccak(b"account implementation"))
-        self.account_proxy_hash = keccak(b"account proxy")
-        self.code[ADDRESS] = b"account proxy"
-        self.code[self.account_implementation.address] = b"account implementation"
+        self.code[ADDRESS] = b"any Circle account generation"
         self.retain_wallet = True
         self.retained = False
+        self.legacy_journal = False
         self.record_path = self.config_path.with_name(
             self.config_path.name + ".wallet-operations.json"
         )
@@ -152,12 +149,12 @@ class Boundary:
             return owner.call(method, params)
 
         monkeypatch.setattr(CircleAgentWallet, "_run", circle_command)
-        monkeypatch.setattr(
-            provider_setup,
-            "supported_account_pins",
-            lambda chain_id: (self.account_proxy_hash, self.account_implementation),
-        )
         monkeypatch.setattr(HttpJsonRpc, "call", rpc_call)
+        monkeypatch.setattr(
+            HttpJsonRpc,
+            "call_many",
+            lambda adapter, calls: [rpc_call(adapter, method, params) for method, params in calls],
+        )
         monkeypatch.setattr(CircleAgentWallet, "execute", forbidden)
         monkeypatch.setattr(CircleAgentWallet, "reconcile", forbidden)
         monkeypatch.setattr(CircleAgentWallet, "sign_funding_authorization", forbidden)
@@ -180,13 +177,12 @@ class Boundary:
             }
         assert params[-1] == {"blockHash": "0x" + self.block_hash.hex(), "requireCanonical": True}
         if method == "eth_getCode":
-            return "0x" + self.code[bytes.fromhex(params[0][2:])].hex()
+            # An address without fixture code has none; a real check rejects it.
+            return "0x" + self.code.get(bytes.fromhex(params[0][2:]), b"").hex()
         if method == "eth_getStorageAt":
             assert params[1] == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
             implementation = (
-                self.account_implementation
-                if params[0].lower() == "0x" + ADDRESS.hex()
-                else self.profile.implementation
+                self.profile.implementation
                 if params[0].lower() == "0x" + self.profile.proxy.address.hex()
                 else self.profile.registry_implementation
             )
@@ -194,8 +190,9 @@ class Boundary:
         assert method == "eth_call"
         call = params[0]
         selector = bytes.fromhex(call["data"][2:10])
-        if call["to"].lower() == "0x" + self.profile.proxy.address.hex():
-            assert selector == keccak(text="voucherDigest(bytes32,uint64)")[:4]
+        if selector == keccak(text="voucherDigest(bytes32,uint64)")[:4]:
+            # Read with the code in one batch; another profile's proxy gets this
+            # profile's digest, which its unpatched check would reject.
             return "0x" + voucher_digest(self.profile.domain, bytes(32), 0).hex()
         assert call["to"].lower() == "0x" + ARC_USDC.hex()
         for function, (kind, value) in self.usdc.items():
@@ -239,19 +236,19 @@ class Boundary:
                 selected = self.profile
             # Native onboarding's exact shared journal shape, independently formed.
             record = {
-                "version": 1,
+                "version": 2,
                 "kind": "mppi-circle-agent-wallet",
                 "profile": profile_to_mapping(selected),
-                "wallet": {
-                    "address": "0x" + ADDRESS.hex(),
-                    "code_hash": "0x" + self.account_proxy_hash.hex(),
-                },
-                "implementation": {
-                    "address": "0x" + self.account_implementation.address.hex(),
-                    "code_hash": "0x" + self.account_implementation.code_hash.hex(),
-                },
+                "wallet": "0x" + ADDRESS.hex(),
                 "operations": {},
             }
+            if self.legacy_journal:
+                # Earlier onboarding also retained the account's code pins.
+                record |= {
+                    "version": 1,
+                    "wallet": {"address": record["wallet"], "code_hash": "0x" + "ab" * 32},
+                    "implementation": {"address": "0x" + "69" * 20, "code_hash": "0x" + "cd" * 32},
+                }
             self.record_path.write_text(json.dumps(record))
             self.record_path.chmod(0o600)
             self.lock_path.touch(mode=0o600)
@@ -347,11 +344,16 @@ def test_packaged_profile_matches_published_and_selected_network(
         boundary.config_path.write_text(TOML.replace('network = "testnet"', 'network = "mainnet"'))
         boundary.original = boundary.config_path.read_bytes()
     checked = []
-    monkeypatch.setattr(
-        ChainReader, "verify_deployment", lambda reader, block: checked.append(reader.profile)
-    )
+
+    def deployment(reader, results, with_code):
+        # The packaged pins name real code; record which profile is checked.
+        checked.append(reader.profile)
+        return results[(4 if with_code else 0) + 3 :]
+
+    monkeypatch.setattr(ChainReader, "_check_deployment", deployment)
     result = asyncio.run(boundary.create(profile=None, testnet=testnet))
-    assert result.chain.reader.profile == expected and checked == [expected, expected]
+    # Once, by setup itself: the Circle wallet check reads no chain state.
+    assert result.chain.reader.profile == expected and checked == [expected]
     with pytest.raises(SetupError, match="selected network"):
         asyncio.run(boundary.create(profile=None, testnet=not testnet))
     boundary.unchanged()
@@ -616,6 +618,16 @@ def test_cancelled_setup_never_constructs_or_starts_runtime(boundary, monkeypatc
     boundary.unchanged()
 
 
+def test_a_journal_retained_with_account_pins_still_composes(boundary):
+    boundary.legacy_journal = True
+    result = asyncio.run(boundary.create())
+    assert result.wallet.address == ADDRESS
+    assert not any(
+        method == "eth_getStorageAt" and ADDRESS.hex() in str(params)
+        for method, params in boundary.calls
+    )
+
+
 @pytest.mark.parametrize(
     "corruption", ["missing-record", "missing-lock", "wrong-wallet", "wrong-profile"]
 )
@@ -630,7 +642,7 @@ def test_retained_wallet_binding_cannot_be_replaced_or_repaired(boundary, corrup
     else:
         record = json.loads(boundary.record_path.read_text())
         if corruption == "wrong-wallet":
-            record["wallet"]["address"] = "0x" + "77" * 20
+            record["wallet"] = "0x" + "77" * 20
         else:
             record["profile"]["chain_id"] = 5042
         boundary.record_path.write_text(json.dumps(record))

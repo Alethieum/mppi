@@ -240,7 +240,11 @@ impl ProviderSessions for Mppi {
     }
 
     async fn recover(&self, evidence: RecoveryEvidence) -> IntegrationResult<SessionView> {
-        self.recover_evidence(evidence).await
+        self.recover_evidence(evidence, false).await
+    }
+
+    async fn recover_current(&self, evidence: RecoveryEvidence) -> IntegrationResult<SessionView> {
+        self.recover_evidence(evidence, true).await
     }
 
     async fn settle(&self, sid: B256) -> IntegrationResult<OperationResult> {

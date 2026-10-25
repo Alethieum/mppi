@@ -3,6 +3,7 @@
 //! Login and custody belong to the official CLI. No API key or entity secret is
 //! accepted. CLI status is never canonical chain confirmation. Once dispatched,
 //! an intent is only reconciled by its returned transaction ID, never resubmitted.
+//! Any Circle account generation is accepted: no account code is pinned.
 //! Sources: @circle-fin/cli 1.1.4 wallet/execute.ts, wallet/sign.ts,
 //! transaction/list.ts and wallet/helpers.ts (published dist/index.js.map);
 //! https://developers.circle.com/agent-stack/agent-wallets/quickstart
@@ -19,14 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
     capabilities::{TransactionWallet, WalletError},
-    chain::{ChainReader, CodePin, data, encoded},
+    chain::{ChainReader, encoded},
     deployment::profile_to_mapping,
     discovery::parse_address,
     local_state::LocalState,
@@ -40,7 +41,6 @@ const MAX_CALL: usize = 60 << 10;
 const MAX_OPERATIONS: usize = 4096;
 const MAX_JOURNAL: usize = 16 << 20;
 const EXECUTE: &str = "execute(address,uint256,bytes)";
-const SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CircleError {
@@ -103,31 +103,6 @@ impl CircleOptions {
     }
 }
 
-/// Independently reviewed account proxy/runtime pins; RPC never supplies them.
-/// Same network-specific pins as mppi_protocol.circle.supported_account_pins.
-pub fn supported_account_pins(chain_id: u64) -> Result<(B256, CodePin), CircleError> {
-    let proxy =
-        alloy_primitives::b256!("d09e34b2e51f09092e73e3ba1d520a42972496bf2a3bfdb22bb50b9729a9fd66");
-    let (address, hash) = match chain_id {
-        5_042_002 => (
-            alloy_primitives::address!("895b96c92d1007872fe1f70606e6b7eeaebd620e"),
-            alloy_primitives::b256!(
-                "3692ce55057ce6c0da5f23b4fb8819fa6d5838758a5e88585b291fdccd36d0fa"
-            ),
-        ),
-        5042 => (
-            alloy_primitives::address!("9c6e09bc32d1e012dcaa2623e66d2cc9860c1aed"),
-            alloy_primitives::b256!(
-                "60ecaaadc845f14626e77541b390bd36a7f5c35efdee5c30471f0eb08626019e"
-            ),
-        ),
-        _ => return Err(CircleError::Configuration),
-    };
-    Ok((
-        proxy,
-        CodePin::new(address, hash).map_err(|_| CircleError::Configuration)?,
-    ))
-}
 fn blockchain(chain: u64) -> Result<&'static str, CircleError> {
     match chain {
         5042 => Ok("ARC"),
@@ -370,14 +345,13 @@ impl Retained {
     }
 }
 
-/// Native TransactionWallet using the authenticated, pinned Circle Agent CLI.
+/// Native TransactionWallet using the authenticated Circle Agent CLI 1.1.4.
 /// Keep one original operation file per wallet/profile, including across native
 /// onboarding and Python runtime use. Constructors never provision a wallet.
 #[derive(Clone)]
 pub struct CircleAgentWallet {
     chain: Arc<ChainReader>,
-    wallet: CodePin,
-    implementation: CodePin,
+    address: Address,
     path: PathBuf,
     options: CircleOptions,
     command: Arc<dyn CircleCommand>,
@@ -387,7 +361,7 @@ pub struct CircleAgentWallet {
 impl fmt::Debug for CircleAgentWallet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CircleAgentWallet")
-            .field("address", &self.wallet.address())
+            .field("address", &self.address)
             .finish_non_exhaustive()
     }
 }
@@ -415,23 +389,12 @@ impl CircleAgentWallet {
         options: CircleOptions,
         require_existing: bool,
     ) -> Result<Self, CircleError> {
-        let (proxy, implementation) = supported_account_pins(chain.profile().domain().chain_id())?;
-        let wallet = CodePin::new(address, proxy).map_err(|_| CircleError::Configuration)?;
         let command = Arc::new(CliCommand(options.clone()));
-        Self::with_command(
-            chain,
-            wallet,
-            implementation,
-            path,
-            options,
-            require_existing,
-            command,
-        )
+        Self::with_command(chain, address, path, options, require_existing, command)
     }
     pub(crate) fn with_command(
         chain: Arc<ChainReader>,
-        wallet: CodePin,
-        implementation: CodePin,
+        address: Address,
         path: &Path,
         options: CircleOptions,
         require_existing: bool,
@@ -439,10 +402,12 @@ impl CircleAgentWallet {
     ) -> Result<Self, CircleError> {
         options.validate()?;
         blockchain(chain.profile().domain().chain_id())?;
+        if address == Address::ZERO {
+            return Err(CircleError::Configuration);
+        }
         let mut result = Self {
             chain,
-            wallet,
-            implementation,
+            address,
             path: path.to_owned(),
             options,
             command,
@@ -458,12 +423,26 @@ impl CircleAgentWallet {
         Ok(result)
     }
     pub fn address(&self) -> Address {
-        self.wallet.address()
+        self.address
     }
     fn scope(&self) -> Value {
-        json!({"version":1,"kind":"mppi-circle-agent-wallet","profile":profile_to_mapping(self.chain.profile()),
-            "wallet":{"address":encoded(self.address()),"code_hash":encoded(self.wallet.code_hash())},
-            "implementation":{"address":encoded(self.implementation.address()),"code_hash":encoded(self.implementation.code_hash())}})
+        json!({"version":2,"kind":"mppi-circle-agent-wallet","profile":profile_to_mapping(self.chain.profile()),
+            "wallet":encoded(self.address)})
+    }
+    /// This wallet and profile's record. Version 1 also retained the account's
+    /// code pins, which no longer select anything; the next save drops them.
+    fn owns(&self, value: &Value) -> bool {
+        let scope = self.scope();
+        if value["version"] != 1 {
+            return *value == scope;
+        }
+        value
+            .as_object()
+            .is_some_and(|fields| fields.len() == 5 && fields.contains_key("implementation"))
+            && value["kind"] == scope["kind"]
+            && value["profile"] == scope["profile"]
+            && value["wallet"].is_object()
+            && value["wallet"]["address"] == scope["wallet"]
     }
     fn store(&self) -> Result<LocalState, CircleError> {
         if self.require_existing {
@@ -508,7 +487,7 @@ impl CircleAgentWallet {
             .ok_or(CircleError::Journal)?
             .remove("operations")
             .ok_or(CircleError::Journal)?;
-        if value != self.scope() {
+        if !self.owns(&value) {
             return Err(CircleError::Journal);
         }
         // serde Option accepts omitted fields; reject them before typed decoding.
@@ -599,16 +578,8 @@ impl CircleAgentWallet {
             .cloned()
             .ok_or(CircleError::InvalidEvidence)
     }
+    /// The CLI version and its selection of this agent wallet on this network.
     pub async fn verify_wallet(&self) -> Result<(), CircleError> {
-        self.verify(false).await
-    }
-    pub async fn verify_registration_wallet(&self) -> Result<(), CircleError> {
-        if !self.options.allow_registration_activation {
-            return Err(CircleError::Configuration);
-        }
-        self.verify(true).await
-    }
-    async fn verify(&self, allow_undeployed: bool) -> Result<(), CircleError> {
         let version = self.command.run(vec!["--version".into()], false).await?;
         if !version.success || version.stdout.trim_ascii() != b"1.1.4" {
             return Err(CircleError::Version);
@@ -639,45 +610,14 @@ impl CircleAgentWallet {
         {
             return Err(CircleError::InvalidEvidence);
         }
-        let invalid = |_| CircleError::InvalidEvidence;
-        let block = self.chain.block(None).await.map_err(invalid)?;
-        self.chain
-            .verify_deployment(&block)
-            .await
-            .map_err(invalid)?;
-        let position = self.chain.position(&block).map_err(invalid)?;
-        for (optional, pin) in [
-            (false, &self.implementation),
-            (allow_undeployed, &self.wallet),
-        ] {
-            let raw = self
-                .chain
-                .rpc()
-                .call("eth_getCode", json!([encoded(pin.address()), position]))
-                .await
-                .map_err(invalid)?;
-            let code = data(&raw).map_err(invalid)?;
-            if optional && code.is_empty() {
-                self.chain.check_canonical(&block).await.map_err(invalid)?;
-                return Ok(());
-            }
-            if code.is_empty() || keccak256(code) != pin.code_hash() {
-                return Err(CircleError::InvalidEvidence);
-            }
+        Ok(())
+    }
+    /// verify_wallet for a wallet explicitly opted in to registration activation.
+    pub async fn verify_registration_wallet(&self) -> Result<(), CircleError> {
+        if !self.options.allow_registration_activation {
+            return Err(CircleError::Configuration);
         }
-        let slot = self
-            .chain
-            .rpc()
-            .call(
-                "eth_getStorageAt",
-                json!([encoded(self.address()), SLOT, position]),
-            )
-            .await
-            .map_err(invalid)?;
-        if data(&slot).map_err(invalid)? != self.implementation.address().into_word().as_slice() {
-            return Err(CircleError::InvalidEvidence);
-        }
-        self.chain.check_canonical(&block).await.map_err(invalid)
+        self.verify_wallet().await
     }
     /// Sign exact caller-supplied EIP-712 data for this selected chain, preserving
     /// Circle's complete ERC-1271 proof bytes. Never used for MPPI session vouchers.
@@ -796,9 +736,6 @@ impl CircleAgentWallet {
         retained.tx_hash = tx.or(previous).map(encoded);
         retained.state = state.into();
         self.save(store, operations)?;
-        if direct {
-            self.verify(true).await?;
-        }
         operations[reference].result(reference, false)
     }
     async fn reconcile_locked(
@@ -898,7 +835,7 @@ impl CircleAgentWallet {
         }
         let direct =
             self.options.allow_registration_activation && *call == self.registration_call()?;
-        self.verify(direct).await?;
+        self.verify_wallet().await?;
         let key = fresh_key()?;
         operations.insert(
             reference_.into(),

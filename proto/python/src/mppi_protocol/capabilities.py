@@ -51,7 +51,20 @@ class FundingAuthorization:
             )
 
 
+class NotSubmittedError(RuntimeError):
+    """A wallet adapter's own durable record proves the call never reached the
+    wallet service: nothing was submitted, so the same call may be sent again.
+
+    Raise it only with that proof. Any other failure leaves the outcome unknown.
+    """
+
+
 class TransactionWallet(Protocol):
+    """A wallet adapter's transactions. ``execute`` sends ``call`` once from
+    ``address`` with zero native value and durably binds ``operation_ref`` to
+    it first; ``reconcile`` reports that same submission and never sends.
+    """
+
     @property
     def address(self) -> bytes: ...
 
@@ -61,6 +74,21 @@ class TransactionWallet(Protocol):
 
 
 class FundingWallet(TransactionWallet, Protocol):
+    """An agent's funding wallet from any provider, behind a thin adapter.
+
+    ``sign_funding_authorization`` returns bytes USDC accepts for exactly that
+    authorization from ``address``: an ECDSA signature for an account without
+    code, or bytes its ERC-1271 isValidSignature accepts. Before submitting
+    funding, the agent checks them and that its ERC-8004 agent id binds
+    ``address``. No wallet implementation or version is pinned.
+
+    A wallet whose service creates the signature when it executes declares an
+    optional ``signs_at_execute = True``: ``sign_funding_authorization`` then
+    returns a placeholder that ``execute`` replaces. The agent neither verifies
+    nor simulates the placeholder; it still checks the agent-id binding, and
+    USDC verifies the real signature on chain.
+    """
+
     def sign_funding_authorization(self, authorization: FundingAuthorization) -> bytes: ...
 
 

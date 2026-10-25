@@ -5,9 +5,16 @@ from dataclasses import replace
 
 import pytest
 from mppi_protocol import follower as follower_module
-from mppi_protocol.chain import Block, ChainEvidenceError, ChainLagError, ChainSession
+from mppi_protocol.chain import (
+    Block,
+    ChainContradictionError,
+    ChainEvidenceError,
+    ChainLagError,
+    ChainSession,
+)
 from mppi_protocol.discovery import ProviderIdentity
 from mppi_protocol.follower import ChainFollower
+from mppi_protocol.http import TransportError
 from mppi_protocol.types import ChainObservation, PauseLevel, SessionStatus
 
 SID = b"s" * 32
@@ -36,6 +43,8 @@ class Reader:
 
     def block(self, number=None):
         self.calls += 1
+        if isinstance(self.fail, Exception):
+            raise self.fail
         if self.fail:
             raise ChainEvidenceError("unavailable")
         if number == 10 and self.head.observation.block_number > 10:
@@ -52,6 +61,24 @@ class Reader:
     def session(self, sid, block):
         assert sid == SID and block == self.head
         return self.state
+
+    # ChainReader's batched forms, here built from the single reads above.
+    def _blocks(self, numbers):
+        return [self.block(number) for number in numbers]
+
+    def _observe_at(self, number, block_hash, *, providers=(), sessions=(), recheck=None):
+        block = self.block(number)
+        again = self.block(recheck) if recheck is not None else None
+        if block.observation.block_hash != block_hash:
+            raise ChainEvidenceError("canonical block evidence changed during observation")
+        self.verify_deployment(block)
+        pause = self.pause_level(block)
+        identities = {
+            provider: self.identity(provider, block, allow_unavailable_catalog=True)
+            for provider in providers
+        }
+        states = {sid: self.session(sid, block) for sid in sessions}
+        return block, again, pause, identities, states
 
 
 def setup():
@@ -270,7 +297,7 @@ def advance_head(reader, clock, number):
 
 
 def test_a_failed_refresh_is_repeated_once_and_its_cause_is_kept(no_wait):
-    """MPPI-34: one failed read no longer refuses every request until the next poll."""
+    """One failed read no longer refuses every request until the next poll."""
 
     async def run():
         _, reader, follower = setup()
@@ -353,6 +380,141 @@ def test_persistent_failures_still_fail_closed_with_only_sdk_text(no_wait):
             await follower.refresh()
         assert not follower.readiness().ready
         assert follower.last_refresh_failure.reason == "unavailable"
+        await follower.stop()
+
+    asyncio.run(run())
+
+
+def test_confirmed_readiness_keeps_the_last_evidence_while_the_rpc_is_down(no_wait):
+    """An agent's requests need no chain read; only fresh admission does."""
+
+    async def run():
+        clock, reader, follower = setup()
+        await follower.start()
+        await follower.watch_session(SID)
+        reader.fail = True
+        clock.advance(120)
+        with pytest.raises(ChainEvidenceError):
+            await follower.refresh()
+        assert follower.readiness(SID).failures[0].reason == "CHAIN_STATE_STALE"
+        assert follower.confirmed_readiness(SID).ready
+        assert follower.confirmed_readiness(b"t" * 32).failures[0].reason == "STATE_UNAVAILABLE"
+        # The same local rules still apply, from the last confirmed activity.
+        clock.advance(86400)
+        assert follower.confirmed_readiness(SID).failures[0].reason == "CLAIM_DEADLINE"
+        await follower.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        "proxy implementation differs from release profile",
+        "deployed code differs from release profile",
+        "MPPI signing domain differs from release profile",
+        "RPC chain differs from the selected deployment",
+        "regressed",
+    ],
+)
+def test_contradicting_evidence_stops_requests_until_a_refresh_is_accepted(no_wait, contradiction):
+    async def run():
+        clock, reader, follower = setup()
+        await follower.start()
+        await follower.watch_session(SID)
+        good = reader.state
+        if contradiction == "regressed":
+            reader.state = replace(good, deposit=good.deposit - 1)
+        else:
+            reader.fail = ChainContradictionError(contradiction)
+        clock.advance(1)
+        with pytest.raises(ChainContradictionError):
+            await follower.refresh()
+        assert follower.confirmed_readiness(SID).failures[0].reason == "INCONSISTENT_STATE"
+        reader.fail, reader.state = False, good
+        await follower.refresh()
+        assert follower.confirmed_readiness(SID).ready
+        await follower.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "unavailable",
+    [
+        TransportError("HTTP request failed", transient=True),
+        TransportError("HTTP endpoint returned status 429", transient=True),
+        TimeoutError(),
+        ChainLagError("RPC head is behind accepted chain evidence"),
+        ChainEvidenceError("RPC snapshot and head are from different blocks"),
+    ],
+)
+def test_unavailable_or_lagging_reads_never_stop_requests(no_wait, unavailable):
+    async def run():
+        clock, reader, follower = setup()
+        await follower.start()
+        await follower.watch_session(SID)
+        reader.fail = unavailable
+        clock.advance(1)
+        try:
+            await follower.refresh()
+        except (ChainEvidenceError, TransportError, TimeoutError):
+            pass  # Lag that the accepted snapshot covers is not raised.
+        assert follower.confirmed_readiness(SID).ready
+        await follower.stop()
+
+    asyncio.run(run())
+
+
+def test_a_failed_background_refresh_is_reported_without_extending_freshness(no_wait):
+    async def run():
+        clock = Clock()
+        reader = Reader(clock)
+        follower = ChainFollower(
+            reader,
+            max_age_ms=10000,
+            collection_margin_ms=1000,
+            poll_interval_ms=1,
+            monotonic=lambda: clock.mono,
+            wall_clock=lambda: clock.wall,
+        )
+        seen = []
+
+        def observe(failure):
+            seen.append(failure)
+            raise RuntimeError("an observer's own failure")  # Never stops following.
+
+        follower.on_refresh_failure = observe
+        await follower.start()
+        reader.fail = True
+        async with asyncio.timeout(2):
+            while len(seen) < 2:
+                await asyncio.sleep(0.01)
+        assert (seen[0].kind, seen[0].reason) == ("ChainEvidenceError", "unavailable")
+        assert not follower.readiness().ready
+        await follower.stop()
+
+    asyncio.run(run())
+
+
+def test_a_proven_state_extends_the_view_without_renewing_freshness():
+    async def run():
+        clock, reader, follower = setup()
+        await follower.start()
+        await follower.watch_session(SID)
+        observed = follower.current.observed_at
+        topped = replace(reader.state, deposit=150)
+        follower.confirm(SID, topped)
+        assert follower.current.sessions[SID] == topped
+        assert follower.current.observed_at == observed  # Never fresher.
+        new = b"n" * 32
+        follower.confirm(new, replace(reader.state, deposit=10))
+        assert new in follower.current.sessions
+        with pytest.raises(ChainEvidenceError, match="regressed"):
+            follower.confirm(SID, replace(topped, deposit=149))
+        clock.advance(11)
+        assert not follower.readiness(SID).ready
+        assert follower.confirmed_readiness(SID).ready
         await follower.stop()
 
     asyncio.run(run())

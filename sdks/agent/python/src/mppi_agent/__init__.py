@@ -15,12 +15,22 @@ from .client import (
     ClientError,
     CloseAccountingError,
     CompletionStream,
+    FundingAuthorizationError,
     InferenceError,
     PaymentError,
 )
 from .discovery import ProviderDiscovery, discover, verify_challenge
-from .hooks import HookError, Hooks, ObserverStats
-from .interfaces import AgentSessions, FundingNotice, FundingWallet, OpenResult, SessionSigner
+from .hooks import HookError, Hooks, ObserverStats, OperationTiming
+from .interfaces import (
+    AgentSessions,
+    FundingNotice,
+    FundingWallet,
+    OpenResult,
+    RunOutcome,
+    RunOutcomeStatus,
+    SessionSigner,
+    SessionTerms,
+)
 from .onboarding import OnboardingError, OnboardingResult, onboard
 
 __all__ = [
@@ -33,17 +43,22 @@ __all__ = [
     "ClientError",
     "CloseAccountingError",
     "CompletionStream",
+    "FundingAuthorizationError",
     "FundingNotice",
     "FundingWallet",
     "LocalSessionSigner",
     "InferenceError",
     "OpenResult",
+    "OperationTiming",
     "OnboardingError",
     "OnboardingResult",
     "PaymentError",
     "ProviderDiscovery",
     "Rates",
+    "RunOutcome",
+    "RunOutcomeStatus",
     "SessionSigner",
+    "SessionTerms",
     "TokenCounts",
     "funding_amount",
     "discover",
