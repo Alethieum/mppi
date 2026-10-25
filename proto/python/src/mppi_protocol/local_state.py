@@ -33,6 +33,12 @@ def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+# Record format versions. Version 2 is the agent payment checkpoint from
+# mppi-agent 0.1.3, which may omit settled runs it forgot; readers before
+# mppi-protocol 0.1.2 accept only version 1 and so refuse it.
+_VERSIONS = (1, 2)
+
+
 class Checkpoint:
     """One mode-0600, bounded, exclusively owned non-secret local record."""
 
@@ -75,7 +81,7 @@ class Checkpoint:
             if (
                 not isinstance(result, dict)
                 or type(result.get("version")) is not int
-                or result["version"] != 1
+                or result["version"] not in _VERSIONS
             ):
                 raise _invalid("unsupported checkpoint record")
             return result
@@ -83,7 +89,11 @@ class Checkpoint:
             raise _invalid("checkpoint cannot be validated") from None
 
     def save(self, record: dict[str, Any]) -> None:
-        if self._lock is None or type(record.get("version")) is not int or record["version"] != 1:
+        if (
+            self._lock is None
+            or type(record.get("version")) is not int
+            or record["version"] not in _VERSIONS
+        ):
             raise _invalid("checkpoint is closed or has an invalid version")
         raw = json.dumps(record, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
         if len(raw) > MAX_CHECKPOINT_BYTES:

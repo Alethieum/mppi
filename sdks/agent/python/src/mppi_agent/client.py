@@ -11,6 +11,7 @@ import asyncio
 import json
 import secrets
 import threading
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
@@ -38,12 +39,12 @@ from mppi_protocol.capabilities import (
     WalletCall,
 )
 from mppi_protocol.catalog import Catalog, parse_catalog, validate_model
-from mppi_protocol.chain import ChainEvidenceError, ChainSession, DeploymentProfile
+from mppi_protocol.chain import ChainEvidenceError, ChainLagError, ChainSession, DeploymentProfile
 from mppi_protocol.contract import ContractCalls, OperationKind, PreparedOperation
 from mppi_protocol.discovery import ProviderIdentity, normalize_origin, parse_document
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.follower import ChainFollower
-from mppi_protocol.http import HttpTransport
+from mppi_protocol.http import HttpTransport, TransportError
 from mppi_protocol.operations import reconcile_operation, submit_operation
 from mppi_protocol.signing import (
     verify_close_auth,
@@ -82,20 +83,52 @@ from mppi_protocol.wire import (
 from .checkpoint import Checkpoint
 from .discovery import ProviderDiscovery, discover, verify_challenge
 from .hooks import HookError, Hooks, ObserverStats
-from .interfaces import OpenResult
+from .interfaces import FundingNotice, OpenResult
 from .state import Ledger, Run, monotone
 
 T = TypeVar("T")
+
+# Control reports that are rejected alone. One such report that fails
+# validation or cannot be proven now is set aside: nothing it carried is
+# applied, and the attachment and every run continue (MPPI-38). A rejected
+# Meter also stops the session cursor; see Client._meter.
+_SINGLE_REPORTS = frozenset({"challenge", "low_credit", "receipt", "drain"})
+_PAYMENT_REPORTS = frozenset({"meter", "low_credit", "receipt", "drain", "close_result"})
+# Settled final runs still waiting for their Receipt, kept before the oldest is
+# pruned anyway: Receipt delivery is not guaranteed (protocol.md, Definitive
+# outcomes and settlement).
+_UNRECEIPTED_FINALS = 1024
+# Longest a stuck attachment waits for live runs before ending them; see _meter.
+_RESYNC_WAIT_S = 60.0
+# Proven Receipt observations kept: the provider stamps each Receipt with its
+# follower's current block, so a session's Receipts share few observations.
+_PROVEN_OBSERVATIONS = 64
+# Receipts waiting for proof: as many as runs may be pending (state.py register).
+_RECEIPT_QUEUE = 1024
+# Receipt proofs that fail after reading chain state, per attachment, before
+# this attachment stops reading for Receipts (a provider wasting the agent's RPC).
+_RECEIPT_FAILURES = 16
 
 
 class ClientError(RuntimeError):
     """Local eligibility, recovery or transport failure; no automatic retry."""
 
 
+_REPORT_FAILURES = (ValidationError, ClientError, ChainEvidenceError, TransportError)
+
+
 class PaymentError(ClientError):
     def __init__(self, failure: PaymentFailure) -> None:
         self.failure = failure
         super().__init__(failure.code.value + (": " + failure.reason if failure.reason else ""))
+
+
+def _detail(kind: str | None, error: BaseException) -> str | None:
+    """The message kind and the SDK's own reason; never provider or endpoint text."""
+    if isinstance(error, PaymentError) or not isinstance(error, _REPORT_FAILURES):
+        return kind
+    reason = str(error)[:200]
+    return f"{kind}: {reason}" if kind else reason
 
 
 class InferenceError(ClientError):
@@ -128,8 +161,11 @@ class _Output:
 class CompletionStream(Iterator[bytes]):
     """Original provider JSON messages. Closing cancels work, never proves usage."""
 
-    def __init__(self, client: Client, run_id: bytes) -> None:
+    def __init__(self, client: Client, run_id: bytes, output: _Output | None = None) -> None:
         self._client, self.run_id = client, run_id
+        # Its own record of the output: the client drops its index entry once
+        # the run is settled and pruned, possibly before this stream is read.
+        self._output = output if output is not None else client._outputs[run_id]
         self._closed = False
         self._read_lock = threading.Lock()
 
@@ -141,7 +177,7 @@ class CompletionStream(Iterator[bytes]):
             if self._closed:
                 raise StopIteration
             try:
-                value = self._client._sync(self._client._next(self.run_id))
+                value = self._client._sync(self._client._next(self._output))
             except BaseException:
                 self._closed = True
                 raise
@@ -154,20 +190,20 @@ class CompletionStream(Iterator[bytes]):
     def terminal(self) -> pb.Terminal | None:
         return cast(
             pb.Terminal | None,
-            self._client._sync(self._client._final_record(self.run_id, receipt=False)),
+            self._client._sync(self._client._final_record(self._output, receipt=False)),
         )
 
     @property
     def receipt(self) -> pb.Receipt | None:
         return cast(
             pb.Receipt | None,
-            self._client._sync(self._client._final_record(self.run_id, receipt=True)),
+            self._client._sync(self._client._final_record(self._output, receipt=True)),
         )
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._client._sync(self._client._cancel_run(self.run_id))
+            self._client._sync(self._client._cancel_run(self.run_id, self._output))
 
     def __enter__(self) -> CompletionStream:
         return self
@@ -204,8 +240,8 @@ class _Completions:
     def create_raw(self, payload: bytes, *, model: str, stream: bool) -> CompletionStream | bytes:
         validate_model(model)
         validate_json(payload, model=model, stream=stream)
-        run_id = self._client._sync(self._client._create(model, stream, payload))
-        result = CompletionStream(self._client, run_id)
+        run_id, output = self._client._sync(self._client._create(model, stream, payload))
+        result = CompletionStream(self._client, run_id, output)
         if stream:
             return result
         try:
@@ -288,8 +324,14 @@ class Client:
         ca_file: str | None = None,
         testnet: bool = True,
         profile: DeploymentProfile | None = None,
+        max_age_ms: int = 60_000,
+        poll_interval_ms: int | None = None,
     ) -> Client:
-        """Use completed CLI onboarding; funding still requires an explicit choice."""
+        """Use completed CLI onboarding; funding still requires an explicit choice.
+
+        The chain follower polls every ``poll_interval_ms`` (default 15 s) and
+        requires evidence younger than ``max_age_ms`` (default 60 s).
+        """
         from .setup import client_from_config
 
         return client_from_config(
@@ -299,6 +341,8 @@ class Client:
             ca_file=ca_file,
             testnet=testnet,
             profile=profile,
+            max_age_ms=max_age_ms,
+            poll_interval_ms=poll_interval_ms,
         )
 
     def __init__(
@@ -320,6 +364,7 @@ class Client:
         queue_messages: int = 64,
         queue_bytes: int = 16 << 20,
         on_low_credit: Callable[[pb.LowCredit], None] | None = None,
+        on_funding_notice: Callable[[FundingNotice], None] | None = None,
         hooks: Hooks | None = None,
     ) -> None:
         if isinstance(provider, str):
@@ -346,6 +391,8 @@ class Client:
             uint256(agent_id, field="agent_id")
         if on_low_credit is not None and not callable(on_low_credit):
             raise ClientError("on_low_credit must be callable")
+        if on_funding_notice is not None and not callable(on_funding_notice):
+            raise ClientError("on_funding_notice must be callable")
         # Validate queue settings before starting an owned thread.
         ByteQueue(max_messages=queue_messages, max_bytes=queue_bytes, wait_ms=queue_wait_ms)
         self.provider, self.wallet, self.signer = provider, wallet, signer
@@ -360,7 +407,10 @@ class Client:
             raise TypeError("hooks must be agent Hooks")
         self._observers = Observers(hooks)
         self._on_low_credit = on_low_credit
-        self._low_credit_queue: ByteQueue | None = None
+        self._on_funding_notice = on_funding_notice
+        # The latest undelivered funding notice: (LowCredit bytes, deposit then,
+        # required). Only the latest matters; delivery works out the rest again.
+        self._funding: tuple[bytes, int, int | None] | None = None
         self._low_credit_task: asyncio.Task[None] | None = None
         self._queue_options = {
             "max_messages": queue_messages,
@@ -383,6 +433,24 @@ class Client:
         self._renew_task: asyncio.Task[None] | None = None
         self._voucher_task: asyncio.Task[None] | None = None
         self._pending_vouchers: dict[bytes, tuple[int, int]] = {}
+        # A confirmed top-up's transaction, to announce once Control is attached.
+        self._top_up_hint: bytes | None = None
+        # Runs registered and persisted whose Complete has not been sent yet.
+        self._unsent: set[bytes] = set()
+        # A rejected Meter stopped this attachment's session cursor, at _resync_at.
+        self._resync: Exception | None = None
+        self._resync_at = 0.0
+        # Receipt proofs run one at a time from a bounded queue, once per run
+        # per attachment, so they never crowd the follower's chain reads.
+        self._receipt_queue: deque[tuple[pb.Receipt, int]] = deque()
+        self._receipt_task: asyncio.Task[None] | None = None
+        self._receipts_seen: set[bytes] = set()
+        self._receipt_failures = 0
+        # Runs whose Receipt was verified; see _prune.
+        self._receipted: set[bytes] = set()
+        # (session, block number, block hash) -> settled total this agent read
+        # itself at that canonical block; see _verify_receipt.
+        self._proven: OrderedDict[tuple[bytes, int, bytes], int] = OrderedDict()
         self._outbound: ByteQueue | None = None
         self._nonce: asyncio.Future[bytes] | None = None
         self._snapshot_waiter: asyncio.Future[pb.SessionState] | None = None
@@ -417,6 +485,9 @@ class Client:
             asyncio.Lock(),
         )
         self._start_lock = asyncio.Lock()
+        # Serialises top-ups among themselves and with close/exit (taken after
+        # _open_lock there). Requests never wait for a wallet operation (MPPI-36).
+        self._funding_lock = asyncio.Lock()
         self._operation_locks: dict[str, asyncio.Lock] = {}
         self._thread_ready.set()
         try:
@@ -708,6 +779,9 @@ class Client:
 
     def _record(self) -> dict[str, Any]:
         result = dict(self._saved)
+        # Version 2 may omit forgotten runs (_prune): mppi-agent 0.1.2 refuses
+        # it rather than misreading it. This release still reads version 1.
+        result["version"] = 2
         if self._ledger is not None:
             ledger = self._ledger
             result["ledger"] = {
@@ -777,8 +851,51 @@ class Client:
         ]
         return result
 
+    def _prune(self) -> None:
+        """Forget final runs that nothing can still change (memory and checkpoint).
+
+        A run goes once it has its final; the session cursor has reached that
+        final's Meter sequence, so a later Meter for it is an ignored duplicate;
+        its Complete stream here has ended, so no Terminal can follow; and its
+        Receipt was verified, a snapshot resolved it, the session closed, or
+        more than _UNRECEIPTED_FINALS settled runs already wait for Receipts.
+        Usage stays exact in the per-bucket totals. The first run of each price
+        bucket stays as the signed price acceptance a checkpoint restore needs.
+        A late Receipt for a forgotten run is rejected alone (no retained run).
+        """
+        ledger = self._ledger
+        if ledger is None:
+            return
+        closed = self._closed_result is not None
+        buckets: set[tuple[str, bytes]] = set()
+        ready: list[bytes] = []
+        waiting: list[bytes] = []
+        for identifier, run in ledger.runs.items():
+            bucket = (run.context.model, run.context.rate_card_hash)
+            if bucket not in buckets:
+                buckets.add(bucket)
+                continue
+            output = self._outputs.get(identifier)
+            if (
+                run.final is None
+                or run.final[4] > ledger.meter_seq
+                or (output is not None and output.task is not None and not output.task.done())
+            ):
+                continue
+            if identifier in self._receipted or run.recovered_through is not None or closed:
+                ready.append(identifier)
+            else:
+                waiting.append(identifier)
+        ready.extend(waiting[: max(0, len(waiting) - _UNRECEIPTED_FINALS)])
+        for identifier in ready:
+            ledger.forget(identifier)
+            self._outputs.pop(identifier, None)
+            self._receipted.discard(identifier)
+            self._receipts_seen.discard(identifier)
+
     async def _persist(self) -> None:
         async with self._checkpoint_lock:
+            self._prune()
             record = self._record()
             await asyncio.to_thread(self._checkpoint.save, record)
             self._saved = record
@@ -813,6 +930,7 @@ class Client:
             not ledger.ready
             or ledger.close_pending
             or self._control_failure is not None
+            or self._resync is not None
             or self._attached_generation == 0
             or self._attached_generation != ledger.generation
         ):
@@ -827,32 +945,33 @@ class Client:
         # Drain every old attachment task before creating another owner. A
         # cancelled to_thread read may finish externally, but its coroutine
         # cannot later apply reports or fail the replacement Control stream.
-        old_tasks = (
-            self._control_tasks
-            + list(self._background)
-            + [output.task for output in self._outputs.values() if output.task is not None]
-        )
+        # Complete streams are not attachment tasks: each ends on its own terms
+        # on the shared channel and applies its final to the current ledger,
+        # whose snapshot already holds every pending run's recovered outcome.
+        old_tasks = self._control_tasks + list(self._background)
         for task in old_tasks:
             task.cancel()
         await asyncio.gather(*old_tasks, return_exceptions=True)
-        if self._channel is not None:
-            await self._channel.close()
         self._pending_vouchers.clear()
-        self._renew_task = self._voucher_task = None
-        self._low_credit_queue = None
+        self._renew_task = self._voucher_task = self._receipt_task = None
+        self._receipt_queue.clear()
+        self._receipts_seen.clear()
+        self._receipt_failures = 0
+        self._funding = None
         self._low_credit_task = None
         if self._ledger is not None:
             self._ledger.ready = False
         self._attached_generation = 0
-        assert self._discovery is not None
-        roots = await asyncio.to_thread(Path(self.ca_file).read_bytes) if self.ca_file else None
-        self._channel = grpc.aio.secure_channel(
-            urlsplit(self._discovery.origin).netloc,
-            grpc.ssl_channel_credentials(root_certificates=roots),
-            options=GRPC_OPTIONS + (("grpc.enable_retries", 0), ("grpc.enable_http_proxy", 0)),
-        )
+        if self._channel is None:
+            assert self._discovery is not None
+            roots = await asyncio.to_thread(Path(self.ca_file).read_bytes) if self.ca_file else None
+            self._channel = grpc.aio.secure_channel(
+                urlsplit(self._discovery.origin).netloc,
+                grpc.ssl_channel_credentials(root_certificates=roots),
+                options=GRPC_OPTIONS + (("grpc.enable_retries", 0), ("grpc.enable_http_proxy", 0)),
+            )
         self._control = services.ControlStub(self._channel).Session()
-        self._control_failure = None
+        self._control_failure = self._resync = None
         self._outbound = ByteQueue(**self._queue_options)
         self._nonce = self._loop.create_future()
         self._snapshot_waiter = None
@@ -881,15 +1000,22 @@ class Client:
         except Exception as error:
             self._control_lost(error)
 
-    def _control_lost(self, error: Exception) -> None:
+    def _control_lost(self, error: Exception, kind: str | None = None) -> None:
+        """End this attachment only; every Complete stream continues (MPPI-38).
+
+        The provider stops work it can no longer fund. A run that already
+        completed still delivers its answer and final, on its own stream.
+        """
         if self._control_failure is not None:
             return
-        self._observers.emit("on_error", HookError("control", type(error).__name__))
+        self._observers.emit(
+            "on_error", HookError("control", type(error).__name__, detail=_detail(kind, error))
+        )
         self._control_failure = error
         self._attached_generation = 0
         if self._low_credit_task is not None:
             self._low_credit_task.cancel()
-        self._low_credit_queue = None
+        self._funding = None
         if self._ledger is not None:
             self._ledger.ready = False
         if self._outbound is not None:
@@ -902,21 +1028,15 @@ class Client:
         ):
             if future is not None and not future.done():
                 future.set_exception(error)
-        for output in self._outputs.values():
-            if output.call is not None and not output.call.done():
-                output.call.cancel()
-            output.queue.close(
-                ClientError("Control attachment was lost; run outcome requires reconciliation")
-            )
         if self._control is not None:
             self._control.cancel()
 
     async def _control_read(self) -> None:
+        kind: str | None = None
         try:
             async for message in self._control:
-                validate_message(message)
                 kind = message.WhichOneof("kind")
-                if kind in ("meter", "low_credit", "receipt", "drain", "close_result"):
+                if kind in _PAYMENT_REPORTS:
                     ledger = self._require_ledger()
                     if (
                         self._attached_generation == 0
@@ -924,26 +1044,22 @@ class Client:
                         or self._control_failure is not None
                     ):
                         raise ClientError("payment report arrived before authenticated cutover")
+                if kind in _SINGLE_REPORTS:
+                    try:
+                        await self._control_report(kind, message)
+                    except _REPORT_FAILURES as error:
+                        self._reject(kind, error)
+                    kind = None
+                    continue
+                if kind == "meter":
+                    await self._meter(message)
+                    kind = None
+                    continue
+                validate_message(message)
                 if kind == "reconnect_challenge":
                     if self._nonce is None or self._nonce.done():
                         raise ClientError("duplicate reconnect challenge")
                     self._nonce.set_result(message.reconnect_challenge.nonce)
-                elif kind == "challenge":
-                    entry = self._challenges.get(message.challenge.request_id)
-                    if entry is None:
-                        raise ClientError("unsolicited payment challenge")
-                    assert self._identity is not None
-                    verify_challenge(
-                        message.challenge,
-                        self._identity,
-                        request_id=message.challenge.request_id,
-                        model=entry[0],
-                    )
-                    if not entry[1].done():
-                        entry[1].set_result(message.challenge)
-                    elif entry[1].result() != message.challenge:
-                        raise ClientError("conflicting repeated challenge")
-                    self._observers.emit("on_challenge", message.challenge)
                 elif kind == "session_state":
                     if self._snapshot_waiter is None or self._snapshot_waiter.done():
                         raise ClientError("unsolicited session snapshot")
@@ -953,60 +1069,166 @@ class Client:
                     await self._snapshot_applied.wait()
                     if self._control_failure is not None:
                         return
-                elif kind == "meter":
-                    ledger = self._require_ledger(message.meter.session_id)
-                    changed = ledger.apply_meter(message.meter, self._observed_state().deposit)
-                    if changed:
-                        await self._persist()
-                        self._observers.emit("on_meter", message.meter)
-                        if self._renew_task is None or self._renew_task.done():
-                            self._renew_task = self._spawn(self._renew())
-                elif kind == "low_credit":
-                    ledger = self._require_ledger(message.low_credit.session_id)
-                    target = ledger.coverage(message.low_credit, self._chain_state().deposit)
-                    if target is not None:
-                        request = message.low_credit.coverage_request
-                        if (
-                            request.run_id not in self._pending_vouchers
-                            and len(self._pending_vouchers) >= self._queue_options["max_messages"]
-                        ):
-                            raise ClientError("pending voucher queue is full")
-                        self._pending_vouchers[request.run_id] = (
-                            target,
-                            request.control_generation,
-                        )
-                        if self._voucher_task is None or self._voucher_task.done():
-                            self._voucher_task = self._spawn(self._voucher_worker())
-                    self._notify_low_credit(message.low_credit)
-                    self._observers.emit("on_low_credit", message.low_credit)
-                elif kind == "receipt":
-                    # Report validation commits in Control order; chain proof reads
-                    # are independent, bounded work and cannot stall voucher I/O.
-                    ledger = self._require_ledger(message.receipt.session_id)
-                    self._spawn(self._receipt(message.receipt))
-                elif kind == "drain":
-                    ledger = self._require_ledger(message.drain.session_id)
-                    targets = (
-                        [message.drain.run_id]
-                        if message.drain.HasField("run_id")
-                        else list(ledger.runs)
-                    )
-                    if not message.drain.HasField("run_id"):
-                        ledger.ready = False
-                    for identifier in targets:
-                        if identifier in ledger.runs:
-                            ledger.runs[identifier].failed_transport = True
-                    await self._persist()
-                    self._observers.emit("on_drain", message.drain)
                 elif kind == "close_result":
                     self._spawn(self._close_result(message.close_result))
                 else:
                     raise ClientError("provider sent a wrong-direction Control message")
+                kind = None
             raise ClientError("Control ended")
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self._control_lost(self._rpc_error(error))
+            self._control_lost(self._rpc_error(error), kind)
+
+    async def _meter(self, message: pb.ControlMessage) -> None:
+        """Apply one Meter in session order, or stop the cursor at a rejected one.
+
+        Every later Meter would gap, so none applies until a re-sync. Closing
+        Control now would make the provider cancel every active run (the
+        provider SDK's detach_locked), so active runs continue to their own
+        finals and the next request re-syncs once no stream is live, or after
+        _RESYNC_WAIT_S at most; the reattach snapshot then supplies the
+        accounting through its cursor.
+        Until then no new run starts and Meter-driven renewal stops, so a run
+        needing more output coverage ends within its funded bound.
+        """
+        if self._resync is not None:
+            return
+        try:
+            validate_message(message)
+            ledger = self._require_ledger(message.meter.session_id)
+            changed = ledger.apply_meter(message.meter, self._observed_state().deposit)
+        except _REPORT_FAILURES as error:
+            self._reject("meter", error)
+            self._resync, self._resync_at = error, asyncio.get_running_loop().time()
+            return
+        if changed:
+            await self._persist()
+            self._observers.emit("on_meter", message.meter)
+            if self._renew_task is None or self._renew_task.done():
+                self._renew_task = self._spawn(self._renew())
+
+    def _resync_if_idle(self) -> bool:
+        """End a stuck attachment once no Complete stream is live; see _meter.
+
+        After _RESYNC_WAIT_S a stream still live is ended too, so a provider
+        cannot keep the session unusable by holding a silent stream open.
+        """
+        if self._resync is None:
+            return False
+        live = [
+            output
+            for output in self._outputs.values()
+            if output.task is not None and not output.task.done()
+        ]
+        if live and asyncio.get_running_loop().time() - self._resync_at < _RESYNC_WAIT_S:
+            return False
+        for output in live:
+            if output.call is not None:
+                output.call.cancel()
+            assert output.task is not None
+            output.task.cancel()
+        self._control_lost(self._resync, "meter")
+        return True
+
+    async def _control_report(self, kind: str, message: pb.ControlMessage) -> None:
+        """Apply one report that may be rejected alone; see ``_SINGLE_REPORTS``."""
+        validate_message(message)
+        if kind == "challenge":
+            entry = self._challenges.get(message.challenge.request_id)
+            if entry is None:
+                raise ClientError("unsolicited payment challenge")
+            assert self._identity is not None
+            verify_challenge(
+                message.challenge,
+                self._identity,
+                request_id=message.challenge.request_id,
+                model=entry[0],
+            )
+            if not entry[1].done():
+                entry[1].set_result(message.challenge)
+            elif entry[1].result() != message.challenge:
+                raise ClientError("conflicting repeated challenge")
+            self._observers.emit("on_challenge", message.challenge)
+        elif kind == "low_credit":
+            ledger = self._require_ledger(message.low_credit.session_id)
+            deposit = self._chain_state().deposit
+            coverage = ledger.coverage(message.low_credit, deposit)  # Records nothing.
+            if coverage.superseded:
+                # Routine under concurrency; persistent ones expose a stale peer.
+                self._observers.emit(
+                    "on_error",
+                    HookError(
+                        "control",
+                        "SupersededCoverage",
+                        ledger.session_id,
+                        message.low_credit.coverage_request.run_id,
+                        "low_credit: coverage request is priced below usage already applied",
+                    ),
+                )
+            # LowCredit both requests a voucher and signals low funding. The SDK
+            # signs every coverage the confirmed deposit covers; only what it
+            # cannot cover, or a plain low-credit notice, reaches funding policy
+            # (MPPI-37). hooks.on_low_credit still observes every notice.
+            if not message.low_credit.HasField("coverage_request") or (
+                coverage.required is not None and coverage.required > deposit
+            ):
+                self._notify_low_credit(message.low_credit, deposit, coverage.required)
+            self._observers.emit("on_low_credit", message.low_credit)
+            target = coverage.target
+            if target is not None:
+                request = message.low_credit.coverage_request
+                if (
+                    request.run_id not in self._pending_vouchers
+                    and len(self._pending_vouchers) >= self._queue_options["max_messages"]
+                ):
+                    # The ledger recorded nothing, and any funding notice went out.
+                    raise ClientError("pending voucher queue is full")
+                ledger.cover(coverage)
+                self._pending_vouchers[request.run_id] = (target, request.control_generation)
+                if self._voucher_task is None or self._voucher_task.done():
+                    self._voucher_task = self._spawn(self._voucher_worker())
+        elif kind == "receipt":
+            # Cheap checks first, with no chain read: a Receipt for an unknown
+            # run, other prices or an already proven run costs the agent nothing.
+            receipt = message.receipt
+            ledger = self._require_ledger(receipt.session_id)
+            run = ledger._run(receipt.run_id)
+            if (receipt.model, receipt.rate_card_hash) != (
+                run.context.model,
+                run.context.rate_card_hash,
+            ):
+                raise ClientError("receipt differs from accepted run prices")
+            if receipt.run_id in self._receipts_seen:
+                return
+            if self._receipt_failures >= _RECEIPT_FAILURES:
+                raise ClientError("receipt proofs are suspended on this attachment")
+            if len(self._receipt_queue) >= _RECEIPT_QUEUE:
+                raise ClientError("receipt proof queue is full")
+            if self._receipt_task is None or self._receipt_task.done():
+                # The worker first runs after this step, so it sees the new entry.
+                self._receipt_task = self._spawn(self._receipt_worker())
+            self._receipts_seen.add(receipt.run_id)
+            self._receipt_queue.append((pb.Receipt.FromString(receipt.SerializeToString()), 0))
+        else:
+            ledger = self._require_ledger(message.drain.session_id)
+            targets = (
+                [message.drain.run_id] if message.drain.HasField("run_id") else list(ledger.runs)
+            )
+            if not message.drain.HasField("run_id"):
+                ledger.ready = False
+            for identifier in targets:
+                if identifier in ledger.runs:
+                    ledger.runs[identifier].failed_transport = True
+            await self._persist()
+            self._observers.emit("on_drain", message.drain)
+
+    def _reject(self, kind: str, error: Exception) -> None:
+        # Nothing the rejected report carried was applied; the attachment and
+        # every run continue. The record names the kind and the SDK's reason.
+        self._observers.emit(
+            "on_error", HookError("control", type(error).__name__, detail=_detail(kind, error))
+        )
 
     def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         if len(self._background) >= self._queue_options["max_messages"]:
@@ -1029,26 +1251,36 @@ class Client:
             target, generation = self._pending_vouchers.pop(identifier)
             await self._voucher(target, generation=generation, run_id=identifier)
 
-    def _notify_low_credit(self, notice: pb.LowCredit) -> None:
-        if self._on_low_credit is None:
+    def _notify_low_credit(self, notice: pb.LowCredit, deposit: int, required: int | None) -> None:
+        if self._on_low_credit is None and self._on_funding_notice is None:
             return
-        if self._low_credit_queue is None:
-            self._low_credit_queue = ByteQueue(**self._queue_options)
-        # Never wait for user code on Control. Bounds include serialized bytes;
-        # an unread/failed hook fails this attachment instead of silently dropping
-        # funding guidance or retaining unbounded work.
-        self._low_credit_queue.put_nowait(notice.SerializeToString())
+        # Never wait for user code on Control. A newer notice replaces one not
+        # yet delivered, and delivery works out the deposit and shortfall again,
+        # so a notice a confirmed top-up has since covered cannot over-fund.
+        self._funding = (notice.SerializeToString(), deposit, required)
         if self._low_credit_task is None or self._low_credit_task.done():
             self._low_credit_task = self._spawn(self._low_credit_worker())
 
     async def _low_credit_worker(self) -> None:
-        assert self._low_credit_queue is not None and self._on_low_credit is not None
-        queue = self._low_credit_queue
-        while True:
-            notice = pb.LowCredit.FromString(await queue.get())
-            # The callback receives a detached record and may enqueue caller-owned
+        while self._funding is not None:
+            data, deposit, required = self._funding
+            self._funding = None
+            try:
+                deposit = max(deposit, self._observed_state().deposit)
+            except ClientError:
+                pass
+            shortfall = None if required is None else required - deposit
+            if shortfall is not None and shortfall <= 0:
+                continue  # Confirmed funding already covers it.
+            # Each callback receives a detached record and may enqueue caller-owned
             # funding work. Its return value never authorizes an SDK top-up.
-            await asyncio.to_thread(self._on_low_credit, notice)
+            if self._on_low_credit is not None:
+                await asyncio.to_thread(self._on_low_credit, pb.LowCredit.FromString(data))
+            if self._on_funding_notice is not None:
+                await asyncio.to_thread(
+                    self._on_funding_notice,
+                    FundingNotice(pb.LowCredit.FromString(data), deposit, required, shortfall),
+                )
 
     def _rpc_error(self, error: Exception) -> Exception:
         if isinstance(error, grpc.aio.AioRpcError):
@@ -1074,6 +1306,8 @@ class Client:
             uint64(choice, field="initial_session_tokens", positive=True)
         async with self._open_lock:
             await self._start()
+            if self._resync is not None and not self._resync_if_idle():
+                raise ClientError("Control re-sync is pending until active runs end (at most 60 s)")
             if (
                 self._ledger is not None
                 and self._ledger.ready
@@ -1358,6 +1592,15 @@ class Client:
             self.timeout,
         )
         verify_reconnect_auth(ledger.domain, ledger.descriptor, nonce, signature)
+        # A run registered but not yet sent cannot be pending at the provider,
+        # and its Complete would now carry a stale generation. Record it
+        # NOT_ADMITTED first, or a provider may refuse this reattach (MPPI-41).
+        unsent = [identifier for identifier in self._unsent if identifier in ledger.pending]
+        self._unsent.clear()
+        if unsent:
+            for identifier in unsent:
+                ledger.abandon_unsent(identifier)
+            await self._persist()
         request = pb.ReconnectRequest(
             session_id=ledger.session_id,
             nonce=nonce,
@@ -1393,8 +1636,16 @@ class Client:
                 raise ClientError("snapshot chain fields differ from canonical state")
             # The provider may observe a settlement or top-up before our
             # periodic follower. Reconcile against fresh confirmed evidence,
-            # never an older cache position or unverified peer amounts.
-            current = await asyncio.wait_for(self.chain.refresh(), self.timeout)
+            # never an older cache position or unverified peer amounts. A
+            # load-balanced RPC may briefly serve a lower head: wait for it.
+            for delay in (0.25, 1.0, None):
+                current = await asyncio.wait_for(self.chain.refresh(), self.timeout)
+                if (
+                    delay is None
+                    or current.block.observation.block_number >= block.observation.block_number
+                ):
+                    break
+                await asyncio.sleep(delay)
             if current.block.observation.block_number < block.observation.block_number:
                 raise ClientError("confirmed chain observation precedes snapshot")
             if (
@@ -1440,6 +1691,7 @@ class Client:
             raise
         finally:
             self._snapshot_applied.set()
+        await self._announce_top_up()
         if require_ready:
             self._require_ready()
 
@@ -1550,11 +1802,14 @@ class Client:
             ):
                 return
             target = required_coverage((max(ledger.usage_numerator, ledger.coverage_numerator),))
-            if target > self._chain_state().deposit or (
-                ledger.voucher is not None and target <= ledger.voucher.cumulative
-            ):
+            signed = ledger.voucher.cumulative if ledger.voucher is not None else None
+            if target > self._chain_state().deposit or (signed is not None and target <= signed):
                 return
             await self._voucher(target, generation=ledger.generation)
+            if (ledger.voucher.cumulative if ledger.voucher is not None else None) == signed:
+                # Not eligible now (for example, an attachment not yet complete):
+                # stop rather than spin. A later Meter or top-up renews again.
+                return
 
     def accept_catalog(self, rate_card_hash: bytes) -> Catalog:
         """Accept an exact currently observed publication for future runs only."""
@@ -1571,7 +1826,7 @@ class Client:
         await self._persist()
         return identity.catalog
 
-    async def _create(self, model: str, stream: bool, payload: bytes) -> bytes:
+    async def _create(self, model: str, stream: bool, payload: bytes) -> tuple[bytes, _Output]:
         result = await self._open(model, None)
         if result.session is None:
             raise ClientError("opening is pending or unknown; reconcile before inference")
@@ -1604,10 +1859,6 @@ class Client:
         )
         if self._require_ready() is not ledger:
             raise ClientError("attachment changed while the run was signed")
-        ledger.register(context, signature)
-        await self._persist()
-        if self._require_ready() is not ledger:
-            raise ClientError("attachment changed before Complete submission")
         request = pb.CompleteRequest(
             model=model,
             stream=stream,
@@ -1619,17 +1870,36 @@ class Client:
             payload=payload,
         )
         validate_message(request)
+        ledger.register(context, signature)
+        self._unsent.add(context.run_id)
+        try:
+            await self._persist()
+            if self._require_ready() is not ledger:
+                raise ClientError("attachment changed before Complete submission")
+        except BaseException:
+            # Nothing was sent, so the provider never held this run. Record it
+            # NOT_ADMITTED with no usage so no reattach names it pending (MPPI-41).
+            if context.run_id in self._unsent:
+                self._unsent.discard(context.run_id)
+                current = self._ledger
+                if current is not None and context.run_id in current.pending:
+                    current.abandon_unsent(context.run_id)
+                    await self._persist()
+            raise
+        self._unsent.discard(context.run_id)
         output = _Output(ByteQueue(**self._queue_options))
         self._outputs[context.run_id] = output
         output.call = services.ChatStub(self._channel).Completions(
             request, timeout=self.request_timeout
         )
         output.task = asyncio.create_task(self._read_complete(context.run_id, stream))
-        return context.run_id
+        return context.run_id, output
 
     async def _read_complete(self, identifier: bytes, stream: bool) -> None:
+        # This stream ends on its own terms. Control loss or a reattach never
+        # cancels it, and a failure here fails only this run (MPPI-38). Reports
+        # apply to the current ledger, which a reattach may have replaced.
         output = self._outputs[identifier]
-        ledger = self._require_ledger()
         upstream: InferenceError | None = None
         payloads = 0
         try:
@@ -1657,7 +1927,9 @@ class Client:
                     if chunk.terminal.run_id != identifier:
                         raise ClientError("terminal names another run")
                     await self._verify_reference(chunk.terminal)
-                    ledger.apply_final(chunk.terminal, self._observed_state().deposit)
+                    self._require_ledger().apply_final(
+                        chunk.terminal, self._observed_state().deposit
+                    )
                     output.terminal = pb.Terminal.FromString(chunk.terminal.SerializeToString())
                     await self._persist()
                 else:
@@ -1672,24 +1944,27 @@ class Client:
                 raise ClientError("nonstreaming response requires one JSON object")
             output.queue.close()
         except asyncio.CancelledError:
-            ledger.runs[identifier].failed_transport = True
+            self._require_ledger().runs[identifier].failed_transport = True
             output.queue.close(
                 ClientError("inference was cancelled; final accounting may remain unresolved")
             )
             raise
         except Exception as error:
+            ledger = self._require_ledger()
             self._observers.emit(
                 "on_error",
-                HookError("complete", type(error).__name__, ledger.session_id, identifier),
+                HookError(
+                    "complete",
+                    type(error).__name__,
+                    ledger.session_id,
+                    identifier,
+                    _detail(None, error),
+                ),
             )
             ledger.runs[identifier].failed_transport = True
             output.queue.close(upstream if upstream is not None else self._rpc_error(error))
             if not output.call.done():
                 output.call.cancel()
-            if isinstance(error, (ValidationError, ChainEvidenceError)) or (
-                isinstance(error, ClientError) and not isinstance(error, InferenceError)
-            ):
-                self._control_lost(error)
             await self._persist()
 
     async def _verify_reference(self, message: pb.Terminal | pb.Receipt) -> None:
@@ -1708,7 +1983,33 @@ class Client:
                 self.timeout,
             )
 
-    async def _receipt(self, receipt: pb.Receipt) -> None:
+    async def _receipt_worker(self) -> None:
+        while self._receipt_queue:
+            await self._receipt(*self._receipt_queue.popleft())
+
+    async def _receipt(self, receipt: pb.Receipt, attempt: int = 0) -> None:
+        # A Receipt that cannot be validated or proven now is set aside alone;
+        # the run's Terminal on Complete, or a later snapshot, still accounts it.
+        try:
+            await self._verify_receipt(receipt)
+        except (TransportError, ChainLagError) as error:
+            # A transient or lagging chain read failed, not the Receipt: try
+            # once more after the queue, then let a later copy of it be proven.
+            if (
+                attempt == 0
+                and (isinstance(error, ChainLagError) or error.transient)
+                and len(self._receipt_queue) < _RECEIPT_QUEUE
+            ):
+                self._receipt_queue.append((receipt, 1))
+                return
+            self._receipts_seen.discard(receipt.run_id)
+            self._receipt_failures += 1
+            self._reject("receipt", error)
+        except (*_REPORT_FAILURES, TimeoutError) as error:
+            self._receipt_failures += 1
+            self._reject("receipt", error)
+
+    async def _verify_receipt(self, receipt: pb.Receipt) -> None:
         ledger = self._require_ledger(receipt.session_id)
         observation = observation_from_wire(receipt.chain_observation)
         if (
@@ -1716,24 +2017,37 @@ class Client:
             or observation.contract_address != ledger.domain.verifying_contract
         ):
             raise ClientError("receipt chain observation differs from session domain")
-        block = await asyncio.wait_for(
-            asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
-        )
-        state = await asyncio.wait_for(
-            asyncio.to_thread(self.chain.reader.session, ledger.session_id, block), self.timeout
-        )
-        if (
-            block.observation != observation
-            or state.settled_cumulative != receipt.settled_cumulative
-        ):
+        # The provider stamps every Receipt with its follower's current block,
+        # so most Receipts repeat an observation already proven here. The
+        # cached total is one this agent read itself at that exact canonical
+        # block of this session; a provider cannot add an entry.
+        key = (ledger.session_id, observation.block_number, observation.block_hash)
+        settled = self._proven.get(key)
+        if settled is None:
+            block = await asyncio.wait_for(
+                asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
+            )
+            state = await asyncio.wait_for(
+                asyncio.to_thread(self.chain.reader.session, ledger.session_id, block),
+                self.timeout,
+            )
+            if block.observation != observation:
+                raise ClientError("receipt settlement total contradicts chain or accepted usage")
+            canonical = await asyncio.wait_for(
+                asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
+            )
+            if canonical != block:
+                raise ClientError("receipt observation became noncanonical")
+            settled = state.settled_cumulative
+            self._proven[key] = settled
+            if len(self._proven) > _PROVEN_OBSERVATIONS:
+                self._proven.popitem(last=False)
+        else:
+            self._proven.move_to_end(key)
+        if settled != receipt.settled_cumulative:
             raise ClientError("receipt settlement total contradicts chain or accepted usage")
         await self._verify_reference(receipt)
-        canonical = await asyncio.wait_for(
-            asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
-        )
-        if canonical != block:
-            raise ClientError("receipt observation became noncanonical")
-        run = ledger.runs[receipt.run_id]
+        run = ledger._run(receipt.run_id)
         rates = ledger.catalogs[run.context.rate_card_hash].rates_for(run.context.model)
         reported = TokenCounts(receipt.input_tokens, receipt.cache_tokens, receipt.output_tokens)
         prospective = (
@@ -1744,25 +2058,25 @@ class Client:
         if receipt.settled_cumulative > prospective:
             raise ClientError("receipt settlement total exceeds accepted usage")
         ledger.apply_final(receipt, self._observed_state().deposit)
-        await self._persist()
-        self._observers.emit("on_receipt", receipt)
+        self._receipted.add(receipt.run_id)
         if receipt.run_id in self._outputs:
             self._outputs[receipt.run_id].receipt = pb.Receipt.FromString(
                 receipt.SerializeToString()
             )
+        await self._persist()
+        self._observers.emit("on_receipt", receipt)
 
-    async def _next(self, identifier: bytes) -> bytes | None:
-        return await self._outputs[identifier].queue.get_or_end()
+    async def _next(self, output: _Output) -> bytes | None:
+        return await output.queue.get_or_end()
 
-    async def _final_record(self, identifier: bytes, *, receipt: bool) -> Any:
-        output = self._outputs[identifier]
+    async def _final_record(self, output: _Output, *, receipt: bool) -> Any:
         value = output.receipt if receipt else output.terminal
         return type(value).FromString(value.SerializeToString()) if value is not None else None
 
-    async def _cancel_run(self, identifier: bytes) -> None:
-        output = self._outputs[identifier]
-        ledger = self._require_ledger()
-        ledger.runs[identifier].failed_transport = True
+    async def _cancel_run(self, identifier: bytes, output: _Output) -> None:
+        run = self._require_ledger().runs.get(identifier)
+        if run is not None:  # A settled, pruned run has nothing left to cancel.
+            run.failed_transport = True
         if output.call is not None:
             output.call.cancel()
         if output.task is not None and not output.task.done():
@@ -1788,6 +2102,7 @@ class Client:
             not ledger.ready
             or ledger.close_pending
             or self._control_failure is not None
+            or self._resync is not None
             or self._attached_generation == 0
             or self._attached_generation != ledger.generation
         ):
@@ -1824,7 +2139,7 @@ class Client:
         await self._local_start()
         ledger = self._require_ledger(identifier)
         uint64(amount, field="top-up amount", positive=True)
-        async with self._open_lock:
+        async with self._funding_lock:
             readiness = self.chain.readiness(identifier)
             if not readiness.ready or ledger.close_pending:
                 raise ClientError("session is ineligible for top-up")
@@ -1859,18 +2174,36 @@ class Client:
 
     async def _top_up_confirmed(self, result: OperationResult) -> None:
         await self.chain.refresh()
-        ledger = self._require_ledger()
+        self._require_ledger()
+        self._top_up_hint = result.tx_hash
         if self._control is not None and self._control_failure is None:
-            await self._send(
-                pb.ControlMessage(
-                    top_up_notice=pb.TopUpNotice(session_id=ledger.session_id, tx=result.tx_hash)
-                )
-            )
+            await self._announce_top_up()
             # A prior Meter may already require more than the former deposit.
             # Recheck that retained target against fresh confirmed funding now;
             # a hint or pending wallet result never changes the spending bound.
-            if self._renew_task is None or self._renew_task.done():
-                self._renew_task = self._spawn(self._renew())
+            # An attachment still in progress renews on its own after attaching.
+            ledger = self._require_ledger()
+            if self._attached_generation != 0 and self._attached_generation == ledger.generation:
+                if self._renew_task is None or self._renew_task.done():
+                    self._renew_task = self._spawn(self._renew())
+
+    async def _announce_top_up(self) -> None:
+        """Send TopUpNotice only on an attached stream (a hint, never credit).
+
+        Before ReconnectRequest has attached a new stream, a provider refuses
+        any other message and ends the stream, so the hint waits for _attach.
+        """
+        ledger = self._require_ledger()
+        if (
+            self._top_up_hint is None
+            or self._attached_generation == 0
+            or self._attached_generation != ledger.generation
+        ):
+            return
+        tx, self._top_up_hint = self._top_up_hint, None
+        await self._send(
+            pb.ControlMessage(top_up_notice=pb.TopUpNotice(session_id=ledger.session_id, tx=tx))
+        )
 
     async def _cooperative_close(self, identifier: bytes) -> OperationResult:
         await self._local_start()
@@ -1879,7 +2212,7 @@ class Client:
             raise self._closed_error
         if self._closed_result is not None:
             return self._closed_result
-        async with self._open_lock:
+        async with self._open_lock, self._funding_lock:
             await self._ensure_close_attachment()
             ledger = self._require_ledger(identifier)
             ledger.close_pending, ledger.ready = True, False
@@ -1948,7 +2281,7 @@ class Client:
     async def _exit(self, identifier: bytes, kind: OperationKind) -> OperationResult:
         await self._local_start()
         ledger = self._require_ledger(identifier)
-        async with self._open_lock:
+        async with self._open_lock, self._funding_lock:
             ref = kind.value + "-" + identifier.hex()
             if ref in self._operations:
                 # Current Closed/paused state cannot erase this operation's

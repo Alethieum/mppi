@@ -37,6 +37,26 @@ def monotone(previous: TokenCounts, current: TokenCounts, catalog: Catalog, mode
         raise invalid("provider counts or exact cost regressed")
 
 
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """One LowCredit's outcome for this agent.
+
+    ``target`` is the cumulative voucher ceiling to sign now, if any.
+    ``required`` is the USDC amount a coverage request requires, in six-decimal
+    base units; above the deposit, or for a run that already ended, it signs
+    nothing.
+    ``superseded`` marks a request the provider computed before usage this
+    agent has already applied; the provider's next check replaces it.
+    ``numerator`` is a signable target's exact price. Deciding records
+    nothing; Ledger.cover records it once the voucher is queued.
+    """
+
+    target: int | None = None
+    required: int | None = None
+    superseded: bool = False
+    numerator: int | None = None
+
+
 @dataclass(slots=True)
 class Run:
     context: RunContext
@@ -104,6 +124,27 @@ class Ledger:
         run = Run(context, signature)
         self.runs[context.run_id] = run
         return run
+
+    def forget(self, identifier: bytes) -> None:
+        """Drop a settled final run; its counts stay in the per-bucket usage.
+
+        The caller decides that nothing can still change it (Client._prune).
+        """
+        if self._run(identifier).final is None:
+            raise invalid("only a final run can be forgotten")
+        del self.runs[identifier]
+
+    def abandon_unsent(self, identifier: bytes) -> None:
+        """Record a registered run whose Complete was never sent as NOT_ADMITTED.
+
+        The provider never held it, so it has no usage, no Meter cursor and no
+        final sequence (``recovered_through``), and is never named pending again.
+        """
+        run = self._run(identifier)
+        if run.final is not None or run.meter_seq or run.counts != TokenCounts(0, 0, 0):
+            raise invalid("only an unreported pending run can be recorded unsent")
+        run.final = (0, 0, 0, pb.RUN_STATUS_NOT_ADMITTED, self.meter_seq, 0)
+        run.recovered_through = self.meter_seq
 
     def _run(self, identifier: bytes) -> Run:
         try:
@@ -232,7 +273,7 @@ class Ledger:
         run.final = final
         return True
 
-    def coverage(self, notice: pb.LowCredit, deposit: int) -> int | None:
+    def coverage(self, notice: pb.LowCredit, deposit: int) -> Coverage:
         validate_message(notice)
         if notice.session_id != self.session_id:
             raise invalid("coverage names a different session")
@@ -243,22 +284,22 @@ class Ledger:
                 for run in self.runs.values()
             ):
                 raise invalid("funding guidance has no signed run price binding")
-            return None
+            return Coverage()
         request = notice.coverage_request
         run = self._run(request.run_id)
-        if not run.active:
-            return None
         if (
             request.control_generation != self.generation
             or run.context.control_generation != self.generation
             or notice.model != run.context.model
             or notice.rate_card_hash != run.context.rate_card_hash
         ):
+            if not run.active:
+                return Coverage()  # Late guidance for work that already ended.
             raise invalid("coverage correlation differs from signed pending work")
+        # Every retained run carries its own signed price acceptance, including one
+        # whose stream this agent already ended while the provider still holds it.
         known = {
-            (item.context.model, item.context.rate_card_hash)
-            for item in self.runs.values()
-            if item.active
+            (item.context.model, item.context.rate_card_hash) for item in self.runs.values()
         } | set(self.usage)
         rows: dict[tuple[str, bytes], TokenCounts] = {}
         for row in request.required_by_price:
@@ -266,20 +307,40 @@ class Ledger:
             if key not in known or key in rows:
                 raise invalid("coverage lacks accepted prices or repeats a bucket")
             rows[key] = counts(row)
-            if key in self.usage:
-                monotone(self.usage[key], rows[key], self.catalogs[key[1]], key[0])
         candidate = (run.context.model, run.context.rate_card_hash)
-        if candidate not in rows or not set(self.usage) <= set(rows):
-            raise invalid("coverage omits candidate or historical usage")
-        total = sum(
-            priced_numerator(value, self.catalogs[version].rates_for(model))
-            for (model, version), value in rows.items()
-        )
+        if candidate not in rows:
+            raise invalid("coverage omits its candidate")
+        priced = {
+            key: priced_numerator(value, self.catalogs[key[1]].rates_for(key[0]))
+            for key, value in rows.items()
+        }
+        # Rows are the provider's target at its own check, and it reserves by
+        # price: a row may hold fewer tokens of one kind than metered usage
+        # (cache beyond a zero-cache bound, input beyond a low estimate) while
+        # covering its cost. A final delivered on a Complete stream can also be
+        # applied here first, since order across the two streams is unspecified
+        # (protocol.md, Definitive outcomes and settlement). Only a bucket priced
+        # below its known usage, or a missing one, makes this target superseded:
+        # sign nothing for it rather than fail the attachment.
+        if not set(self.usage) <= set(rows) or any(
+            priced[key] < priced_numerator(value, self.catalogs[key[1]].rates_for(key[0]))
+            for key, value in self.usage.items()
+        ):
+            return Coverage(superseded=True)
+        total = sum(priced.values())
         required = required_coverage((total,))
-        if required > deposit:
-            return None
-        self.coverage_numerator = total
-        return max(required, self.voucher.cumulative if self.voucher is not None else 0)
+        if required > deposit or not run.active:
+            # Ended work is advisory only: its shortfall may still inform the
+            # caller's funding (protocol.md, Request admission, step 6).
+            return Coverage(required=required)
+        current = self.voucher.cumulative if self.voucher is not None else 0
+        return Coverage(max(required, current), required, numerator=total)
+
+    def cover(self, coverage: Coverage) -> None:
+        """Record the target of a coverage decision the caller is signing."""
+        if coverage.target is None or coverage.numerator is None:
+            raise invalid("only a signable coverage decision can be recorded")
+        self.coverage_numerator = coverage.numerator
 
     def restore_snapshot(
         self, snapshot: pb.SessionState, *, nonce: bytes, deposit: int, settled: int
@@ -344,7 +405,25 @@ class Ledger:
             if row.run_id in seen:
                 raise invalid("duplicate snapshot run")
             seen.add(row.run_id)
-            run = self._run(row.run_id)
+            if row.run_id not in self.runs:
+                # A final run this agent already settled and forgot: its counts
+                # are in the bucket totals, and only this agent's own signature
+                # can name it. Nothing else of it remains to restore.
+                if row.status != pb.RUN_STATUS_NOT_ADMITTED:
+                    verify_run_auth(
+                        self.domain,
+                        self.descriptor,
+                        RunContext(
+                            self.session_id,
+                            row.run_id,
+                            row.control_generation,
+                            row.model,
+                            row.rate_card_hash,
+                        ),
+                        row.auth_signature,
+                    )
+                continue
+            run = self.runs[row.run_id]
             value = counts(row)
             if row.status == pb.RUN_STATUS_NOT_ADMITTED:
                 if run.counts != TokenCounts(0, 0, 0) or (
@@ -410,6 +489,23 @@ class Ledger:
                 if key not in totals:
                     raise invalid("snapshot erased a known run's usage")
                 monotone(value, totals[key], catalogs[key[1]], key[0])
+        # A forgotten run's counts live only in usage, so the retained runs no
+        # longer partition it. Known usage plus each retained run's increase
+        # is therefore the floor for the snapshot's totals.
+        floor = dict(self.usage)
+        for run, value, _ in run_updates:
+            key = (run.context.model, run.context.rate_card_hash)
+            old = floor.get(key, TokenCounts(0, 0, 0))
+            floor[key] = TokenCounts(
+                old.input_tokens + value.input_tokens - run.counts.input_tokens,
+                old.cache_tokens + value.cache_tokens - run.counts.cache_tokens,
+                old.output_tokens + value.output_tokens - run.counts.output_tokens,
+            )
+        for key, value in floor.items():
+            if value != TokenCounts(0, 0, 0):
+                if key not in totals:
+                    raise invalid("snapshot erased a known run's usage")
+                monotone(value, totals[key], self.catalogs[key[1]], key[0])
         total_numerator = sum(
             priced_numerator(value, catalogs[version].rates_for(model))
             for (model, version), value in totals.items()

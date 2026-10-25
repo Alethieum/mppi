@@ -6,6 +6,7 @@ these cases check price authority, cursor cutover and economic idempotence.
 
 import asyncio
 import threading
+from collections import OrderedDict, deque
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -92,7 +93,15 @@ def component_client():
     client._challenges, client._outputs = {}, {}
     client._control = None
     client._on_low_credit = None
-    client._low_credit_queue = client._low_credit_task = None
+    client._funding = client._low_credit_task = None
+    client._on_funding_notice = client._top_up_hint = None
+    client._unsent = set()
+    client._resync = None
+    client._receipt_queue, client._receipt_task = deque(), None
+    client._receipts_seen, client._receipt_failures = set(), 0
+    client._receipted, client._closed_result = set(), None
+    client._funding_lock = asyncio.Lock()
+    client._proven = OrderedDict()
     return client
 
 
@@ -724,14 +733,14 @@ def test_native_partial_complete_keeps_unknown_accounting_without_replay(cause):
         output.task = asyncio.create_task(client._read_complete(identifier, True))
         try:
             await asyncio.wait_for(emitted.wait(), 2)
-            assert await asyncio.wait_for(client._next(identifier), 2) == b'{"text":"partial"}'
+            assert await asyncio.wait_for(client._next(output), 2) == b'{"text":"partial"}'
             if cause == "cancelled":
-                await client._cancel_run(identifier)
+                await client._cancel_run(identifier, output)
             else:
                 release.set()
                 await asyncio.wait_for(output.task, 2)
             with pytest.raises((ClientError, ValidationError)):
-                await asyncio.wait_for(client._next(identifier), 2)
+                await asyncio.wait_for(client._next(output), 2)
             assert calls == [identifier]
             assert client._ledger.pending == (identifier,)
             assert client._ledger.usage_amount == 0
@@ -973,5 +982,91 @@ def test_open_reconnects_after_funding_outlives_control_setup(monkeypatch):
             assert len(client._operations) == 1
             assert client._operations[original_ref][1].state is OperationState.CONFIRMED
             assert not client._outputs and not client._ledger.runs
+
+    asyncio.run(scenario())
+
+
+def test_unsent_run_is_not_admitted_when_control_is_lost_before_submission():
+    """MPPI-38/41: a run registered but never sent must not stay pending."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        ledger.runs.clear()
+        current = SimpleNamespace(
+            sessions=client.chain.snapshot().sessions,
+            identities={DESCRIPTOR.provider_id: SimpleNamespace(catalog=CATALOG)},
+        )
+        client.chain.snapshot = lambda: current
+        client._open = AsyncMock(return_value=SimpleNamespace(session=object()))
+
+        async def persist():
+            if not client._persist.await_count - 1:  # Lost while registering.
+                client._control_failure = ClientError("fixture Control loss")
+
+        client._persist = AsyncMock(side_effect=persist)
+        payload = b'{"model":"test/model","messages":[],"stream":true}'
+        with pytest.raises(ClientError, match="not ready"):
+            await client._create(MODEL, True, payload)
+        (run,) = ledger.runs.values()
+        assert run.final == (0, 0, 0, pb.RUN_STATUS_NOT_ADMITTED, 0, 0)
+        assert ledger.pending == () and client._persist.await_count == 2
+        assert not client._outputs and not client._unsent
+
+    asyncio.run(scenario())
+
+
+def test_attachment_records_a_registered_but_unsent_run_not_admitted():
+    async def scenario():
+        client = attachment_client()
+        ledger = client._ledger
+        message = snapshot(ledger)
+        context = RunContext(ledger.session_id, b"u" * 32, 1, MODEL, CATALOG.rate_card_hash)
+        ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+        client._unsent = {b"u" * 32}
+        deliver_snapshot(client, message)
+        await client._attach(b"t" * 32, require_ready=False)
+        request = client._send.await_args_list[-1].args[0].reconnect_request
+        assert b"u" * 32 not in request.pending_run_ids
+        assert client._ledger.runs[b"u" * 32].final[3] == pb.RUN_STATUS_NOT_ADMITTED
+        assert client._ledger.generation == 2 and not client._unsent
+
+    asyncio.run(scenario())
+
+
+def test_attachment_waits_briefly_for_a_lagging_rpc_to_reach_the_snapshot_block():
+    """A load-balanced RPC may first serve a head below the provider's snapshot."""
+
+    async def scenario():
+        client = attachment_client()
+        old = client.chain.current
+        message = snapshot(client._ledger)
+        newer_block = replace(
+            old.block,
+            observation=replace(old.block.observation, block_number=2, block_hash=b"d" * 32),
+            parent_hash=old.block.observation.block_hash,
+        )
+        message.chain_block_number = 2
+        message.chain_block_hash = newer_block.observation.block_hash
+        client.chain.reader.block.return_value = newer_block
+        behind, caught_up = SimpleNamespace(**vars(old)), SimpleNamespace(**vars(old))
+        caught_up.block = newer_block
+        client.chain.refresh = AsyncMock(side_effect=[behind, caught_up])
+        deliver_snapshot(client, message)
+        await client._attach(b"t" * 32, require_ready=False)
+        assert client._attached_generation == 2 and client.chain.refresh.await_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_a_pending_top_up_notice_follows_the_reconnect_request():
+    async def scenario():
+        client = attachment_client()
+        client._top_up_hint = b"t" * 32
+        deliver_snapshot(client, snapshot(client._ledger))
+        await client._attach(b"t" * 32, require_ready=False)
+        kinds = [call.args[0].WhichOneof("kind") for call in client._send.await_args_list]
+        assert kinds == ["session_open", "reconnect_request", "top_up_notice"]
+        assert client._top_up_hint is None
 
     asyncio.run(scenario())

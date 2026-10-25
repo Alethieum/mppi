@@ -3,7 +3,7 @@
 The native Python agent `Client`, provider `Mppi` payment services and shared
 chain observer implement the paid request loop below. Start with the
 [provider quickstart](provider-quickstart.md) or [agent quickstart](agent-quickstart.md)
-for `0.1.2` built-in setup with packaged official Arc mainnet and testnet profiles.
+for built-in setup with packaged official Arc mainnet and testnet profiles.
 The [Python composition reference](python-quickstart.md) covers custom wallet
 and explicit chain capabilities.
 
@@ -150,10 +150,30 @@ wallet/HTTP/chain calls run outside that loop. `create_raw` accepts validated JS
 bytes when the caller must retain exact numeric text. Nonstreaming create returns
 one original JSON response after a valid terminal and gRPC OK trailers.
 
+Each run's Complete stream ends on its own terms. A lost Control attachment or a
+reattach never cancels it, so a run the provider already completed still
+delivers its answer and final. One Control report that fails validation or
+cannot be proven now (a challenge, `LowCredit`, `Receipt` or `Drain`) is set
+aside with an `on_error` record naming its kind and reason; the attachment and
+every run continue. A Receipt is first checked against its retained run and
+prices with no chain read; each run's Receipt is proven once per attachment,
+one proof at a time, and after 16 failed proofs on one attachment later
+Receipts are rejected without chain reads. A rejected `Meter` stops the session
+cursor: Control stays open so active runs finish (closing it would make the
+provider cancel them), no new run starts, and the next request re-syncs once
+no stream is live, or after 60 s, when a stream still live is ended. A run registered but never sent is recorded `NOT_ADMITTED`
+locally and is never named pending at a reattach.
+
 Reuse the checkpoint path and recoverable signer credential across restarts.
 The agent uses an exclusive local file lock and atomic, mode-0600 checkpoints
 on macOS/Linux. It stores signed payment intents and accounting, not private
-keys or prompts. Failure to retain required intent stops submission/signing.
+keys or prompts. Its size stays bounded in a long session: a run is forgotten
+once its final and final Meter are applied, its stream has ended and its
+Receipt was verified (or a snapshot resolved it, the session closed, or 1,024
+settled runs already wait for Receipts). Usage stays exact in per-price totals,
+and one run per price is kept as signed price acceptance. `mppi-agent` 0.1.3
+writes this checkpoint as format 2 and still reads format 1; 0.1.2 refuses
+format 2, so do not downgrade over a checkpoint 0.1.3 has written. Failure to retain required intent stops submission/signing.
 Wallet-service credentials and durable transaction idempotency remain in the
 wallet adapter. A changed signer never silently opens a second funded session.
 
@@ -194,6 +214,26 @@ deposit, the provider makes one canonical refresh bounded by `max_age_ms`,
 outside the accounting lock, then rechecks ownership, readiness and the deposit
 bound. Covered vouchers use the cache. Execution continues under its existing
 funded limit while refresh is pending; a denied grant still terminates the run.
+
+**Read cost.** One refresh for one provider and one session makes 24 RPC
+requests (22 on the first): the new head (2), the previous head again (2), the
+deployment's code, implementation slots and signing domain (10), the pause level
+(1), the provider identity and catalog (6), the session (1) and the head once
+more (2). Each further watched session adds 1. With the default
+`max_age_ms // 4` poll, a 60 s freshness limit polls every 15 s, about 1.6
+requests per second per client. An agent's Receipt costs 5 requests only for the
+first Receipt carrying a given provider block observation; later Receipts with
+that observation reuse the total this agent read itself. A Receipt or Terminal
+with a settlement reference adds 8. JSON-RPC batches do not reduce what most
+paid plans count.
+
+A failed refresh is repeated once, 250 ms later, before it fails closed, and
+`last_refresh_failure` keeps the last failure's error class, SDK reason and
+monotonic time. A load-balanced RPC may serve backends at slightly different
+heights ([Arc RPC endpoints](https://docs.arc.io/arc/references/rpc-endpoints)):
+a head or block behind accepted evidence is `ChainLagError`, not a regression.
+If it persists, the accepted snapshot stays and ages as usual, so freshness is
+never extended. A different block at an accepted height still fails.
 
 `snapshot()` returns fresh evidence or fails; `current` exposes the last evidence
 for accounting even when stale. `readiness(session_id)` checks positive existence,
@@ -310,7 +350,11 @@ runtime must retain prior confirmed results and reject observation regressions.
 
 `ChainReader(rpc, profile)` performs synchronous, block-pinned reads. Invoke it
 outside the gRPC I/O loop. `HttpJsonRpc` is a bounded read-only adapter: no wallet
-submissions, redirects or automatic retries. TLS verifies certificate and host;
+submissions or redirects. Its methods only read, so it repeats a transient
+failure up to twice, 250 ms and then 1 s later: HTTP 408, 425, 429, 500, 502,
+503 or 504, a refused or dropped connection, or JSON-RPC error -32005 or -32007
+(rate limits) or -32014 (a backend that has not imported the block yet). A timeout or any other failure is not repeated, and a repeat
+starts only within one transport timeout of the first attempt. TLS verifies certificate and host;
 `HttpTransport(ca_file=...)` can trust a provider's private CA. Its timeout bounds
 individual blocking I/O operations, not an entire SDK operation's lifetime.
 

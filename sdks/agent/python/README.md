@@ -1,5 +1,35 @@
 # MPPI agent SDK for Python
 
+Version `0.1.3` keeps the wire protocol, contract, signatures and payment
+semantics of `0.1.2` and works with the providers running `0.1.2`. It changes
+how the client survives concurrency, rate limits and lagging RPCs:
+
+- one invalid or unprovable Control report is rejected alone; Control loss
+  or a reattach never cancels a Complete stream, so completed answers arrive;
+- a coverage request overtaken by another stream's final is ignored, not
+  fatal, and judged by price;
+- chain reads repeat rate-limited, unavailable and not-yet-imported reads;
+  a lagging RPC head keeps accepted evidence; a failed refresh is repeated;
+- a top-up no longer blocks requests; `from_config` polls every 15 s and
+  takes `max_age_ms` and `poll_interval_ms`; a Receipt observation is
+  proven once;
+- `on_low_credit` receives a `LowCredit` only for what the deposit cannot
+  cover; the new `on_funding_notice` gets a `FundingNotice` with its
+  `shortfall`, worked out at delivery;
+- settled runs are forgotten, so the payment checkpoint stays bounded. It is
+  written as format 2; do not downgrade to `0.1.2` over it.
+
+Known in `0.1.3`, planned for `0.1.4`:
+
+- `on_low_credit` receives fewer notices than in `0.1.2`: only shortfalls the
+  deposit cannot cover and plain low-credit notices, coalesced to the latest
+  undelivered one.
+- While a funding callback is running, a newer plain notice can replace an
+  undelivered shortfall, which then arrives without its amount. The provider
+  re-sends coverage while the requirement stands.
+- A top-up confirmed while Control is reattaching renews vouchers at the next
+  Meter rather than at once. Nothing stalls.
+
 Version `0.1.2` supports explicit Arc mainnet and testnet selection with built-in Circle CLI onboarding and
 `Client.from_config(...)`. See the
 [agent quickstart](../../../docs/agent-quickstart.md).
@@ -41,11 +71,20 @@ The caller supplies wallet integration; no login or key creation is implicit.
   catalog for subsequent runs. Active and historical runs keep their prices.
 - `sessions.topUp(session_id, amount)` takes positive USDC base units. Funding
   is explicit; low-credit guidance never triggers a wallet transfer.
-- `Client(..., on_low_credit=callback)` delivers validated `LowCredit` messages
-  to caller code in order, outside the Control event loop. Each message is a
-  detached copy. The caller may explicitly call `sessions.topUp`; the SDK adds
-  no funding policy. Keep callbacks bounded: an exception or full callback queue
-  fails the attachment. Queued callbacks are discarded when Control is lost;
+- `Client(..., on_low_credit=callback)` delivers funding notices to caller
+  code outside the Control event loop, as a detached `pb.LowCredit`. A
+  provider's `LowCredit` both asks for a voucher and signals low funding: the
+  SDK signs every coverage the confirmed deposit covers itself, so only a
+  requirement the deposit cannot cover, or a plain low-credit notice, reaches
+  the callback. `Client(..., on_funding_notice=callback)` receives the same
+  notices as a `FundingNotice(notice, deposit, required, shortfall)`, in USDC
+  base units (`required` and `shortfall` are `None` for a plain notice), for
+  example `client.sessions.topUp(session_id, funding.shortfall)`. The deposit
+  and shortfall are worked out at delivery, a notice that a confirmed top-up
+  has since covered is dropped, and an undelivered notice is replaced by a
+  newer one, so a slow callback never sees a stale shortfall. The SDK adds no
+  funding policy. Keep callbacks bounded: an exception fails the attachment.
+  An undelivered notice is discarded when Control is lost;
   an already running callback cannot be interrupted. Confirmed top-up rechecks
   the retained voucher target against fresh chain funding.
 - `sessions.recover(session_id)` restores retained state and authenticates a new

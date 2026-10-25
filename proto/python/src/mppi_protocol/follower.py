@@ -12,8 +12,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from .chain import Block, ChainEvidenceError, ChainReader, ChainSession
+from .chain import Block, ChainEvidenceError, ChainLagError, ChainReader, ChainSession
 from .discovery import ProviderIdentity
+from .errors import ValidationError
+from .http import TransportError
 from .types import (
     PauseLevel,
     PaymentCode,
@@ -29,6 +31,23 @@ def _milliseconds(value: int, field: str) -> int:
     if type(value) is not int or not 0 < value <= ((1 << 63) - 1) // 1_000_000:
         raise ValueError(f"{field} must be positive bounded integer milliseconds")
     return value
+
+
+# A failed refresh is repeated once, 250 ms later, before it fails closed.
+_REFRESH_RETRY_DELAYS = (0.25,)
+_sleep = asyncio.sleep
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshFailure:
+    """The last failed refresh attempt: error class, SDK reason, monotonic time.
+
+    The reason is SDK-written text only, never an endpoint or remote content.
+    """
+
+    kind: str
+    reason: str
+    at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +96,7 @@ class ChainFollower:
         self._progress_at = 0.0
         self._failed = True
         self._running = False
+        self.last_refresh_failure: RefreshFailure | None = None
 
     @property
     def current(self) -> ChainSnapshot | None:
@@ -132,6 +152,8 @@ class ChainFollower:
         block = self.reader.block()
         if previous is not None:
             old = previous.block
+            if block.observation.block_number < old.observation.block_number:
+                raise ChainLagError("RPC head is behind accepted chain evidence")
             if self.reader.block(old.observation.block_number) != old:
                 raise ChainEvidenceError("previously accepted canonical block changed")
             if (
@@ -173,36 +195,72 @@ class ChainFollower:
         )
 
     async def refresh(self) -> ChainSnapshot:
+        """Read a new canonical position; repeat a failed read once (MPPI-34).
+
+        A head or block behind accepted evidence is lag (ChainLagError): if it
+        persists, the accepted snapshot is kept and ages as usual, so freshness
+        is never extended. Any other failure fails closed until a later read.
+        """
         async with self._lock:
             try:
-                result = await asyncio.to_thread(
-                    self._read, tuple(self._providers), tuple(self._sessions), self._current
-                )
-                previous = self._current
-                if previous is not None:
-                    old = previous.block
-                    new = result.block
-                    if (
-                        new.observation.block_number < old.observation.block_number
-                        or new.timestamp < old.timestamp
-                        or (
-                            new.observation.block_number == old.observation.block_number
-                            and new != old
+                for delay in (*_REFRESH_RETRY_DELAYS, None):
+                    try:
+                        self._accept(
+                            await asyncio.to_thread(
+                                self._read,
+                                tuple(self._providers),
+                                tuple(self._sessions),
+                                self._current,
+                            )
                         )
-                    ):
-                        raise ChainEvidenceError("canonical observation regressed or changed")
-                if (
-                    previous is None
-                    or result.block.observation.block_number
-                    > previous.block.observation.block_number
-                ):
-                    self._progress_at = result.observed_at
-                self._current = result
-                self._failed = False
+                        break
+                    except Exception as error:
+                        self.last_refresh_failure = RefreshFailure(
+                            type(error).__name__,
+                            str(error)[:200]
+                            if isinstance(
+                                error, (ChainEvidenceError, TransportError, ValidationError)
+                            )
+                            else "",
+                            self._clock(),
+                        )
+                        if delay is None:
+                            if isinstance(error, ChainLagError) and self._covers_watched():
+                                break
+                            raise
+                    await _sleep(delay)
                 return self.snapshot()
             except BaseException:
                 self._failed = True
                 raise
+
+    def _accept(self, result: ChainSnapshot) -> None:
+        previous = self._current
+        if previous is not None:
+            old = previous.block
+            new = result.block
+            if (
+                new.observation.block_number < old.observation.block_number
+                or new.timestamp < old.timestamp
+                or (new.observation.block_number == old.observation.block_number and new != old)
+            ):
+                raise ChainEvidenceError("canonical observation regressed or changed")
+        if (
+            previous is None
+            or result.block.observation.block_number > previous.block.observation.block_number
+        ):
+            self._progress_at = result.observed_at
+        self._current = result
+        self._failed = False
+
+    def _covers_watched(self) -> bool:
+        current = self._current
+        return (
+            current is not None
+            and not self._failed
+            and all(provider in current.identities for provider in self._providers)
+            and all(session in current.sessions for session in self._sessions)
+        )
 
     def snapshot(self) -> ChainSnapshot:
         result = self._current

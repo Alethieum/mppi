@@ -53,7 +53,7 @@ def test_unsafe_or_invalid_existing_checkpoint_fails_closed(tmp_path: Path, kind
     if kind == "duplicate":
         path.write_text('{"version":1,"operation_ref":"a","operation_ref":"b"}')
     elif kind == "version":
-        path.write_text('{"version":2}')
+        path.write_text('{"version":3}')  # 1 and 2 are the supported formats.
     elif kind == "boolean_version":
         path.write_text('{"version":true}')
     elif kind == "permissions":

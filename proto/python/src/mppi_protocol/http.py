@@ -1,6 +1,7 @@
 """Small bounded HTTP transport for discovery and chain JSON-RPC.
 
-No redirects, cookies, implicit proxy credentials, retries or wallet submissions.
+No redirects, cookies, implicit proxy credentials, retries or wallet submissions;
+failures say whether they are transient so a read-only caller may repeat them.
 Run blocking reads away from the gRPC I/O loop. TLS uses certificate/hostname
 verification; an optional CA file adds support for provider-managed private PKI.
 """
@@ -18,8 +19,23 @@ from .errors import ValidationCode, ValidationError
 MAX_RPC_RESPONSE_BYTES = 4 << 20
 
 
+# Statuses a later identical read may not repeat: timeout, too early, rate limit
+# and server/gateway unavailability (RFC 9110 sections 15.5.9, 15.6; RFC 8470
+# section 5.2; RFC 6585 section 4).
+TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 class TransportError(RuntimeError):
-    """Read did not produce usable evidence; never proof of economic failure."""
+    """Read did not produce usable evidence; never proof of economic failure.
+
+    ``transient`` marks a rate limit, an unavailable server or a dropped
+    connection, which a later identical read may not repeat. A timeout,
+    rejected content, TLS verification failure or other status is not.
+    """
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +101,10 @@ class HttpTransport:
             )
             response = connection.getresponse()
             if response.status != 200:
-                raise TransportError(f"HTTP endpoint returned status {response.status}")
+                raise TransportError(
+                    f"HTTP endpoint returned status {response.status}",
+                    transient=response.status in TRANSIENT_STATUSES,
+                )
             if response.getheader("Content-Encoding", "identity").lower() != "identity":
                 raise TransportError("compressed HTTP response is not accepted")
             if (
@@ -97,8 +116,11 @@ class HttpTransport:
             if len(raw) > self.max_bytes:
                 raise TransportError("HTTP response exceeds the configured byte limit")
             return raw
-        except (OSError, http.client.HTTPException, ValueError):
+        except (TimeoutError, ssl.SSLCertVerificationError, ValueError):
             # Do not echo endpoint credentials, remote bodies or TLS file paths.
             raise TransportError("HTTP request failed") from None
+        except (OSError, http.client.HTTPException):
+            # Refused, reset or dropped connections, including a closed keep-alive.
+            raise TransportError("HTTP request failed", transient=True) from None
         finally:
             connection.close()

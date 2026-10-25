@@ -17,8 +17,9 @@ discovery. Each admitted run retains its accepted prices.
 Start with the [agent quickstart](docs/agent-quickstart.md) to onboard a wallet
 and make paid inference requests. Providers start with the
 [provider quickstart](docs/provider-quickstart.md) to initialize declarations,
-onboard and attach MPPI to their existing gateway. Agent and provider SDKs are
-version `0.1.2`, sharing Python protocol package `0.1.1`. The built-in wallet
+onboard and attach MPPI to their existing gateway. The agent SDK is version
+`0.1.3` with Python protocol package `0.1.2`; the published provider SDKs are
+version `0.1.2` with protocol `0.1.1`. The built-in wallet
 integration uses Circle Agent Wallet for both roles.
 Both quickstarts select the packaged official Arc testnet profile and document
 explicit mainnet selection. Explicit

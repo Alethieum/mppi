@@ -4,6 +4,7 @@ import json
 import ssl
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -49,6 +50,21 @@ class Peer(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         response = {"jsonrpc": "2.0", "id": request["id"], "result": "0x4cef52"}
+        if self.path.startswith("/slow"):
+            threading.Event().wait(1)
+        if self.path.startswith(("/status/", "/flaky/")):
+            _, kind, status, failures = (self.path + "/0").split("/")[:4]
+            with ATTEMPTS_LOCK:
+                ATTEMPTS[self.path] = ATTEMPTS.get(self.path, 0) + 1
+                failing = kind == "status" or ATTEMPTS[self.path] <= int(failures)
+            if failing:
+                body = b'{"error":"remote secret value"}'
+                self.send_response(int(status))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
         if self.path == "/wrong-id":
             response["id"] = "wrong"
         if self.path == "/error":
@@ -65,6 +81,10 @@ class Peer(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+ATTEMPTS: dict[str, int] = {}
+ATTEMPTS_LOCK = threading.Lock()
 
 
 @contextmanager
@@ -227,3 +247,52 @@ def test_secrets_do_not_appear_in_transport_representation_or_errors():
     with pytest.raises(TransportError) as failure:
         HttpTransport().request(endpoint)
     assert "secret" not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "transient"),
+    [(408, True), (425, True), (429, True), (500, True), (502, True), (503, True), (504, True)]
+    + [(400, False), (401, False), (403, False), (404, False), (413, False)],
+)
+def test_transport_marks_only_retryable_http_statuses_transient(status, transient):
+    with server() as port:
+        with pytest.raises(TransportError) as caught:
+            HttpTransport(timeout_ms=1000).request(
+                f"http://127.0.0.1:{port}/status/{status}", body=b'{"id":1}'
+            )
+    assert caught.value.transient is transient
+    assert "secret" not in str(caught.value)
+
+
+def test_transport_marks_dropped_connections_but_not_timeouts_or_content_transient():
+    with server() as port:
+        with pytest.raises(TransportError) as slow:
+            HttpTransport(timeout_ms=200).request(f"http://127.0.0.1:{port}/slow", body=b'{"id":1}')
+        with pytest.raises(TransportError) as html:
+            HttpTransport(timeout_ms=1000).request(f"http://127.0.0.1:{port}/html")
+    with pytest.raises(TransportError) as refused:
+        HttpTransport(timeout_ms=1000).request(f"http://127.0.0.1:{port}/", body=b'{"id":1}')
+    assert (slow.value.transient, html.value.transient, refused.value.transient) == (
+        False,
+        False,
+        True,
+    )
+
+
+def test_rpc_read_retries_rate_limits_with_bounded_backoff(monkeypatch):
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    with server() as port:
+        endpoint = f"http://127.0.0.1:{port}"
+        assert HttpJsonRpc(endpoint + "/flaky/429/2").call("eth_chainId", []) == "0x4cef52"
+        assert ATTEMPTS["/flaky/429/2"] == 3 and delays == [0.25, 1.0]
+        delays.clear()
+        with pytest.raises(TransportError) as exhausted:
+            HttpJsonRpc(endpoint + "/flaky/503/9").call("eth_chainId", [])
+        assert exhausted.value.transient and ATTEMPTS["/flaky/503/9"] == 3
+        assert delays == [0.25, 1.0]
+        delays.clear()
+        for path in ("/flaky/404/1", "/slow/a"):
+            with pytest.raises(TransportError):
+                HttpJsonRpc(endpoint + path, HttpTransport(timeout_ms=200)).call("eth_chainId", [])
+        assert ATTEMPTS["/flaky/404/1"] == 1 and delays == []

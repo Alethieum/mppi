@@ -5,14 +5,14 @@ then handles discovery, payment messages and inference against the provider's
 MPPI endpoint. This guide uses Circle Agent Wallet on official Arc testnet,
 with Python 3.12+ on macOS or Linux.
 
-The built-in setup requires `mppi-agent` version `0.1.2`. Existing applications
+The built-in setup requires `mppi-agent` version `0.1.3`. Existing applications
 can continue using the [explicit composition interface](python-quickstart.md).
 
 ## 1. Install
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-agent==0.1.2'
+uv pip install 'mppi-agent==0.1.3'
 ```
 
 The shared protocol dependency installs automatically. Run the remaining
@@ -65,10 +65,16 @@ Set `ARC_RPC_URL_TESTNET` through your secret environment for your own trusted
 RPC; `--rpc-env NAME` selects a different variable. URLs with credentials are
 never stored in configuration.
 
-The built-in client polls Arc every 2 seconds and requires chain evidence less
-than 60 seconds old. Wallet operations have a 300-second wait budget, including
-Circle's signing and submission steps. Expired chain evidence still stops new
-authorization; waiting longer never extends a session's collection deadline.
+The built-in client requires chain evidence less than 60 seconds old and polls
+Arc every 15 seconds, as the explicit composition does; pass
+`Client.from_config(..., max_age_ms=..., poll_interval_ms=...)` to choose
+another cadence. Each poll costs about 24 RPC requests, so one client makes
+about 1.6 requests per second; see [read cost](python-runtime.md#fresh-chain-state)
+to size a shared RPC plan. Wallet operations have a 300-second wait budget,
+including Circle's signing and submission steps. Expired chain evidence still
+stops new authorization; waiting longer never extends a session's collection
+deadline. A Complete stream has no deadline unless you set one: an explicitly
+composed `Client(..., request_timeout_ms=...)` bounds each inference RPC.
 
 ## 4. Make a request
 

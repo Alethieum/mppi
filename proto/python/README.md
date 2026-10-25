@@ -8,6 +8,11 @@ The implementation validates catalogs and report transitions, computes exact
 amounts, signs and verifies fixed-session proofs, prepares contract calls and
 checks canonical receipt evidence. Version `0.1.1` also supplies shared discovery
 validation and the Circle Agent Wallet adapter used by both Python roles.
+Version `0.1.2`, used by `mppi-agent` 0.1.3, adds bounded repeats of transient
+read-only JSON-RPC calls, lag-tolerant chain following
+(`ChainLagError`, `last_refresh_failure`), `HookError.detail` and
+`TransportError.transient`, and accepts checkpoint format 2; every change is
+additive.
 These building blocks do not authorize inference or store provider state.
 
 See [the SDK interfaces](../../docs/sdk-interfaces.md) for the implemented surface

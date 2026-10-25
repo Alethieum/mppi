@@ -305,7 +305,8 @@ def test_builtin_follower_allows_read_latency_but_same_head_still_expires(
 
     monkeypatch.setattr(setup, "ChainFollower", follower)
     with Client.from_config(PROVIDER, config_path=boundary.config) as client:
-        assert client.chain.poll_interval_ms == 2_000
+        # MPPI-35: the explicit composition's cadence, not a 2 s poll.
+        assert (client.chain.max_age_ms, client.chain.poll_interval_ms) == (60_000, 15_000)
         assert client.chain.collection_margin_ms == 30_000
 
         async def scenario():
@@ -759,3 +760,15 @@ def test_mainnet_builtin_cli_does_not_require_a_wallet_factory(monkeypatch, tmp_
             },
         )
     ]
+
+
+def test_builtin_client_takes_the_callers_chain_timing(boundary):
+    """MPPI-35: each poll costs about 24 RPC reads, so the caller chooses its cadence."""
+    boundary.onboard()
+    with Client.from_config(
+        PROVIDER, config_path=boundary.config, max_age_ms=30_000, poll_interval_ms=5_000
+    ) as client:
+        assert (client.chain.max_age_ms, client.chain.poll_interval_ms) == (30_000, 5_000)
+    for options in ({"max_age_ms": 0}, {"poll_interval_ms": 61_000}, {"max_age_ms": True}):
+        with pytest.raises((OnboardingError, ValidationError)):
+            Client.from_config(PROVIDER, config_path=boundary.config, **options)

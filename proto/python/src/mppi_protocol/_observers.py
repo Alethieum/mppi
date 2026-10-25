@@ -19,12 +19,17 @@ class ObserverStats:
 
 @dataclass(frozen=True, slots=True)
 class HookError:
-    """Sanitized SDK boundary error; no prompt, credentials or upstream body."""
+    """Sanitized SDK boundary error; no prompt, credentials or upstream body.
+
+    ``detail`` names the rejected message kind and the SDK's own reason, for
+    example ``"meter: meter sequence has a gap"``; it never holds remote text.
+    """
 
     operation: str
     code: str
     session_id: bytes | None = None
     run_id: bytes | None = None
+    detail: str | None = None
 
 
 class Observers:

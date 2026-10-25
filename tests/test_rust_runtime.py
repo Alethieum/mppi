@@ -34,9 +34,11 @@ from eth_utils import keccak
 from mppi.v1 import mppi_pb2 as pb
 from mppi.v1 import mppi_pb2_grpc as services
 from mppi_agent import Client, PaymentError
+from mppi_agent.state import Ledger
 from mppi_protocol.chain import ChainReader, HttpJsonRpc
 from mppi_protocol.contract import ContractCalls
 from mppi_protocol.deployment import profile_from_mapping
+from mppi_protocol.errors import ValidationCode, ValidationError
 from mppi_protocol.follower import ChainFollower
 from mppi_protocol.signing import LocalSessionSigner
 from mppi_protocol.types import OperationState, PaymentCode, RunContext, SessionStatus
@@ -391,7 +393,23 @@ def unpaid_request(origin: str, profile: dict, certificate: Path) -> None:
         assert rejected.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
-def paid_agent(node, origin: str, profile: dict, directory: Path, recovery: bool = False) -> dict:
+def reject_first_meter():
+    """Make the agent reject the provider's first valid Meter, as if it were bad."""
+    original, rejected = Ledger.apply_meter, []
+
+    def apply_meter(self, meter, deposit):
+        if not rejected:
+            rejected.append(meter.seq)
+            raise ValidationError(ValidationCode.INCONSISTENT_USAGE, "fixture rejects a Meter")
+        return original(self, meter, deposit)
+
+    Ledger.apply_meter = apply_meter
+    return lambda: setattr(Ledger, "apply_meter", original), rejected
+
+
+def paid_agent(
+    node, origin: str, profile: dict, directory: Path, recovery: bool = False, mode: str = ""
+) -> dict:
     wallet = COMMON.LocalWallet(
         {"rpc": node.endpoint, "wallet_key": hx((2).to_bytes(32, "big"))}, "wallet_key"
     )
@@ -419,8 +437,17 @@ def paid_agent(node, origin: str, profile: dict, directory: Path, recovery: bool
         assert opened.session is not None and opened.session.readiness.ready
         identifier = opened.session.session_id
         assert opened.session.deposit == 5_510_000
-        with client.chat.completions.create_raw(REQUEST, model=MODEL, stream=True) as stream:
-            assert list(stream) == list(CHUNKS)
+        restore, rejected = reject_first_meter() if mode == "rejected-meter" else (None, None)
+        try:
+            with client.chat.completions.create_raw(REQUEST, model=MODEL, stream=True) as stream:
+                # A rejected Meter mid-run must not end Control while the run is
+                # active: the provider would cancel it (core.rs detach_locked).
+                assert list(stream) == list(CHUNKS)
+        finally:
+            if restore is not None:
+                restore()
+        if mode == "rejected-meter":
+            assert rejected == [1]
         terminal = stream.terminal
         assert terminal is not None and terminal.amount == 5_420_000
         assert (terminal.input_tokens, terminal.cache_tokens, terminal.output_tokens) == (
@@ -538,9 +565,13 @@ def observe(node, proxy: bytes, start: str, agent: dict, provider: dict) -> None
     assert node.uint(USDC, token, "transferCalls", ()) == 2
 
 
-@pytest.mark.parametrize("recovery", [False, True], ids=["ordinary", "recovery-batch"])
+@pytest.mark.parametrize(
+    ("recovery", "mode"),
+    [(False, ""), (True, ""), (False, "rejected-meter")],
+    ids=["ordinary", "recovery-batch", "rejected-meter"],
+)
 def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
-    node, tmp_path: Path, recovery: bool
+    node, tmp_path: Path, recovery: bool, mode: str
 ) -> None:
     context = tls_context(tmp_path)
 
@@ -619,7 +650,7 @@ def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
             connections_before_paid = peers.h2_connections
             try:
                 agent = await asyncio.to_thread(
-                    paid_agent, node, origin, profile, tmp_path, recovery
+                    paid_agent, node, origin, profile, tmp_path, recovery, mode
                 )
             except Exception as error:
                 raise AssertionError(

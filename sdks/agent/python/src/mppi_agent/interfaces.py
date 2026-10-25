@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol
 
+from mppi.v1 import mppi_pb2 as pb
 from mppi_protocol import ValidationCode, ValidationError
 from mppi_protocol.capabilities import FundingWallet, SessionSigner
 from mppi_protocol.types import OperationResult, OperationState, SessionPage, SessionView
@@ -23,6 +24,25 @@ class OpenResult:
                 ValidationCode.INVALID_VALUE,
                 "usable opening requires confirmed funding and a ready attachment",
             )
+
+
+@dataclass(frozen=True, slots=True)
+class FundingNotice:
+    """A requirement the confirmed deposit cannot cover, for funding policy.
+
+    ``notice`` is the provider's validated ``pb.LowCredit``, a detached copy.
+    ``deposit`` is the confirmed deposit and ``required`` the amount the
+    notice's coverage request needs, both in six-decimal USDC base units, and
+    ``shortfall`` is ``required - deposit``: an amount for ``sessions.topUp``.
+    Both are worked out when the notice is delivered, not when it arrived. A
+    plain low-credit notice has no coverage request: ``required`` and
+    ``shortfall`` are ``None``. The SDK never tops up by itself.
+    """
+
+    notice: pb.LowCredit
+    deposit: int
+    required: int | None
+    shortfall: int | None
 
 
 class CompletionStream(Protocol):

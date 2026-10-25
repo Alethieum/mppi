@@ -305,17 +305,27 @@ def client_from_config(
     ca_file: str | None = None,
     testnet: bool = True,
     profile: DeploymentProfile | None = None,
+    max_age_ms: int = 60_000,
+    poll_interval_ms: int | None = None,
 ) -> Client:
     """Compose the installed client from completed onboarding without new wallet writes.
 
     One stable payment checkpoint belongs to this setup. Its existing provider,
     signer and pending-operation guards apply unchanged. Funding is explicit.
     Select the same network and trusted deployment used during onboarding.
+    Chain evidence must be younger than ``max_age_ms``; the follower polls every
+    ``poll_interval_ms`` (default a quarter of it, 15 s), as the explicit
+    composition does. Each poll costs about 24 RPC reads (docs/agent-quickstart.md).
     """
     from .client import Client
 
     if initial_session_tokens is not None:
         uint64(initial_session_tokens, field="initial_session_tokens", positive=True)
+    uint64(max_age_ms, field="max_age_ms", positive=True)
+    if poll_interval_ms is not None:
+        uint64(poll_interval_ms, field="poll_interval_ms", positive=True)
+        if poll_interval_ms > max_age_ms:
+            raise OnboardingError("poll_interval_ms exceeds max_age_ms")
     selected = _profile(testnet=testnet, profile=profile)
     _account_pins(selected["chain_id"])
     config = Path(config_path).absolute()
@@ -358,9 +368,9 @@ def client_from_config(
             signer=signer,
             chain=ChainFollower(
                 reader,
-                max_age_ms=60_000,
+                max_age_ms=max_age_ms,
                 collection_margin_ms=30_000,
-                poll_interval_ms=2_000,
+                poll_interval_ms=poll_interval_ms,
             ),
             contract=ContractCalls(reader.profile.domain, "USDC", "2"),
             checkpoint_path=payment_path,

@@ -30,7 +30,7 @@ def completion_client(error=None):
     queue.put_nowait(b'{"text":"complete"}')
     queue.close(error)
     client._outputs = {identifier: _Output(queue)}
-    client._create = AsyncMock(return_value=identifier)
+    client._create = AsyncMock(return_value=(identifier, client._outputs[identifier]))
 
     def observed_errors():
         client._observers.emit("on_receipt", pb.Receipt())

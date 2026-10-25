@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -53,6 +54,31 @@ class ChainEvidenceError(RuntimeError):
     """Missing or inconsistent chain evidence; payment authorization must stop."""
 
 
+class ChainLagError(ChainEvidenceError):
+    """The RPC served a head or block behind evidence already accepted.
+
+    A load-balanced RPC may route reads to backends at slightly different
+    heights (docs.arc.io/arc/references/rpc-endpoints). This is lag, not a
+    regression: the accepted evidence stays valid and simply ages.
+    """
+
+
+class _RateLimited(ChainEvidenceError):
+    """A JSON-RPC rate-limit or not-yet-imported error; a later read may succeed."""
+
+
+# A transient read failure is repeated twice, 250 ms and then 1 s later: rate
+# limits and dropped connections are routine on shared RPC plans. A timeout is
+# not repeated, since each attempt already spent the transport's whole budget.
+_READ_RETRY_DELAYS = (0.25, 1.0)
+# EIP-1474 -32005 "Limit exceeded" (https://eips.ethereum.org/EIPS/eip-1474);
+# QuickNode's -32007 per-second request limit on EVM endpoints
+# (https://www.quicknode.com/docs/berachain/error-references); Arc's -32014 from
+# a load-balanced backend that "hasn't yet imported that block", which Arc says
+# can be retried after a brief backoff (docs.arc.io/arc/references/rpc-endpoints).
+_RATE_LIMIT_CODES = frozenset({-32005, -32007, -32014})
+
+
 class Rpc(Protocol):
     def call(self, method: str, params: list[object]) -> object: ...
 
@@ -65,7 +91,8 @@ class HttpJsonRpc:
     )
 
     def call(self, method: str, params: list[object]) -> object:
-        # This adapter only reads. It cannot turn reconciliation into a submit.
+        # This adapter only reads. It cannot turn reconciliation into a submit,
+        # so repeating a read after a transient failure never submits anything.
         if method not in {
             "eth_chainId",
             "eth_getBlockByNumber",
@@ -76,6 +103,21 @@ class HttpJsonRpc:
             "eth_estimateGas",
         }:
             raise ChainEvidenceError("unsupported read-only RPC method")
+        # A repeat starts only within one transport timeout of the first attempt.
+        budget = time.monotonic() + getattr(self.transport, "timeout_ms", 10_000) / 1000
+        for delay in _READ_RETRY_DELAYS:
+            try:
+                return self._once(method, params)
+            except TransportError as error:
+                if not error.transient or time.monotonic() + delay >= budget:
+                    raise
+            except _RateLimited:
+                if time.monotonic() + delay >= budget:
+                    raise
+            time.sleep(delay)
+        return self._once(method, params)
+
+    def _once(self, method: str, params: list[object]) -> object:
         request_id = str(uuid4())
         payload = json.dumps(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
@@ -86,6 +128,9 @@ class HttpJsonRpc:
         )
         if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
             raise ChainEvidenceError("RPC response identity mismatch")
+        error = response.get("error")
+        if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
+            raise _RateLimited("RPC request was rate limited")
         if "error" in response or "result" not in response:
             # No remote error data: it may contain private endpoint parameters.
             raise ChainEvidenceError("RPC request returned no usable result")
@@ -213,11 +258,12 @@ class ChainReader:
         self._network()
         if number is not None:
             uint64(number, field="block number")
-        raw = _object(
-            self.rpc.call(
-                "eth_getBlockByNumber", ["latest" if number is None else hex(number), False]
-            )
+        result = self.rpc.call(
+            "eth_getBlockByNumber", ["latest" if number is None else hex(number), False]
         )
+        if result is None and number is not None:
+            raise ChainLagError("RPC has not served that block yet")
+        raw = _object(result)
         actual = _quantity(raw.get("number"))
         if number is not None and actual != number:
             raise ChainEvidenceError("canonical block number mismatch")

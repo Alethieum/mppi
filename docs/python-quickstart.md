@@ -12,15 +12,16 @@ Install the role your application uses:
 uv pip install 'mppi-provider==0.1.2'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.2'
+uv pip install 'mppi-agent==0.1.3'
 ```
 
-Each role installs its required `mppi-protocol==0.1.1` dependency. The applications
+Each role installs its required protocol dependency: the agent
+`mppi-protocol==0.1.2`, the provider `mppi-protocol==0.1.1`. The applications
 communicate through the provider's HTTPS origin; neither needs the other role's
 package. Source development uses the [local build guide](build.md).
 
-The explicit profile example on this page uses testnet. Version `0.1.2`
-also supports packaged mainnet selection through the built-in helpers:
+The explicit profile example on this page uses testnet. Since `0.1.2`, both
+roles also support packaged mainnet selection through the built-in helpers:
 `Client.from_config(..., testnet=False)` and
 `await Mppi.from_config(..., testnet=False)`. Follow the quickstarts' mainnet
 sections for separate wallet/configuration and RPC selection. Use the accepted
@@ -204,7 +205,10 @@ coverage calculated from provider-supplied counts and accepted prices.
 
 `initial_session_tokens` is your funding choice. Low credit does not trigger an
 automatic transfer. For longer use, integrate `Client(on_low_credit=callback)`
-with your approved funding policy; explicitly call
+with your approved funding policy. It is called only when the confirmed deposit
+cannot cover what the provider requires; `Client(on_funding_notice=callback)`
+receives the same notice as a `FundingNotice` whose `shortfall` is the missing
+amount in USDC base units, worked out at delivery; explicitly call
 `client.sessions.topUp(session_id, amount)` with positive USDC base units and
 inspect its operation result. Ordinary voucher renewal remains automatic within
 confirmed funding. See [agent composition](python-runtime.md#agent-composition)

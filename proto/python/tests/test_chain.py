@@ -8,6 +8,7 @@ https://eips.ethereum.org/EIPS/eip-1898#specification
 
 import copy
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from mppi_protocol.capabilities import FundingAuthorization
 from mppi_protocol.catalog import parse_catalog
 from mppi_protocol.chain import (
     ChainEvidenceError,
+    ChainLagError,
     ChainReader,
     CodePin,
     DeploymentProfile,
@@ -986,3 +988,71 @@ def test_batch_simulation_rejects_nonempty_return_and_changed_block(context, mon
     rpc.reorg_after = 3
     with pytest.raises(ChainEvidenceError, match="changed"):
         reader.simulate(operation, sender=DESCRIPTOR.operator)
+
+
+class RateLimitedTransport(EchoTransport):
+    def __init__(self, codes: list[int]) -> None:
+        super().__init__()
+        self.codes = codes
+
+    def request(self, endpoint: str, *, body: bytes) -> bytes:
+        if not self.codes:
+            return super().request(endpoint, body=body)
+        request = json.loads(body)
+        self.calls.append(request)
+        error = {"code": self.codes.pop(0), "message": "private-api-key"}
+        return json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": error}).encode()
+
+
+def test_rpc_retries_json_rpc_rate_limit_codes_only(monkeypatch) -> None:
+    delays: list[float] = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    # EIP-1474 -32005 "Limit exceeded"; QuickNode's -32007 per-second limit.
+    transport = RateLimitedTransport([-32005, -32007])
+    rpc = HttpJsonRpc("https://rpc.example/private-api-key", transport)
+    assert rpc.call("eth_chainId", []) == hex(CHAIN)
+    assert len(transport.calls) == 3 and delays == [0.25, 1.0]
+    for code in (3, -32000, -32602):  # Revert and invalid input are not retried.
+        transport = RateLimitedTransport([code])
+        with pytest.raises(ChainEvidenceError) as caught:
+            HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
+        assert len(transport.calls) == 1 and "private-api-key" not in str(caught.value)
+    transport = RateLimitedTransport([-32005] * 3)
+    with pytest.raises(ChainEvidenceError):
+        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
+    assert len(transport.calls) == 3
+
+
+def test_rpc_retries_stay_within_one_transport_timeout(monkeypatch) -> None:
+    delays: list[float] = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    transport = RateLimitedTransport([-32005, -32005])
+    transport.timeout_ms = 1_000  # Room for the 250 ms repeat, not the 1 s one.
+    with pytest.raises(ChainEvidenceError):
+        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
+    assert len(transport.calls) == 2 and delays == [0.25]
+
+
+def test_rpc_retries_a_backend_that_has_not_imported_the_block(monkeypatch) -> None:
+    # Arc: the load-balanced primary endpoint returns -32014 for a block one
+    # backend has not imported yet; retry after a brief backoff.
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    transport = RateLimitedTransport([-32014])
+    assert HttpJsonRpc("https://rpc.example/private-api-key", transport).call(
+        "eth_chainId", []
+    ) == hex(CHAIN)
+    assert len(transport.calls) == 2
+
+
+def test_an_unserved_numbered_block_is_lag_not_missing_evidence(context) -> None:
+    reader, rpc, _ = context
+    original = rpc.call
+
+    def call(method, params):
+        if method == "eth_getBlockByNumber" and params[0] != "latest":
+            return None
+        return original(method, params)
+
+    rpc.call = call
+    with pytest.raises(ChainLagError):
+        reader.block(7)

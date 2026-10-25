@@ -18,6 +18,11 @@ uv sync --locked --all-packages
 uv run --locked python scripts/check.py
 ```
 
+The tests use the workspace's `dev` dependency group, which `uv sync` installs
+by default. Running `proto/python/tests` outside this workspace also needs
+`jsonschema==4.26.0`, which `test_fixture_schema.py` imports, alongside
+`pytest==9.1.1`.
+
 Rust regeneration needs `protoc` on PATH. Use the same bundled compiler as
 Python generation: `grpcio-tools==1.84.0` (libprotoc 35.1). A wrapper executable
 named `protoc` should invoke the workspace Python interpreter with

@@ -1,8 +1,9 @@
 # Python SDK interfaces
 
-The two role packages are **`mppi-agent`** and **`mppi-provider`**, version
-`0.1.2`, requiring Python 3.12 or newer. They share support distribution
-`mppi-protocol==0.1.1`, containing generated wire bindings, exact payment primitives
+The two role packages are **`mppi-agent`** version `0.1.3` and
+**`mppi-provider`** version `0.1.2`, requiring Python 3.12 or newer. They share
+support distribution `mppi-protocol` (`0.1.2` and `0.1.1` respectively),
+containing generated wire bindings, exact payment primitives
 and the Circle Agent Wallet adapter.
 The support library is not an additional role SDK.
 

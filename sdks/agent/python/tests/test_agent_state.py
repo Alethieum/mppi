@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 from mppi.v1 import mppi_pb2 as pb
-from mppi_agent.state import Ledger
+from mppi_agent.state import Coverage, Ledger
 from mppi_protocol.amounts import Rates
 from mppi_protocol.catalog import CatalogRow, publish_catalog
 from mppi_protocol.errors import ValidationError
@@ -51,7 +51,7 @@ def test_ordinary_low_credit_must_bind_to_a_locally_signed_run(field):
         remaining_tokens=1,
         suggest_top_up_tokens=10,
     )
-    assert ledger.coverage(notice, 100) is None
+    assert ledger.coverage(notice, 100) == Coverage()
     setattr(notice, field, "other/model" if field == "model" else b"x" * 32)
     with pytest.raises(ValidationError, match="signed run price binding"):
         ledger.coverage(notice, 100)
@@ -229,7 +229,10 @@ def test_complete_coverage_and_output_renewal_use_exact_accepted_price() -> None
             ],
         ),
     )
-    assert ledger.coverage(notice, 100) == 4  # ceil(3.5), not individual floors.
+    decision = ledger.coverage(notice, 100)
+    assert decision == Coverage(4, 4, numerator=3_500_000)  # ceil(3.5), one rounding.
+    assert ledger.coverage_numerator == 0  # Deciding records nothing.
+    ledger.cover(decision)
     ledger.accept_voucher(
         pb.Voucher(
             session_id=ledger.session_id,
@@ -246,7 +249,7 @@ def test_complete_coverage_and_output_renewal_use_exact_accepted_price() -> None
     with pytest.raises(ValidationError):
         ledger.coverage(notice, 100)
     ledger.runs[bytes(32)].failed_transport = True
-    assert ledger.coverage(notice, 100) is None
+    assert ledger.coverage(notice, 100) == Coverage()
 
 
 def test_snapshot_replaces_totals_and_requires_all_pending_outcomes() -> None:
@@ -337,7 +340,7 @@ def test_unadmitted_parallel_candidate_is_not_required_in_other_coverage() -> No
             ],
         ),
     )
-    assert ledger.coverage(notice, 100) == 4
+    assert ledger.coverage(notice, 100) == Coverage(4, 4, numerator=3_500_000)
 
 
 def test_final_cursor_cannot_be_assigned_to_another_run() -> None:
@@ -349,3 +352,144 @@ def test_final_cursor_cannot_be_assigned_to_another_run() -> None:
     with pytest.raises(ValidationError):
         ledger.apply_meter(meter(ledger, number=1, seq=2, inputs=4), 100)
     assert ledger.meter_seq == 1 and ledger.runs[(1).to_bytes(32, "big")].counts.input_tokens == 0
+
+
+def coverage_notice(
+    ledger: Ledger, *, run: int, rows: list[tuple[str, bytes, int, int]]
+) -> pb.LowCredit:
+    return pb.LowCredit(
+        session_id=ledger.session_id,
+        model=MODEL,
+        rate_card_hash=CATALOG.rate_card_hash,
+        remaining_tokens=0,
+        suggest_top_up_tokens=10,
+        coverage_request=pb.CoverageRequest(
+            run_id=run.to_bytes(32, "big"),
+            control_generation=1,
+            required_by_price=[
+                pb.RequiredTokens(
+                    model=model,
+                    rate_card_hash=version,
+                    input_tokens=inputs,
+                    cache_tokens=0,
+                    output_tokens=outputs,
+                )
+                for model, version, inputs, outputs in rows
+            ],
+        ),
+    )
+
+
+def low_voucher_ledger(count: int) -> Ledger:
+    ledger = ledger_with_runs(count)
+    ledger.voucher = None
+    ledger.accept_voucher(
+        pb.Voucher(
+            session_id=ledger.session_id,
+            cumulative=10,
+            signature=SIGNER.sign_voucher(DOMAIN, ledger.session_id, 10),
+        ),
+        100,
+    )
+    return ledger
+
+
+def test_coverage_computed_before_another_streams_final_is_superseded_not_fatal() -> None:
+    """MPPI-40: Complete's Terminal can be applied before an older Control request.
+
+    The provider computed run 1's rows while run 0 was still preparing (only the
+    candidate's bound); run 0's Terminal then arrived first on its own stream.
+    """
+    ledger = low_voucher_ledger(2)
+    assert ledger.apply_final(final(ledger, number=0, seq=1, inputs=8, outputs=1), 100)
+    # Priced 3.5 against usage already priced at 4.5.
+    old = coverage_notice(ledger, run=1, rows=[(MODEL, CATALOG.rate_card_hash, 4, 3)])
+    assert ledger.coverage(old, 100) == Coverage(superseded=True)  # Signs nothing.
+    assert ledger.voucher.cumulative == 10 and ledger.coverage_numerator == 0
+    # The provider's next check includes run 0's final and is signed exactly.
+    current = coverage_notice(ledger, run=1, rows=[(MODEL, CATALOG.rate_card_hash, 12, 7)])
+    decision = ledger.coverage(current, 100)
+    assert decision == Coverage(10, 10, numerator=9_500_000)  # ceil(9.5).
+    ledger.cover(decision)
+    assert ledger.coverage_numerator == 9_500_000
+
+
+def test_coverage_omitting_a_bucket_created_by_a_later_final_is_superseded() -> None:
+    ledger = low_voucher_ledger(1)
+    second = publish_catalog((CatalogRow("test/second", Rates(1_000_000, 1_000_000)),))
+    ledger.add_catalog(second)
+    context = RunContext(ledger.session_id, b"b" * 32, 1, "test/second", second.rate_card_hash)
+    ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+    terminal = pb.Terminal(
+        session_id=ledger.session_id,
+        run_id=b"b" * 32,
+        model="test/second",
+        rate_card_hash=second.rate_card_hash,
+        input_tokens=2,
+        cache_tokens=0,
+        output_tokens=0,
+        amount=2,
+        status=pb.RUN_STATUS_COMPLETED,
+        final_meter_seq=1,
+    )
+    assert ledger.apply_final(terminal, 100)
+    old = coverage_notice(ledger, run=0, rows=[(MODEL, CATALOG.rate_card_hash, 4, 6)])
+    assert ledger.coverage(old, 100) == Coverage(superseded=True)
+    current = coverage_notice(
+        ledger,
+        run=0,
+        rows=[(MODEL, CATALOG.rate_card_hash, 4, 6), ("test/second", second.rate_card_hash, 2, 0)],
+    )
+    assert ledger.coverage(current, 100) == Coverage(10, 7, numerator=7_000_000)  # Signed 10 kept.
+
+
+@pytest.mark.parametrize("defect", ("candidate", "unknown", "duplicate"))
+def test_malformed_coverage_still_fails_validation(defect: str) -> None:
+    ledger = low_voucher_ledger(2)
+    rows = {
+        "candidate": [],
+        "unknown": [(MODEL, b"x" * 32, 4, 6)],
+        "duplicate": [(MODEL, CATALOG.rate_card_hash, 4, 6)] * 2,
+    }[defect]
+    with pytest.raises(ValidationError):
+        ledger.coverage(coverage_notice(ledger, run=1, rows=rows), 100)
+
+
+def test_coverage_may_include_a_retained_run_whose_stream_this_agent_ended() -> None:
+    ledger = low_voucher_ledger(1)
+    second = publish_catalog((CatalogRow("test/second", Rates(1_000_000, 1_000_000)),))
+    ledger.add_catalog(second)
+    context = RunContext(ledger.session_id, b"b" * 32, 1, "test/second", second.rate_card_hash)
+    ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+    ledger.runs[b"b" * 32].failed_transport = True  # Cancelled here; still admitted there.
+    notice = coverage_notice(
+        ledger,
+        run=0,
+        rows=[(MODEL, CATALOG.rate_card_hash, 4, 6), ("test/second", second.rate_card_hash, 2, 0)],
+    )
+    assert ledger.coverage(notice, 100) == Coverage(10, 7, numerator=7_000_000)
+
+
+def test_coverage_is_compared_by_price_not_per_token_kind() -> None:
+    """A run may meter past its bound in one token kind while its cost is covered.
+
+    The provider reserves by price and reports an active run's bound in rows,
+    so run 0's bucket holds (4 in, 6 out) while run 0 has metered (5 in, 1 out).
+    """
+    ledger = low_voucher_ledger(1)
+    second = publish_catalog((CatalogRow("test/second", Rates(1_000_000, 1_000_000)),))
+    ledger.add_catalog(second)
+    context = RunContext(ledger.session_id, b"b" * 32, 1, "test/second", second.rate_card_hash)
+    ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+    assert ledger.apply_meter(meter(ledger, inputs=5, outputs=1), 100)
+    notice = coverage_notice(
+        ledger,
+        run=0,
+        rows=[(MODEL, CATALOG.rate_card_hash, 4, 6), ("test/second", second.rate_card_hash, 2, 3)],
+    )
+    notice.coverage_request.run_id = b"b" * 32
+    notice.model, notice.rate_card_hash = "test/second", second.rate_card_hash
+    decision = ledger.coverage(notice, 100)
+    assert decision == Coverage(10, 10, numerator=10_000_000)  # 5 + 5, never ignored.
+    ledger.cover(decision)
+    assert ledger.coverage_numerator == 10_000_000

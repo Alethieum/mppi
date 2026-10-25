@@ -6,8 +6,13 @@ installed two-role acceptance test; these are not chain or wallet integration.
 """
 
 import asyncio
+import copy
+import json
+import pickle
 import threading
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -16,15 +21,26 @@ import grpc
 import pytest
 from mppi.v1 import mppi_pb2 as pb
 from mppi.v1 import mppi_pb2_grpc as services
-from mppi_agent import Client, ClientError, CloseAccountingError, Hooks
+from mppi_agent import (
+    Client,
+    ClientError,
+    CloseAccountingError,
+    CompletionStream,
+    FundingNotice,
+    Hooks,
+)
+from mppi_agent import client as client_module
 from mppi_agent.checkpoint import Checkpoint
+from mppi_agent.client import _Output
 from mppi_agent.state import Ledger
 from mppi_protocol._observers import Observers
 from mppi_protocol.amounts import Rates
 from mppi_protocol.catalog import CatalogRow, publish_catalog
 from mppi_protocol.chain import Block, ChainSession, ClosingEvidence, OpeningEvidence
-from mppi_protocol.contract import ContractCalls
+from mppi_protocol.contract import ContractCalls, OperationKind
 from mppi_protocol.discovery import ProviderIdentity
+from mppi_protocol.errors import ValidationCode, ValidationError
+from mppi_protocol.http import TransportError
 from mppi_protocol.signing import LocalSessionSigner, verify_close_auth, verify_voucher
 from mppi_protocol.types import (
     ChainObservation,
@@ -78,7 +94,15 @@ def component_client() -> Client:
     client._outputs = {}
     client._control = None
     client._on_low_credit = None
-    client._low_credit_queue = client._low_credit_task = None
+    client._funding = client._low_credit_task = None
+    client._on_funding_notice = client._top_up_hint = None
+    client._unsent = set()
+    client._resync = None
+    client._receipt_queue, client._receipt_task = deque(), None
+    client._receipts_seen, client._receipt_failures = set(), 0
+    client._receipted, client._closed_result = set(), None
+    client._funding_lock = asyncio.Lock()
+    client._proven = OrderedDict()
     return client
 
 
@@ -296,11 +320,17 @@ def test_low_credit_hook_cannot_stall_control_or_mutate_its_payment_records() ->
     asyncio.run(scenario())
 
 
-def test_low_credit_hook_queue_is_bounded_without_waiting_on_control() -> None:
+def test_undelivered_low_credit_notices_coalesce_without_waiting_on_control() -> None:
     async def scenario() -> None:
         client = component_client()
-        entered, release = threading.Event(), threading.Event()
-        client._on_low_credit = lambda _: (entered.set(), release.wait(2))
+        entered, release, received = threading.Event(), threading.Event(), []
+
+        def callback(notice):
+            received.append(notice.remaining_tokens)
+            entered.set()
+            assert release.wait(2)
+
+        client._on_low_credit = callback
         notice = pb.LowCredit(
             session_id=client._ledger.session_id,
             model="test/model",
@@ -308,18 +338,17 @@ def test_low_credit_hook_queue_is_bounded_without_waiting_on_control() -> None:
             remaining_tokens=1,
             suggest_top_up_tokens=10,
         )
-        client._notify_low_credit(notice)
+        client._notify_low_credit(notice, 100, None)
         assert await asyncio.to_thread(entered.wait, 1)
         try:
-            for _ in range(client._queue_options["max_messages"]):
-                client._notify_low_credit(notice)
-            with pytest.raises(asyncio.QueueFull):
-                client._notify_low_credit(notice)
+            for remaining in range(2, 202):  # Never blocks, never fills a queue.
+                notice.remaining_tokens = remaining
+                client._notify_low_credit(notice, 100, None)
             assert len(client._background) == 1
         finally:
             release.set()
-            client._low_credit_task.cancel()
-            await asyncio.gather(client._low_credit_task, return_exceptions=True)
+        await asyncio.wait_for(client._low_credit_task, 2)
+        assert received == [1, 201]  # Only the latest undelivered notice.
 
     asyncio.run(scenario())
 
@@ -342,11 +371,11 @@ def test_control_loss_discards_queued_low_credit_callbacks() -> None:
             rate_card_hash=CATALOG.rate_card_hash,
             remaining_tokens=1,
         )
-        client._notify_low_credit(notice)
+        client._notify_low_credit(notice, 100, None)
         try:
             assert await asyncio.to_thread(entered.wait, 1)
             notice.remaining_tokens = 2
-            client._notify_low_credit(notice)
+            client._notify_low_credit(notice, 100, None)
             client._control_lost(ClientError("fixture disconnect"))
             release.set()
             await asyncio.gather(client._low_credit_task, return_exceptions=True)
@@ -820,5 +849,882 @@ def test_failed_close_send_preserves_intent_for_explicit_reconnect_retry() -> No
         assert client._close_waiter is None and client._attached_generation == 0
         client._persist.assert_awaited_once()
         assert isinstance(client._control_failure, OSError)
+
+    asyncio.run(scenario())
+
+
+RUN = b"r" * 32
+ANSWER = b'{"text":"answer"}'
+
+
+def accept_voucher(ledger, amount):
+    ledger.accept_voucher(
+        pb.Voucher(
+            session_id=ledger.session_id,
+            cumulative=amount,
+            signature=SIGNER.sign_voucher(DOMAIN, ledger.session_id, amount),
+        ),
+        100,
+    )
+
+
+def completed(ledger):
+    return pb.Terminal(
+        session_id=ledger.session_id,
+        run_id=RUN,
+        model="test/model",
+        rate_card_hash=CATALOG.rate_card_hash,
+        input_tokens=4,
+        cache_tokens=0,
+        output_tokens=0,
+        amount=2,
+        status=pb.RUN_STATUS_COMPLETED,
+        final_meter_seq=1,
+    )
+
+
+class Errors:
+    def __init__(self):
+        self.records, self.seen = [], threading.Event()
+
+    def __call__(self, error):
+        self.records.append(error)
+        self.seen.set()
+
+
+async def serve(control, release):
+    """One loopback server for Control and the run's Complete stream."""
+
+    class Chat(services.ChatServicer):
+        async def Completions(self, request, context):
+            yield pb.ChatChunk(payload=ANSWER)
+            await release.wait()
+            yield pb.ChatChunk(terminal=completed(LEDGER[0]))
+
+    class Peer(services.ControlServicer):
+        async def Session(self, requests, context):
+            async for message in control():
+                yield message
+
+    server = grpc.aio.server(options=GRPC_OPTIONS)
+    services.add_ChatServicer_to_server(Chat(), server)
+    services.add_ControlServicer_to_server(Peer(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    return server, grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+
+
+LEDGER: list = []
+
+
+def start_run(client, channel):
+    output = _Output(ByteQueue())
+    client._outputs[RUN] = output
+    output.call = services.ChatStub(channel).Completions(pb.CompleteRequest(run_id=RUN))
+    output.task = asyncio.create_task(client._read_complete(RUN, True))
+    return output
+
+
+@pytest.mark.parametrize("kind", ["low_credit", "meter"])
+def test_one_rejected_control_report_keeps_control_or_resyncs_without_losing_answers(kind):
+    """MPPI-38: one invalid report fails no run, and a bad one never loses an answer."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        LEDGER[:] = [ledger]
+        accept_voucher(ledger, 4)
+        errors = Errors()
+        client._observers = Observers(Hooks(on_error=errors))
+        bad = (
+            pb.ControlMessage(
+                low_credit=pb.LowCredit(
+                    session_id=ledger.session_id,
+                    model="other/model",
+                    rate_card_hash=CATALOG.rate_card_hash,
+                    remaining_tokens=1,
+                    suggest_top_up_tokens=10,
+                )
+            )
+            if kind == "low_credit"
+            else pb.ControlMessage(
+                meter=pb.Meter(
+                    session_id=ledger.session_id,
+                    run_id=b"u" * 32,
+                    seq=1,
+                    input_tokens=1,
+                    cache_tokens=0,
+                    output_tokens=0,
+                )
+            )
+        )
+        sent, release, hold = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def control():
+            await sent.wait()
+            yield bad
+            await hold.wait()
+
+        server, channel = await serve(control, release)
+        client._channel = channel
+        output = start_run(client, channel)
+        client._control = services.ControlStub(channel).Session()
+        reader = asyncio.create_task(client._control_read())
+        try:
+            assert await asyncio.wait_for(client._next(output), 2) == ANSWER
+            sent.set()
+            assert await asyncio.to_thread(errors.seen.wait, 2)
+            # A live run keeps Control open: a provider cancels every active run
+            # when Control closes, so nothing re-syncs while this stream is live.
+            assert client._control_failure is None and not reader.done()
+            if kind == "meter":
+                with pytest.raises(ClientError, match="not ready"):
+                    client._require_ready()  # No new run on the stuck cursor.
+            release.set()
+            assert await asyncio.wait_for(client._next(output), 2) is None  # Completed OK.
+            assert output.terminal.status == pb.RUN_STATUS_COMPLETED
+            assert client._ledger.runs[RUN].final is not None
+            assert client._ledger.usage_amount == 2
+            error = errors.records[0]
+            assert (error.operation, error.code) == ("control", "ValidationError")
+            if kind == "low_credit":
+                assert client._control_failure is None and not reader.done()
+                assert (
+                    error.detail == "low_credit: funding guidance has no signed run price binding"
+                )
+            else:
+                # The cursor cannot pass a rejected Meter: once no stream is live,
+                # the next request re-syncs before it starts.
+                assert error.detail == "meter: report has no retained signed run"
+                await asyncio.sleep(0)
+                assert client._resync_if_idle() and client._control_failure is not None
+        finally:
+            hold.set()
+            release.set()
+            client._control.cancel()
+            reader.cancel()
+            output.task.cancel()
+            await asyncio.gather(reader, output.task, return_exceptions=True)
+            client._observers.close()
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def test_control_loss_and_reattach_keep_in_flight_complete_streams():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        LEDGER[:] = [ledger]
+        accept_voucher(ledger, 4)
+        release, hold, streams = asyncio.Event(), asyncio.Event(), []
+
+        async def control():
+            streams.append(True)
+            await hold.wait()
+            yield pb.ControlMessage()
+
+        server, channel = await serve(control, release)
+        client._channel, client._loop = channel, asyncio.get_running_loop()
+        client._control_tasks = []
+        client._discovery, client.ca_file = SimpleNamespace(origin="https://127.0.0.1:9"), None
+        output = start_run(client, channel)
+        try:
+            assert await asyncio.wait_for(client._next(output), 2) == ANSWER
+            client._control_lost(ClientError("fixture Control loss"))
+            await client._connect()  # Reattach reuses the channel the run rides on.
+            await asyncio.sleep(0.2)
+            assert client._channel is channel and streams
+            release.set()
+            assert await asyncio.wait_for(client._next(output), 2) is None
+            assert output.terminal.status == pb.RUN_STATUS_COMPLETED
+            assert client._ledger.runs[RUN].final is not None
+        finally:
+            hold.set()
+            release.set()
+            for task in [*client._control_tasks, output.task]:
+                task.cancel()
+            await asyncio.gather(*client._control_tasks, output.task, return_exceptions=True)
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def test_failed_receipt_proof_is_quarantined_without_failing_control():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        errors = Errors()
+        client._observers = Observers(Hooks(on_error=errors))
+        client.chain.reader = SimpleNamespace(
+            block=Mock(side_effect=TransportError("HTTP endpoint returned status 429"))
+        )
+        receipt = pb.Receipt(
+            session_id=ledger.session_id,
+            run_id=RUN,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            input_tokens=4,
+            cache_tokens=0,
+            output_tokens=0,
+            amount=2,
+            status=pb.RUN_STATUS_COMPLETED,
+            final_meter_seq=1,
+            settled_cumulative=0,
+            chain_observation=pb.ChainObservation(
+                chain_id=DOMAIN.chain_id,
+                contract_address=DOMAIN.verifying_contract,
+                block_number=1,
+                block_hash=b"b" * 32,
+            ),
+        )
+        task = client._spawn(client._receipt(receipt))
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert client._control_failure is None and ledger.runs[RUN].final is None
+        assert await asyncio.to_thread(errors.seen.wait, 2)
+        assert errors.records[0].detail == "receipt: HTTP endpoint returned status 429"
+        client._observers.close()
+
+    asyncio.run(scenario())
+
+
+def test_superseded_coverage_is_reported_and_signs_nothing():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        accept_voucher(ledger, 10)
+        context = RunContext(ledger.session_id, b"q" * 32, 1, "test/model", CATALOG.rate_card_hash)
+        ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+        final = completed(ledger)
+        final.run_id, final.input_tokens, final.amount = b"q" * 32, 8, 4
+        assert ledger.apply_final(final, 100)  # Its Complete stream overtook Control.
+        errors = Errors()
+        client._observers = Observers(Hooks(on_error=errors))
+        notice = pb.LowCredit(
+            session_id=ledger.session_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            remaining_tokens=0,
+            suggest_top_up_tokens=10,
+            coverage_request=pb.CoverageRequest(
+                run_id=RUN,
+                control_generation=1,
+                required_by_price=[
+                    pb.RequiredTokens(
+                        model="test/model",
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        input_tokens=4,
+                        cache_tokens=0,
+                        output_tokens=3,
+                    )
+                ],
+            ),
+        )
+        await client._control_report("low_credit", pb.ControlMessage(low_credit=notice))
+        assert await asyncio.to_thread(errors.seen.wait, 2)
+        record = errors.records[0]
+        assert (record.operation, record.code, record.run_id) == (
+            "control",
+            "SupersededCoverage",
+            RUN,
+        )
+        assert record.detail == "low_credit: coverage request is priced below usage already applied"
+        assert not client._pending_vouchers and client._voucher_task is None
+        assert client._control_failure is None
+        client._observers.close()
+
+    asyncio.run(scenario())
+
+
+CANARY = "prompt-canary-5f1e9a"
+
+
+@pytest.mark.parametrize("failure", ["invalid_json", "upstream_error", "bad_terminal", "control"])
+def test_request_and_response_content_never_reaches_errors_or_the_checkpoint(failure):
+    """Privacy: error records, exceptions and the checkpoint hold only SDK text."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        accept_voucher(ledger, 4)
+        client._saved, client._opening_ref, client._operations = {"version": 1}, None, {}
+        errors = Errors()
+        client._observers = Observers(Hooks(on_error=errors))
+        body = json.dumps({"model": "test/model", "content": CANARY}).encode()
+
+        class Chat(services.ChatServicer):
+            async def Completions(self, request, context):
+                assert CANARY.encode() in request.payload
+                if failure == "invalid_json":
+                    yield pb.ChatChunk(payload=b'{"content":"' + CANARY.encode())
+                elif failure == "upstream_error":
+                    yield pb.ChatChunk(upstream_error=pb.UpstreamError(body=body, http_status=400))
+                    terminal = completed(ledger)
+                    terminal.status = pb.RUN_STATUS_FAILED
+                    yield pb.ChatChunk(terminal=terminal)
+                else:
+                    yield pb.ChatChunk(payload=body)
+                    terminal = completed(ledger)
+                    if failure == "bad_terminal":
+                        terminal.model = "canary/" + CANARY
+                    yield pb.ChatChunk(terminal=terminal)
+
+        class Peer(services.ControlServicer):
+            async def Session(self, requests, context):
+                yield pb.ControlMessage(
+                    low_credit=pb.LowCredit(
+                        session_id=ledger.session_id,
+                        model="canary/" + CANARY,
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        remaining_tokens=1,
+                        suggest_top_up_tokens=10,
+                    )
+                )
+                await asyncio.Event().wait()
+
+        server = grpc.aio.server(options=GRPC_OPTIONS)
+        services.add_ChatServicer_to_server(Chat(), server)
+        services.add_ControlServicer_to_server(Peer(), server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+        output = _Output(ByteQueue())
+        client._outputs[RUN] = output
+        output.call = services.ChatStub(channel).Completions(
+            pb.CompleteRequest(
+                run_id=RUN, payload=b'{"model":"test/model","q":"' + CANARY.encode() + b'"}'
+            )
+        )
+        reader = None
+        try:
+            if failure == "control":
+                client._control = services.ControlStub(channel).Session()
+                reader = asyncio.create_task(client._control_read())
+                assert await asyncio.to_thread(errors.seen.wait, 2)
+                raised = []
+            else:
+                output.task = asyncio.create_task(client._read_complete(RUN, True))
+                raised = []
+                while True:
+                    try:
+                        if await asyncio.wait_for(client._next(output), 2) is None:
+                            break
+                    except Exception as error:
+                        raised.append(error)
+                        break
+                assert raised and await asyncio.to_thread(errors.seen.wait, 2)
+            texts = [str(error) for error in raised] + [
+                repr((record.operation, record.code, record.detail)) for record in errors.records
+            ]
+            assert errors.records and not any(CANARY in text for text in texts), texts
+            assert CANARY not in json.dumps(client._record())
+        finally:
+            if reader is not None:
+                client._control.cancel()
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            if output.task is not None:
+                output.task.cancel()
+                await asyncio.gather(output.task, return_exceptions=True)
+            client._observers.close()
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+def fixture_receipt(ledger, run_id):
+    return pb.ControlMessage(
+        receipt=pb.Receipt(
+            session_id=ledger.session_id,
+            run_id=run_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            input_tokens=0,
+            cache_tokens=0,
+            output_tokens=0,
+            amount=0,
+            status=pb.RUN_STATUS_COMPLETED,
+            final_meter_seq=1,
+            settled_cumulative=0,
+            chain_observation=pb.ChainObservation(
+                chain_id=DOMAIN.chain_id,
+                contract_address=DOMAIN.verifying_contract,
+                block_number=1,
+                block_hash=b"b" * 32,
+            ),
+        )
+    )
+
+
+class CountingReader:
+    """Counts chain reads and the most that ever ran at once."""
+
+    def __init__(self, failure=None):
+        self.failure, self.reads, self.active, self.most = failure, 0, 0, 0
+        self.lock = threading.Lock()
+
+    def _read(self):
+        with self.lock:
+            self.reads += 1
+            self.active += 1
+            self.most = max(self.most, self.active)
+        try:
+            threading.Event().wait(0.002)
+            if self.failure is not None:
+                raise self.failure
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def block(self, number=None):
+        self._read()
+        return Block(
+            ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 1, b"b" * 32),
+            100,
+            b"c" * 32,
+        )
+
+    def session(self, session_id, block):
+        self._read()
+        return ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+
+
+async def offer(client, message):
+    try:
+        await client._control_report("receipt", message)
+        return None
+    except (ValidationError, ClientError) as error:
+        return str(error)
+
+
+def test_receipt_flood_is_checked_without_chain_reads_and_proven_once_per_run():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        accept_voucher(ledger, 4)
+        client.chain.reader = reader = CountingReader()
+        # Receipts for runs this agent never signed cost no read at all.
+        reasons = [
+            await offer(client, fixture_receipt(ledger, n.to_bytes(32, "big"))) for n in range(200)
+        ]
+        assert set(reasons) == {"report has no retained signed run"} and reader.reads == 0
+        # Fifty copies of one run's Receipt are proven once.
+        for _ in range(50):
+            assert await offer(client, fixture_receipt(ledger, RUN)) is None
+        await client._receipt_task
+        assert reader.reads == 3 and ledger.runs[RUN].final is not None
+        assert client._control_failure is None and client._resync is None
+
+    asyncio.run(scenario())
+
+
+def test_failing_receipt_proofs_are_bounded_and_never_read_concurrently():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        client._queue_options["max_messages"] = 64
+        accept_voucher(ledger, 4)
+        client.chain.reader = reader = CountingReader(
+            TransportError("HTTP endpoint returned status 429", transient=True)
+        )
+        runs = []
+        for number in range(40):
+            identifier = bytes([number + 1]) * 32
+            context = RunContext(
+                ledger.session_id, identifier, 1, "test/model", CATALOG.rate_card_hash
+            )
+            ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+            runs.append(identifier)
+        reasons = []
+        for identifier in runs:
+            reasons.append(await offer(client, fixture_receipt(ledger, identifier)))
+            if client._receipt_task is not None:
+                await client._receipt_task
+        assert reasons[:16] == [None] * 16
+        assert set(reasons[16:]) == {"receipt proofs are suspended on this attachment"}
+        # Each transient failure is tried once more before it counts.
+        assert reader.reads == 32 and reader.most == 1
+        assert client._receipt_failures == 16 and client._control_failure is None
+        # Queued proofs still run one at a time.
+        client._receipt_failures, client._receipts_seen = 0, set()
+        reader.failure = None
+        for identifier in runs[:10]:
+            assert await offer(client, fixture_receipt(ledger, identifier)) is None
+        await client._receipt_task
+        assert reader.most == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_low_credit_rejected_for_a_full_voucher_queue_changes_nothing():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        client._pending_vouchers = {bytes([n]) * 32: (1, 1) for n in range(4)}
+        notice = pb.LowCredit(
+            session_id=ledger.session_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            remaining_tokens=0,
+            suggest_top_up_tokens=10,
+            coverage_request=pb.CoverageRequest(
+                run_id=RUN,
+                control_generation=1,
+                required_by_price=[
+                    pb.RequiredTokens(
+                        model="test/model",
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        input_tokens=4,
+                        cache_tokens=0,
+                        output_tokens=3,
+                    )
+                ],
+            ),
+        )
+        with pytest.raises(ClientError, match="pending voucher queue is full"):
+            await client._control_report("low_credit", pb.ControlMessage(low_credit=notice))
+        assert ledger.coverage_numerator == 0 and RUN not in client._pending_vouchers
+
+    asyncio.run(scenario())
+
+
+def test_a_top_up_never_blocks_requests_and_top_ups_stay_serial():
+    """MPPI-36: a wallet operation (60-130 s with Circle) must not stall requests."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        client._open_lock, client._funding_lock = asyncio.Lock(), asyncio.Lock()
+        client._local_start = client._start = AsyncMock()
+        client._saved = {}
+        opening = OperationResult(
+            "open-x",
+            OperationState.CONFIRMED,
+            tx_hash=b"t" * 32,
+            observation=ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 1, b"b" * 32),
+        )
+        client._operations = {"open-x": (SimpleNamespace(kind=OperationKind.OPEN), opening)}
+        client._opening_ref = "open-x"
+        view = SimpleNamespace(readiness=Readiness(True))
+        client._get = AsyncMock(return_value=view)
+        client.contract = ContractCalls(DOMAIN, "USDC", "2")
+        state = client.chain.snapshot().sessions
+        current = SimpleNamespace(sessions=state, block=SimpleNamespace(timestamp=1_800_000_000))
+        client.chain.snapshot = lambda: current
+        entered, release, signed = threading.Event(), threading.Event(), []
+
+        def sign(authorization):
+            signed.append(authorization.nonce)
+            entered.set()
+            assert release.wait(5)
+            return b"\x01" * 65
+
+        client.wallet = SimpleNamespace(address=DESCRIPTOR.agent, sign_funding_authorization=sign)
+        client._submit = AsyncMock(return_value=OperationResult("top-up", OperationState.PENDING))
+        first = asyncio.create_task(client._top_up(ledger.session_id, 10))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            opened = await asyncio.wait_for(client._open("test/model", None), 1)
+            assert opened.session is view  # Not held behind the wallet.
+            second = asyncio.create_task(client._top_up(ledger.session_id, 10))
+            await asyncio.sleep(0.1)
+            assert len(signed) == 1  # Top-ups still run one at a time.
+        finally:
+            release.set()
+        await first
+        await second
+        assert len(signed) == 2
+
+    asyncio.run(scenario())
+
+
+def test_receipts_sharing_a_proven_observation_need_no_chain_reads():
+    """MPPI-35: one proof per provider observation, not five reads per Receipt."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        client._queue_options["max_messages"] = 64
+        accept_voucher(ledger, 4)
+        client.chain.reader = reader = CountingReader()
+        client._proven = OrderedDict()
+        runs = []
+        for number in range(5):
+            identifier = bytes([number + 1]) * 32
+            context = RunContext(
+                ledger.session_id, identifier, 1, "test/model", CATALOG.rate_card_hash
+            )
+            ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+            runs.append(identifier)
+        for identifier in runs[:4]:
+            message = fixture_receipt(ledger, identifier)
+            message.receipt.final_meter_seq = runs.index(identifier) + 1
+            assert await offer(client, message) is None
+        await client._receipt_task
+        assert reader.reads == 3 and all(ledger.runs[run].final for run in runs[:4])
+        # A different settled total at a proven observation is refused, still without reads.
+        errors = Errors()
+        client._observers = Observers(Hooks(on_error=errors))
+        message = fixture_receipt(ledger, runs[4])
+        message.receipt.final_meter_seq, message.receipt.settled_cumulative = 5, 1
+        assert await offer(client, message) is None
+        await client._receipt_task
+        assert reader.reads == 3 and ledger.runs[runs[4]].final is None
+        assert await asyncio.to_thread(errors.seen.wait, 2)
+        assert errors.records[0].detail == (
+            "receipt: receipt settlement total contradicts chain or accepted usage"
+        )
+        client._observers.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_silent_stream_cannot_hold_a_resync_past_its_deadline(monkeypatch):
+    """A provider must not keep the session unusable with a stream that sends nothing."""
+
+    async def scenario():
+        monkeypatch.setattr(client_module, "_RESYNC_WAIT_S", 0.05, raising=False)
+        client = component_client()
+        client._open_lock, client._start = asyncio.Lock(), AsyncMock()
+        client._resync = ValidationError(ValidationCode.INCONSISTENT_USAGE, "fixture")
+        client._resync_at = asyncio.get_running_loop().time()
+        silent = _Output(ByteQueue())
+        silent.task = asyncio.create_task(asyncio.Event().wait())
+        client._outputs[RUN] = silent
+        with pytest.raises(ClientError, match="re-sync is pending"):
+            await client._open("test/model", None)
+        await asyncio.sleep(0.06)
+        client._connect = AsyncMock(side_effect=RuntimeError("reattaching"))
+        with pytest.raises(RuntimeError, match="reattaching"):
+            await client._open("test/model", None)  # The next request re-syncs.
+        await asyncio.gather(silent.task, return_exceptions=True)
+        assert silent.task.cancelled() and client._control_failure is not None
+
+    asyncio.run(scenario())
+
+
+def test_a_transient_receipt_proof_failure_is_retried_and_can_be_offered_again():
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        accept_voucher(ledger, 4)
+
+        class Flaky(CountingReader):
+            def __init__(self, failures):
+                super().__init__()
+                self.left = failures
+
+            def _read(self):
+                super()._read()
+                if self.left:
+                    self.left -= 1
+                    raise TransportError("HTTP endpoint returned status 503", transient=True)
+
+        client.chain.reader = reader = Flaky(1)
+        assert await offer(client, fixture_receipt(ledger, RUN)) is None
+        await client._receipt_task
+        assert ledger.runs[RUN].final is not None and client._receipt_failures == 0
+        assert reader.reads == 4  # One failed read, then the full proof.
+        # Two failures in a row give up for now, but a later copy is proven.
+        context = RunContext(ledger.session_id, b"q" * 32, 1, "test/model", CATALOG.rate_card_hash)
+        ledger.register(context, SIGNER.sign_run(DOMAIN, context))
+        client.chain.reader = reader = Flaky(2)
+        client._proven.clear()
+        message = fixture_receipt(ledger, b"q" * 32)
+        message.receipt.final_meter_seq = 2
+        assert await offer(client, message) is None
+        await client._receipt_task
+        assert ledger.runs[b"q" * 32].final is None and client._receipt_failures == 1
+        assert await offer(client, message) is None
+        await client._receipt_task
+        assert ledger.runs[b"q" * 32].final is not None
+
+    asyncio.run(scenario())
+
+
+def test_a_stream_holds_the_output_record_create_handed_it():
+    client = component_client()
+    output = _Output(ByteQueue())
+    stream = CompletionStream(client, RUN, output)  # Not looked up in _outputs.
+    assert stream._output is output and RUN not in client._outputs
+
+
+def coverage_low_credit(ledger, *, run=RUN, inputs=4, outputs=3):
+    return pb.ControlMessage(
+        low_credit=pb.LowCredit(
+            session_id=ledger.session_id,
+            model="test/model",
+            rate_card_hash=CATALOG.rate_card_hash,
+            remaining_tokens=7,
+            suggest_top_up_tokens=200_000,
+            coverage_request=pb.CoverageRequest(
+                run_id=run,
+                control_generation=1,
+                required_by_price=[
+                    pb.RequiredTokens(
+                        model="test/model",
+                        rate_card_hash=CATALOG.rate_card_hash,
+                        input_tokens=inputs,
+                        cache_tokens=0,
+                        output_tokens=outputs,
+                    )
+                ],
+            ),
+        )
+    )
+
+
+class Funding:
+    """A 0.1.2-style on_low_credit callback: it gets a real pb.LowCredit."""
+
+    def __init__(self):
+        self.notices, self.seen = [], threading.Event()
+
+    def __call__(self, notice):
+        assert isinstance(notice, pb.LowCredit)
+        copied = pb.LowCredit()
+        copied.CopyFrom(notice)
+        assert copy.copy(notice) == copy.deepcopy(notice) == copied
+        assert pickle.loads(pickle.dumps(notice)) == notice
+        self.notices.append((notice, notice.remaining_tokens, notice.suggest_top_up_tokens))
+        notice.session_id = bytes(32)  # A detached record, as before.
+        self.seen.set()
+
+
+class Notices:
+    """An on_funding_notice callback, the new way to read the shortfall."""
+
+    def __init__(self):
+        self.notices, self.seen = [], threading.Event()
+
+    def __call__(self, notice):
+        assert copy.deepcopy(notice) == pickle.loads(pickle.dumps(notice)) == notice
+        self.notices.append(notice)
+        self.seen.set()
+
+
+def test_a_covered_coverage_request_is_signed_without_reaching_funding_policy():
+    """MPPI-37: a routine voucher request no longer reads as "top up"."""
+
+    async def scenario():
+        client = component_client()
+        client._on_low_credit = funding = Funding()
+        await client._control_report("low_credit", coverage_low_credit(client._ledger))
+        assert RUN in client._pending_vouchers  # The SDK signs it itself.
+        await asyncio.sleep(0.05)
+        assert client._low_credit_task is None and not funding.notices
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["shortfall", "ended_run", "full_voucher_queue", "plain"])
+def test_only_what_the_deposit_cannot_cover_reaches_funding_policy(case):
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        client._on_low_credit = funding = Funding()
+        client._on_funding_notice = notices = Notices()
+        if case == "plain":
+            message = coverage_low_credit(ledger)
+            message.low_credit.ClearField("coverage_request")
+        else:
+            message = coverage_low_credit(ledger, inputs=150, outputs=150)  # 150 > deposit 100.
+        if case == "ended_run":
+            ledger.runs[RUN].failed_transport = True  # Its Complete already failed.
+        if case == "full_voucher_queue":
+            client._pending_vouchers = {bytes([n]) * 32: (1, 1) for n in range(4)}
+        await client._control_report("low_credit", message)
+        assert await asyncio.to_thread(funding.seen.wait, 2)
+        assert await asyncio.to_thread(notices.seen.wait, 2)
+        ((notice, remaining, suggested),) = funding.notices
+        assert (remaining, suggested) == (7, 200_000)
+        assert notice.HasField("coverage_request") is (case != "plain")
+        (funding_notice,) = notices.notices
+        assert isinstance(funding_notice, FundingNotice)
+        assert funding_notice.notice.remaining_tokens == 7
+        amounts = (100, None, None) if case == "plain" else (100, 150, 50)
+        assert (
+            funding_notice.deposit,
+            funding_notice.required,
+            funding_notice.shortfall,
+        ) == amounts
+        assert RUN not in client._pending_vouchers and ledger.coverage_numerator == 0
+        await asyncio.sleep(0)
+        assert message.low_credit.session_id == ledger.session_id  # Copy was detached.
+        client._low_credit_task.cancel()
+        await asyncio.gather(client._low_credit_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_shortfall_is_worked_out_at_delivery_so_a_covered_one_never_over_funds():
+    """Final RC review: three notices queued at deposit 100, then a top-up to 150."""
+
+    async def scenario():
+        client = component_client()
+        ledger = client._ledger
+        entered, release, delivered = threading.Event(), threading.Event(), []
+
+        def callback(notice):
+            delivered.append((notice.deposit, notice.required, notice.shortfall))
+            entered.set()
+            assert release.wait(2)
+
+        client._on_funding_notice = callback
+        message = coverage_low_credit(ledger, inputs=150, outputs=150)
+        await client._control_report("low_credit", message)
+        assert await asyncio.to_thread(entered.wait, 2)
+        for _ in range(2):
+            await client._control_report("low_credit", message)
+        sessions = client.chain.current.sessions
+        sessions[ledger.session_id] = replace(sessions[ledger.session_id], deposit=150)
+        release.set()
+        await asyncio.wait_for(client._low_credit_task, 2)
+        assert delivered == [(100, 150, 50)]  # The covered later ones are dropped.
+
+    asyncio.run(scenario())
+
+
+def test_a_top_up_notice_waits_for_an_attached_stream():
+    """A provider ends a new stream that sends anything before ReconnectRequest."""
+
+    async def scenario():
+        client = component_client()
+        client.chain.refresh = AsyncMock()
+        client._send = AsyncMock()
+        client._control, client._attached_generation = object(), 0  # Mid-reattach.
+        confirmed = OperationResult(
+            "top-up",
+            OperationState.CONFIRMED,
+            tx_hash=b"t" * 32,
+            observation=ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 1, b"b" * 32),
+        )
+        await client._top_up_confirmed(confirmed)
+        client._send.assert_not_awaited()
+        client._attached_generation = 1  # _attach completes and announces it.
+        await client._announce_top_up()
+        (message,) = [call.args[0] for call in client._send.await_args_list]
+        assert message.top_up_notice.tx == b"t" * 32 and client._top_up_hint is None
+        for task in list(client._background):
+            task.cancel()
+        await asyncio.gather(*client._background, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_renewal_stops_instead_of_spinning_when_it_cannot_sign():
+    """With top-ups off _open_lock, a renewal can start while an attachment
+    is still completing: ready, but not yet attached. It must not spin."""
+
+    async def scenario():
+        client = component_client()
+        client._attached_generation = 0  # Swapped ledger, attachment not yet recorded.
+        client._ledger.coverage_numerator = 4_000_000
+        await asyncio.wait_for(client._renew(), 1)
+        assert client._ledger.voucher is None
 
     asyncio.run(scenario())

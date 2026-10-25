@@ -20,7 +20,7 @@ from .client import (
 )
 from .discovery import ProviderDiscovery, discover, verify_challenge
 from .hooks import HookError, Hooks, ObserverStats
-from .interfaces import AgentSessions, FundingWallet, OpenResult, SessionSigner
+from .interfaces import AgentSessions, FundingNotice, FundingWallet, OpenResult, SessionSigner
 from .onboarding import OnboardingError, OnboardingResult, onboard
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "ClientError",
     "CloseAccountingError",
     "CompletionStream",
+    "FundingNotice",
     "FundingWallet",
     "LocalSessionSigner",
     "InferenceError",

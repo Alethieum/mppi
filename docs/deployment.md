@@ -64,7 +64,7 @@ Provider endpoint availability is independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Agent `0.1.2` and provider `0.1.2` built-in setup package the verified official
+Agent `0.1.3` and provider `0.1.2` built-in setup package the verified official
 profiles for both Arc networks. `--testnet` and `--mainnet` select the respective
 profile without a separate download. Version `0.1.1` packages testnet only. The
 provider composition helpers use those same pins; they still verify chain ID,
@@ -144,8 +144,9 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 ## SDK installation inputs
 
 The provider quickstart uses `mppi-provider==0.1.2` from PyPI and native
-`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.2`.
-Both Python roles depend on `mppi-protocol==0.1.1`. Use the release record to
+`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.3`.
+The agent depends on `mppi-protocol==0.1.2` and the provider on
+`mppi-protocol==0.1.1`. Use the release record to
 identify the reviewed source revision and exact artifact digests. For development, the
 [public source tree can be built independently](build.md).
 
