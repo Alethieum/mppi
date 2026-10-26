@@ -11,12 +11,11 @@ import json
 import pickle
 import threading
 import time
-from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import astuple, replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import grpc
 import pytest
@@ -38,17 +37,19 @@ from mppi_agent.client import _Output
 from mppi_agent.state import Ledger
 from mppi_protocol import follower as follower_module
 from mppi_protocol._observers import Observers
-from mppi_protocol.amounts import Rates, TokenCounts
+from mppi_protocol.amounts import Rates, TokenCounts, priced_numerator, required_coverage
+from mppi_protocol.capabilities import FundingAuthorization
 from mppi_protocol.catalog import CatalogRow, publish_catalog
 from mppi_protocol.chain import (
     Block,
     ChainContradictionError,
+    ChainEvidenceError,
     ChainSession,
     ClosingEvidence,
     FundingEvidence,
     OpeningEvidence,
 )
-from mppi_protocol.contract import ContractCalls, OperationKind
+from mppi_protocol.contract import ARC_USDC, ContractCalls, OperationKind
 from mppi_protocol.discovery import ProviderIdentity
 from mppi_protocol.errors import ValidationCode, ValidationError
 from mppi_protocol.follower import ChainFollower, ChainSnapshot
@@ -114,6 +115,7 @@ def component_client() -> Client:
     client._attached_generation = 1
     client._outbound = ByteQueue()
     client._voucher_lock = asyncio.Lock()
+    client._voucher_headroom = 0
     client._background = set()
     client._pending_vouchers = {}
     client._voucher_task = client._renew_task = None
@@ -129,11 +131,8 @@ def component_client() -> Client:
     client._on_funding_notice = client._top_up_hint = None
     client._unsent = set()
     client._resync = None
-    client._receipt_queue, client._receipt_task = deque(), None
-    client._receipts_seen, client._receipt_failures = set(), 0
     client._receipted, client._closed_result = set(), None
     client._funding_lock = asyncio.Lock()
-    client._proven = OrderedDict()
     return client
 
 
@@ -741,6 +740,352 @@ def test_a_close_whose_proof_cannot_be_read_stays_pending_and_is_never_requested
     asyncio.run(scenario())
 
 
+class _FreshOpening(Exception):
+    """The opening after a retirement reached its new Challenge."""
+
+
+def closed_client(tmp_path: Path, kind: str, settled: int = 0) -> tuple[Client, bytes, Path]:
+    """A restored client whose session this agent itself closed (or did not)."""
+    path = tmp_path / "agent.json"
+    contract = ContractCalls(DOMAIN, "USDC", "2")
+    observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+    client = component_client()
+    client.contract, client.wallet = contract, SimpleNamespace(address=DESCRIPTOR.agent)
+    client.signer_reference = "fixture:public-test-key"
+    ledger = client._ledger
+    ledger.close_pending, ledger.ready = True, False
+    client._saved = {"version": 2, "scope": client._scope(7)}
+    opening = OperationResult(
+        "open-x", OperationState.CONFIRMED, tx_hash=b"o" * 32, observation=observation
+    )
+    auth = FundingAuthorization(
+        DOMAIN.chain_id,
+        ARC_USDC,
+        "USDC",
+        "2",
+        DESCRIPTOR.agent,
+        DOMAIN.verifying_contract,
+        100,
+        0,
+        2_000_000_000,
+        b"n" * 32,
+    )
+    client._opening_ref = "open-x"
+    client._operations = {
+        "open-x": (contract.open(DESCRIPTOR, 100, CATALOG.rate_card_hash, auth, bytes(65)), opening)
+    }
+    if kind == "cooperative":
+        client._saved["confirmed_close"] = {
+            "tx": (b"c" * 32).hex(),
+            "block": 10,
+            "block_hash": (b"b" * 32).hex(),
+            "capture": 0,
+            "refunded": 100,
+        }
+    elif kind == "excess":
+        client._saved["confirmed_close"] = {
+            "tx": (b"c" * 32).hex(),
+            "block": 10,
+            "block_hash": (b"b" * 32).hex(),
+            "capture": 1,
+            "refunded": 99,
+        }
+    elif kind == "reported":
+        client._saved["reported_close"] = {"tx": (b"c" * 32).hex(), "capture": 0, "refunded": 100}
+    elif kind in ("withdraw", "releaseIdle", "requestClose"):
+        call = getattr(
+            contract,
+            {"releaseIdle": "release_idle", "requestClose": "request_close"}.get(kind, kind),
+        )(DESCRIPTOR)
+        ref = kind + "-" + ledger.session_id.hex()
+        client._operations[ref] = (
+            call,
+            OperationResult(
+                ref, OperationState.CONFIRMED, tx_hash=b"e" * 32, observation=observation
+            ),
+        )
+    checkpoint = Checkpoint(path)
+    checkpoint.save(client._record())
+    checkpoint.close()
+    # A new process restores the record, as from a CLI run after the close.
+    restored = component_client()
+    restored.contract, restored.wallet = contract, client.wallet
+    restored._checkpoint, restored._checkpoint_lock = Checkpoint(path), asyncio.Lock()
+    restored._saved = restored._checkpoint.load()
+    restored._ledger, restored._operations = None, {}
+    restored._closed_error = None
+    restored._restore_local(7)
+    del restored._persist  # The real journal writes.
+    restored.agent_id, restored.initial_session_tokens = 43, 10
+    restored._start = restored._local_start = restored._connect = AsyncMock()
+    restored._challenge = AsyncMock(side_effect=_FreshOpening)
+    restored._open_lock = asyncio.Lock()
+    # Fresh evidence at the exit's block, where the closed session's settled total
+    # is final; a closed session never changes, so a later block shows the same.
+    closed = ChainSession(100, settled, SessionStatus.CLOSED, 0, 100, CATALOG.rate_card_hash)
+    restored.chain.current = SimpleNamespace(
+        block=Block(observation, 100, b"c" * 32), sessions={ledger.session_id: closed}
+    )
+    restored.chain.snapshot = lambda: restored.chain.current
+    restored.chain.refresh = AsyncMock(return_value=restored.chain.current)
+    restored.chain.reader = SimpleNamespace()
+    return restored, ledger.session_id, path
+
+
+@pytest.mark.parametrize("kind", ["cooperative", "withdraw", "releaseIdle"])
+@pytest.mark.parametrize("archived_before", [False, True], ids=["first", "retried"])
+def test_an_agents_own_close_retires_its_session_so_the_next_opening_funds_another(
+    tmp_path: Path, kind: str, archived_before: bool
+) -> None:
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind)
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        before = json.loads(path.read_text())
+        if archived_before:  # A crash after the link, before the journal dropped it.
+            history.hardlink_to(path)
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        # Its whole last record stays readable beside the checkpoint.
+        assert json.loads(history.read_text()) == before
+        assert history.stat().st_mode & 0o777 == 0o600
+        after = json.loads(path.read_text())
+        assert "ledger" not in after and "confirmed_close" not in after
+        assert after["operations"] == [] and after["opening_ref"] is None
+        assert after["scope"] == before["scope"]
+        assert client._ledger is None and client._closed_result is None
+        assert client._operations == {} and client._opening_ref is None
+        # Only a new Control stream carries the new session.
+        assert isinstance(client._control_failure, ClientError)
+        client._connect.assert_awaited()
+        client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "kind", ["reported", "requestClose", "excess", "active", "no_tokens", "no_agent_id"]
+)
+def test_a_close_not_yet_final_or_not_within_usage_keeps_its_session(
+    tmp_path: Path, kind: str
+) -> None:
+    async def scenario() -> None:
+        client, identifier, path = closed_client(
+            tmp_path, "cooperative" if kind in ("active", "no_tokens", "no_agent_id") else kind
+        )
+        before = path.read_bytes()
+        if kind == "active":
+            output = SimpleNamespace(task=asyncio.get_running_loop().create_future())
+            client._outputs[b"q" * 32] = output
+        elif kind == "no_tokens":
+            client.initial_session_tokens = None  # No new session could be funded.
+        elif kind == "no_agent_id":
+            client.agent_id = None
+        expected = {
+            "reported": (ClientError, "session close is pending"),
+            "requestClose": (ClientError, "session close is pending"),
+            "excess": (CloseAccountingError, None),
+            "active": (ClientError, "still ending"),
+            "no_tokens": (ClientError, "initial_session_tokens is required"),
+            "no_agent_id": (FundingAuthorizationError, "AGENT_ID_REQUIRED"),
+        }[kind]
+        with pytest.raises(expected[0], match=expected[1]):
+            await client._open("test/model", None)
+        assert path.read_bytes() == before
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        client._challenge.assert_not_awaited()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle"])
+def test_an_exit_whose_settled_total_exceeds_usage_is_never_retired(
+    tmp_path: Path, kind: str
+) -> None:
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind, settled=1)
+        before = path.read_bytes()
+        with pytest.raises(CloseAccountingError) as failure:
+            await client._open("test/model", None)
+        assert (failure.value.capture_amount, failure.value.usage_amount) == (1, 0)
+        assert failure.value.operation.operation_ref == kind + "-" + identifier.hex()
+        # Fresh evidence already at the exit's block: no read; it fails closed again.
+        client.chain.refresh.assert_not_awaited()
+        with pytest.raises(CloseAccountingError):
+            await client._open("test/model", None)
+        assert path.read_bytes() == before
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        client._challenge.assert_not_awaited()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_exit_is_retired_only_on_evidence_at_or_after_its_block(tmp_path: Path) -> None:
+    """Current state, not the exit's historical block: a node that prunes
+    history still serves it, and a closed session never changes."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        before = path.read_bytes()
+        behind = SimpleNamespace(
+            block=Block(
+                ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 9, b"9" * 32),
+                90,
+                b"8" * 32,
+            ),
+            sessions=client.chain.current.sessions,
+        )
+        client.chain.snapshot = lambda: behind
+        client.chain.refresh = AsyncMock(return_value=behind)
+        with pytest.raises(ClientError, match="does not yet show the exited session closed"):
+            await client._open("test/model", None)
+        client.chain.refresh.assert_awaited_once()
+        assert path.read_bytes() == before
+        later = SimpleNamespace(
+            block=Block(
+                ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 40, b"4" * 32),
+                400,
+                b"3" * 32,
+            ),
+            sessions=client.chain.current.sessions,
+        )
+        client.chain.refresh = AsyncMock(return_value=later)
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_retirement_keeps_a_stale_reported_close_only_in_its_history(tmp_path: Path) -> None:
+    """A provider's CloseResult whose transaction never closed the session stays
+    PENDING; the agent then withdrew. The next session's close must send its
+    own CloseRequest, never prove the old transaction again."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        reported = {"tx": (b"x" * 32).hex(), "capture": 0, "refunded": 100}
+        client._saved["reported_close"] = reported
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert "reported_close" not in json.loads(path.read_text())
+        assert "reported_close" not in client._saved
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        assert json.loads(history.read_text())["reported_close"] == reported
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reconcile_that_started_during_a_retirement_never_resurrects_its_operation(
+    tmp_path: Path,
+) -> None:
+    """The reconcile arrives while retirement refreshes stale evidence, after it
+    took the operation locks, so no lock of its own existed to wait on."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        ref = "withdraw-" + identifier.hex()
+        reading, exit_read, reconciled = asyncio.Event(), asyncio.Event(), threading.Event()
+        current = client.chain.current
+
+        def stale():
+            raise ChainEvidenceError("stale")
+
+        async def refresh():
+            reading.set()
+            await exit_read.wait()
+            return current
+
+        client.chain.snapshot = stale
+        client.chain.refresh = AsyncMock(side_effect=refresh)
+        previous = client._operations[ref][1]
+        client.chain.reader.reconcile = Mock(
+            side_effect=lambda *_, **__: reconciled.wait(2) and previous
+        )
+        retiring = asyncio.create_task(client._open("test/model", None))
+        await asyncio.wait_for(reading.wait(), 2)
+        assert ref not in client._operation_locks
+        reconciling = asyncio.create_task(client._reconcile_ref(ref))
+        await asyncio.sleep(0.05)
+        exit_read.set()
+        with pytest.raises(_FreshOpening):
+            await retiring
+        reconciled.set()
+        with pytest.raises(ClientError, match="unknown retained operation reference"):
+            await reconciling
+        assert client._operations == {}
+        assert json.loads(path.read_text())["operations"] == []
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_recovery_waiting_while_its_session_retired_leaves_the_next_attachment(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client, identifier, _ = closed_client(tmp_path, "cooperative")
+        client._control_lost = Mock()
+        client._ensure_close_attachment = AsyncMock()
+        await client._open_lock.acquire()
+        recovering = asyncio.create_task(client._recover(identifier))
+        await asyncio.sleep(0)
+        await client._retire_closed(None)
+        client._open_lock.release()
+        with pytest.raises(ClientError, match="not retained"):
+            await recovering
+        client._control_lost.assert_not_called()
+        client._ensure_close_attachment.assert_not_awaited()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_closing_a_stream_after_its_session_retired_only_ends_the_stream(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client, _, _ = closed_client(tmp_path, "cooperative")
+        await client._retire_closed(None)
+        output = _Output(ByteQueue())
+        await client._cancel_run(b"r" * 32, output)
+        with pytest.raises(ClientError, match="caller cancelled inference"):
+            await output.queue.get_or_end()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reconcile_waiting_during_a_retirement_never_writes_into_the_next_journal(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client, identifier, _ = closed_client(tmp_path, "withdraw")
+        ref = "withdraw-" + identifier.hex()
+        client.chain.reader.reconcile = Mock(side_effect=AssertionError)
+        held = client._operation_locks.setdefault(ref, asyncio.Lock())
+        await held.acquire()
+        retiring = asyncio.create_task(client._open("test/model", None))
+        await asyncio.sleep(0)
+        reconciling = asyncio.create_task(client._reconcile_ref(ref))
+        await asyncio.sleep(0)
+        held.release()
+        with pytest.raises(_FreshOpening):
+            await retiring
+        with pytest.raises(ClientError, match="unknown retained operation reference"):
+            await reconciling
+        assert client._operations == {}
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
 def test_restarted_public_inspection_reconcile_and_exit_restore_without_open(
     tmp_path: Path,
 ) -> None:
@@ -1141,41 +1486,19 @@ def test_control_loss_and_reattach_keep_in_flight_complete_streams():
     asyncio.run(scenario())
 
 
-def test_failed_receipt_proof_is_quarantined_without_failing_control():
+def test_a_receipt_contradicting_its_runs_final_is_refused_and_changes_nothing():
     async def scenario():
         client = component_client()
         ledger = client._ledger
-        errors = Errors()
-        client._observers = Observers(Hooks(on_error=errors))
-        client.chain.reader = SimpleNamespace(
-            block=Mock(side_effect=TransportError("HTTP endpoint returned status 429"))
-        )
-        receipt = pb.Receipt(
-            session_id=ledger.session_id,
-            run_id=RUN,
-            model="test/model",
-            rate_card_hash=CATALOG.rate_card_hash,
-            input_tokens=4,
-            cache_tokens=0,
-            output_tokens=0,
-            amount=2,
-            status=pb.RUN_STATUS_COMPLETED,
-            final_meter_seq=1,
-            settled_cumulative=0,
-            chain_observation=pb.ChainObservation(
-                chain_id=DOMAIN.chain_id,
-                contract_address=DOMAIN.verifying_contract,
-                block_number=1,
-                block_hash=b"b" * 32,
-            ),
-        )
-        task = client._spawn(client._receipt(receipt))
-        await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0)
-        assert client._control_failure is None and ledger.runs[RUN].final is None
-        assert await asyncio.to_thread(errors.seen.wait, 2)
-        assert errors.records[0].detail == "receipt: HTTP endpoint returned status 429"
-        client._observers.close()
+        accept_voucher(ledger, 4)
+        output = client._outputs[RUN] = _Output(ByteQueue())
+        assert ledger.apply_final(completed(ledger), 100)  # Its Terminal came first.
+        message = fixture_receipt(ledger, RUN)  # No tokens: another final.
+        assert await offer(client, message) == "conflicting definitive final reports"
+        assert ledger.runs[RUN].final[:3] == (4, 0, 0) and ledger.usage_amount == 2
+        assert RUN not in client._receipted and output.receipt is None
+        client._persist.assert_not_awaited()
+        assert client._control_failure is None
 
     asyncio.run(scenario())
 
@@ -1390,61 +1713,32 @@ async def offer(client, message):
         return str(error)
 
 
-def test_receipt_flood_is_checked_without_chain_reads_and_proven_once_per_run():
+def test_a_receipt_is_applied_at_once_with_no_chain_read():
+    """Checked against its run's accepted terms only, so it applies while the
+    RPC is down. Its settled total is the provider's report: the agent proves
+    the settled total at close and reads it at each attachment."""
+
     async def scenario():
         client = component_client()
         ledger = client._ledger
         accept_voucher(ledger, 4)
-        client.chain.reader = reader = CountingReader()
-        # Receipts for runs this agent never signed cost no read at all.
+        client.chain.reader = reader = CountingReader(TransportError("RPC is down"))
+        output = client._outputs[RUN] = _Output(ByteQueue())
+        client._observers = Mock()
+        # Receipts for runs this agent never signed are refused.
         reasons = [
             await offer(client, fixture_receipt(ledger, n.to_bytes(32, "big"))) for n in range(200)
         ]
-        assert set(reasons) == {"report has no retained signed run"} and reader.reads == 0
-        # Fifty copies of one run's Receipt are proven once.
+        assert set(reasons) == {"report has no retained signed run"}
+        message = fixture_receipt(ledger, RUN)
         for _ in range(50):
-            assert await offer(client, fixture_receipt(ledger, RUN)) is None
-        await client._receipt_task
-        assert reader.reads == 3 and ledger.runs[RUN].final is not None
+            assert await offer(client, message) is None
+        assert reader.reads == 0 and ledger.runs[RUN].final is not None
+        assert RUN in client._receipted and output.receipt == message.receipt
+        # Copies change nothing more.
+        assert client._observers.emit.call_args_list == [call("on_receipt", message.receipt)]
+        assert client._persist.await_count == 1
         assert client._control_failure is None and client._resync is None
-
-    asyncio.run(scenario())
-
-
-def test_failing_receipt_proofs_are_bounded_and_never_read_concurrently():
-    async def scenario():
-        client = component_client()
-        ledger = client._ledger
-        client._queue_options["max_messages"] = 64
-        accept_voucher(ledger, 4)
-        client.chain.reader = reader = CountingReader(
-            TransportError("HTTP endpoint returned status 429", transient=True)
-        )
-        runs = []
-        for number in range(40):
-            identifier = bytes([number + 1]) * 32
-            context = RunContext(
-                ledger.session_id, identifier, 1, "test/model", CATALOG.rate_card_hash
-            )
-            ledger.register(context, SIGNER.sign_run(DOMAIN, context))
-            runs.append(identifier)
-        reasons = []
-        for identifier in runs:
-            reasons.append(await offer(client, fixture_receipt(ledger, identifier)))
-            if client._receipt_task is not None:
-                await client._receipt_task
-        assert reasons[:16] == [None] * 16
-        assert set(reasons[16:]) == {"receipt proofs are suspended on this attachment"}
-        # Each transient failure is tried once more before it counts.
-        assert reader.reads == 32 and reader.most == 1
-        assert client._receipt_failures == 16 and client._control_failure is None
-        # Queued proofs still run one at a time.
-        client._receipt_failures, client._receipts_seen = 0, set()
-        reader.failure = None
-        for identifier in runs[:10]:
-            assert await offer(client, fixture_receipt(ledger, identifier)) is None
-        await client._receipt_task
-        assert reader.most == 1
 
     asyncio.run(scenario())
 
@@ -1565,47 +1859,6 @@ def test_a_top_up_needs_the_agent_id_and_relies_on_the_opening_checks(agent_id):
     asyncio.run(scenario())
 
 
-def test_receipts_sharing_a_proven_observation_need_no_chain_reads():
-    """One proof per provider observation, not five reads per Receipt."""
-
-    async def scenario():
-        client = component_client()
-        ledger = client._ledger
-        client._queue_options["max_messages"] = 64
-        accept_voucher(ledger, 4)
-        client.chain.reader = reader = CountingReader()
-        client._proven = OrderedDict()
-        runs = []
-        for number in range(5):
-            identifier = bytes([number + 1]) * 32
-            context = RunContext(
-                ledger.session_id, identifier, 1, "test/model", CATALOG.rate_card_hash
-            )
-            ledger.register(context, SIGNER.sign_run(DOMAIN, context))
-            runs.append(identifier)
-        for identifier in runs[:4]:
-            message = fixture_receipt(ledger, identifier)
-            message.receipt.final_meter_seq = runs.index(identifier) + 1
-            assert await offer(client, message) is None
-        await client._receipt_task
-        assert reader.reads == 3 and all(ledger.runs[run].final for run in runs[:4])
-        # A different settled total at a proven observation is refused, still without reads.
-        errors = Errors()
-        client._observers = Observers(Hooks(on_error=errors))
-        message = fixture_receipt(ledger, runs[4])
-        message.receipt.final_meter_seq, message.receipt.settled_cumulative = 5, 1
-        assert await offer(client, message) is None
-        await client._receipt_task
-        assert reader.reads == 3 and ledger.runs[runs[4]].final is None
-        assert await asyncio.to_thread(errors.seen.wait, 2)
-        assert errors.records[0].detail == (
-            "receipt: receipt settlement total contradicts chain or accepted usage"
-        )
-        client._observers.close()
-
-    asyncio.run(scenario())
-
-
 def test_a_silent_stream_cannot_hold_a_resync_past_its_deadline(monkeypatch):
     """A provider must not keep the session unusable with a stream that sends nothing."""
 
@@ -1626,45 +1879,6 @@ def test_a_silent_stream_cannot_hold_a_resync_past_its_deadline(monkeypatch):
             await client._open("test/model", None)  # The next request re-syncs.
         await asyncio.gather(silent.task, return_exceptions=True)
         assert silent.task.cancelled() and client._control_failure is not None
-
-    asyncio.run(scenario())
-
-
-def test_a_transient_receipt_proof_failure_is_retried_and_can_be_offered_again():
-    async def scenario():
-        client = component_client()
-        ledger = client._ledger
-        accept_voucher(ledger, 4)
-
-        class Flaky(CountingReader):
-            def __init__(self, failures):
-                super().__init__()
-                self.left = failures
-
-            def _read(self):
-                super()._read()
-                if self.left:
-                    self.left -= 1
-                    raise TransportError("HTTP endpoint returned status 503", transient=True)
-
-        client.chain.reader = reader = Flaky(1)
-        assert await offer(client, fixture_receipt(ledger, RUN)) is None
-        await client._receipt_task
-        assert ledger.runs[RUN].final is not None and client._receipt_failures == 0
-        assert reader.reads == 4  # One failed read, then the full proof.
-        # Two failures in a row give up for now, but a later copy is proven.
-        context = RunContext(ledger.session_id, b"q" * 32, 1, "test/model", CATALOG.rate_card_hash)
-        ledger.register(context, SIGNER.sign_run(DOMAIN, context))
-        client.chain.reader = reader = Flaky(2)
-        client._proven.clear()
-        message = fixture_receipt(ledger, b"q" * 32)
-        message.receipt.final_meter_seq = 2
-        assert await offer(client, message) is None
-        await client._receipt_task
-        assert ledger.runs[b"q" * 32].final is None and client._receipt_failures == 1
-        assert await offer(client, message) is None
-        await client._receipt_task
-        assert ledger.runs[b"q" * 32].final is not None
 
     asyncio.run(scenario())
 
@@ -1890,6 +2104,231 @@ def test_renewal_stops_instead_of_spinning_when_it_cannot_sign():
     asyncio.run(scenario())
 
 
+def added(*counts):
+    return TokenCounts(*(sum(column) for column in zip(*map(astuple, counts), strict=True)))
+
+
+class AdmittingProvider(services.ChatServicer, services.ControlServicer):
+    """A provider following the admission rule of both provider SDKs.
+
+    A request is admitted at once when the accepted voucher covers usage, every
+    admitted reservation and its own bound. Otherwise it sends that complete
+    target as a LowCredit coverage request and waits for a covering voucher
+    (mppi_provider ``Mppi._admit``; the Rust ``attempt_admission_before``).
+    Each run then reports one Meter, waits for the agent's renewal and ends.
+    """
+
+    BOUND, USED = TokenCounts(4, 0, 10), TokenCounts(4, 0, 6)
+
+    def __init__(self, ledger):
+        self.ledger = ledger
+        self.accepted, self.vouchers, self.coverage_requests = None, [], 0
+        self.usage, self.reserved, self.seq = TokenCounts(0, 0, 0), {}, 0
+        self.changed, self.outbound = asyncio.Condition(), asyncio.Queue()
+
+    def covered(self, amount):
+        return self.accepted is not None and self.accepted >= amount
+
+    async def Session(self, requests, context):
+        async def receive():
+            async for message in requests:
+                amount = message.voucher.cumulative
+                verify_voucher(DOMAIN, DESCRIPTOR, amount, message.voucher.signature)
+                async with self.changed:
+                    self.vouchers.append(amount)
+                    if not self.covered(amount):
+                        self.accepted = amount
+                    self.changed.notify_all()
+
+        reader = asyncio.create_task(receive())
+        try:
+            while True:
+                yield await self.outbound.get()
+        finally:
+            reader.cancel()
+
+    async def Completions(self, request, context):
+        sid = self.ledger.session_id
+        async with self.changed:
+            target = added(self.usage, *self.reserved.values(), self.BOUND)
+            required = required_coverage(
+                (priced_numerator(target, CATALOG.rates_for(request.model)),)
+            )
+            if not self.covered(required):
+                self.coverage_requests += 1
+                await self.outbound.put(
+                    pb.ControlMessage(
+                        low_credit=pb.LowCredit(
+                            session_id=sid,
+                            model=request.model,
+                            rate_card_hash=request.rate_card_hash,
+                            remaining_tokens=0,
+                            suggest_top_up_tokens=10,
+                            coverage_request=pb.CoverageRequest(
+                                run_id=request.run_id,
+                                control_generation=request.control_generation,
+                                required_by_price=[
+                                    pb.RequiredTokens(
+                                        model=request.model,
+                                        rate_card_hash=request.rate_card_hash,
+                                        input_tokens=target.input_tokens,
+                                        cache_tokens=target.cache_tokens,
+                                        output_tokens=target.output_tokens,
+                                    )
+                                ],
+                            ),
+                        )
+                    )
+                )
+                await asyncio.wait_for(self.changed.wait_for(lambda: self.covered(required)), 2)
+            self.reserved[request.run_id], self.seq = self.BOUND, self.seq + 1
+            signed = len(self.vouchers)
+            await self.outbound.put(
+                pb.ControlMessage(
+                    meter=pb.Meter(
+                        session_id=sid,
+                        run_id=request.run_id,
+                        seq=self.seq,
+                        input_tokens=self.USED.input_tokens,
+                        cache_tokens=self.USED.cache_tokens,
+                        output_tokens=self.USED.output_tokens,
+                    )
+                )
+            )
+            await asyncio.wait_for(self.changed.wait_for(lambda: len(self.vouchers) > signed), 2)
+            del self.reserved[request.run_id]
+            self.usage = added(self.usage, self.USED)
+        yield pb.ChatChunk(payload=ANSWER)
+        yield pb.ChatChunk(
+            terminal=pb.Terminal(
+                session_id=sid,
+                run_id=request.run_id,
+                model=request.model,
+                rate_card_hash=request.rate_card_hash,
+                input_tokens=self.USED.input_tokens,
+                cache_tokens=self.USED.cache_tokens,
+                output_tokens=self.USED.output_tokens,
+                amount=5,
+                status=pb.RUN_STATUS_COMPLETED,
+                final_meter_seq=self.seq,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("headroom", "coverage_requests", "vouchers"),
+    # Each request reserves 4 input and 10 output tokens (7 base units) and
+    # uses 4 and 6 (5); the renewal after its Meter adds 6 output tokens (3).
+    ((0, 2, [7, 10, 12, 15]), (20, 1, [27, 30, 33])),
+)
+def test_voucher_headroom_admits_the_next_request_without_a_voucher_round_trip(
+    headroom, coverage_requests, vouchers
+):
+    """Without headroom every request waits for LowCredit and its Voucher
+    before its first byte. With it the first voucher leaves room for the next
+    request, so the provider admits it at once; amounts stay at most the
+    requirement plus the headroom."""
+
+    async def scenario():
+        client = component_client()
+        client._voucher_headroom = headroom
+        ledger = client._ledger
+        ledger.runs.clear()
+        client.chain.current.identities = {DESCRIPTOR.provider_id: SimpleNamespace(catalog=CATALOG)}
+        client._open = AsyncMock(return_value=SimpleNamespace(session=object()))
+        provider = AdmittingProvider(ledger)
+        server = grpc.aio.server(options=GRPC_OPTIONS)
+        services.add_ChatServicer_to_server(provider, server)
+        services.add_ControlServicer_to_server(provider, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}", options=GRPC_OPTIONS)
+        client._channel, client.request_timeout = channel, None
+        client._control = services.ControlStub(channel).Session()
+        tasks = [
+            asyncio.create_task(client._control_read()),
+            asyncio.create_task(client._control_write()),
+        ]
+        payload = b'{"model":"test/model","messages":[],"stream":true}'
+        try:
+            for _ in range(2):
+                _, output = await asyncio.wait_for(client._create("test/model", True, payload), 2)
+                assert await asyncio.wait_for(client._next(output), 3) == ANSWER
+                assert await asyncio.wait_for(client._next(output), 3) is None
+            assert provider.coverage_requests == coverage_requests
+            assert provider.vouchers == vouchers
+            assert ledger.usage_amount == 10 and client._control_failure is None
+        finally:
+            client._control.cancel()
+            for task in tasks + list(client._background):
+                task.cancel()
+            await asyncio.gather(*tasks, *client._background, return_exceptions=True)
+            await channel.close()
+            await server.stop(0)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("signed", "headroom", "sent"),
+    (
+        (None, 0, 7),  # Exactly the requirement, as without headroom.
+        (None, 20, 27),
+        (10, 20, 27),  # Raised to the requirement plus the headroom.
+        (30, 20, 30),  # Already sufficient: resent, never raised.
+        (None, 1000, 100),  # Never above the confirmed deposit.
+    ),
+)
+def test_a_voucher_covers_its_requirement_plus_the_headroom_within_the_deposit(
+    signed, headroom, sent
+):
+    async def scenario():
+        client = component_client()
+        client._voucher_headroom = headroom
+        client._send = AsyncMock()
+        ledger = client._ledger
+        if signed is not None:
+            accept_voucher(ledger, signed)
+        # The provider requires 4 input and 10 output tokens: 7 base units.
+        await client._control_report("low_credit", coverage_low_credit(ledger, outputs=10))
+        await asyncio.wait_for(client._voucher_task, 1)
+        (message,) = [call.args[0] for call in client._send.await_args_list]
+        assert message.voucher.cumulative == ledger.voucher.cumulative == sent
+        verify_voucher(DOMAIN, DESCRIPTOR, sent, message.voucher.signature)
+        await asyncio.wait_for(client._renew(), 1)  # The same requirement: nothing more.
+        await client._voucher(101, generation=1, run_id=RUN)  # Above the deposit of 100.
+        assert client._send.await_count == 1 and ledger.voucher.cumulative == sent
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", (-1, True, 1.0, "20", 1 << 64))
+def test_voucher_headroom_is_an_explicit_uint64_choice(tmp_path: Path, value) -> None:
+    async def stop() -> None:
+        pass
+
+    chain = SimpleNamespace(
+        reader=SimpleNamespace(profile=SimpleNamespace(domain=DOMAIN)), stop=stop
+    )
+    options = {
+        "wallet": SimpleNamespace(address=DESCRIPTOR.agent),
+        "signer": SIGNER,
+        "chain": chain,
+        "contract": ContractCalls(DOMAIN, "USDC", "2"),
+        "checkpoint_path": tmp_path / "agent.json",
+        "signer_reference": "fixture:public-test-key",
+    }
+    with pytest.raises(ValidationError, match="voucher_headroom"):
+        Client(7, voucher_headroom=value, **options)
+    client = Client(7, **options)
+    assert client._voucher_headroom == 0  # Off unless the caller chooses it.
+    client.close()
+    options["checkpoint_path"] = tmp_path / "other.json"
+    client = Client(7, voucher_headroom=20, **options)
+    assert client._voucher_headroom == 20
+    client.close()
+
+
 REFUSALS = {
     "deposit": PaymentFailure(PaymentCode.INSUFFICIENT_DEPOSIT),
     "authorization": PaymentFailure(PaymentCode.SESSION_NOT_READY, "AUTHORIZATION_REQUIRED"),
@@ -2089,14 +2528,18 @@ def test_a_follower_keeps_the_refresh_failure_callback_its_caller_set(tmp_path, 
 
 
 def top_up_client(timestamp=1_800_000_000):
-    """A component client that can top up, with a wallet that records its signing."""
+    """A component client that can top up, with a wallet that records its signing.
+
+    Its follower accepted block 10 of a final network, where USDC holds every
+    authorization unused.
+    """
     client = component_client()
     client._funding_lock = asyncio.Lock()
     client._local_start = AsyncMock()
     client._operations, client._saved = {}, {}
     client._control = None
     client.contract = ContractCalls(DOMAIN, "USDC", "2")
-    block = SimpleNamespace(timestamp=timestamp)
+    block = SimpleNamespace(observation=SimpleNamespace(block_number=10), timestamp=timestamp)
     client.chain.current = current = SimpleNamespace(
         sessions=client.chain.snapshot().sessions, block=block
     )
@@ -2105,7 +2548,15 @@ def top_up_client(timestamp=1_800_000_000):
     sign = Mock(return_value=b"\x01" * 65)
     client.wallet = SimpleNamespace(address=DESCRIPTOR.agent, sign_funding_authorization=sign)
     fundable(client)
+    client.chain.reader.profile = SimpleNamespace(domain=DOMAIN, instant_finality=True)
+    client.chain.reader._call = Mock(return_value=bytes(32))  # authorizationState: false
+    client.chain.reader._check_canonical = Mock()
     return client, current, sign
+
+
+def authorization_state(nonce):
+    """USDC authorizationState(agent, nonce) calldata (EIP3009.sol:64)."""
+    return bytes.fromhex("e94a0102") + bytes(12) + DESCRIPTOR.agent + nonce
 
 
 def test_a_failed_top_up_is_retried_with_its_same_authorization_until_it_expires():
@@ -2127,6 +2578,14 @@ def test_a_failed_top_up_is_retried_with_its_same_authorization_until_it_expires
         await client._top_up(ledger.session_id, 10)
         again = sign.call_args.args[0]
         assert again == first  # Same amount, nonce and validity window.
+        # USDC held it unused at the follower's block before it was resent: one
+        # call pinned to that final block, which is not read again.
+        assert client.chain.reader._call.call_args.args == (
+            DESCRIPTOR.token,
+            authorization_state(first.nonce),
+            current.block,
+        )
+        client.chain.reader._check_canonical.assert_not_called()
         refs = [call.args[1] for call in client._submit.call_args_list]
         assert len(set(refs)) == 2  # Each attempt has its own reference.
         with pytest.raises(ClientError, match="earlier top-up of 10 is still valid"):
@@ -2183,6 +2642,238 @@ def test_a_confirmed_top_up_takes_its_new_deposit_from_its_event():
         first = sign.call_args.args[0]
         await client._top_up(ledger.session_id, 10)
         assert sign.call_args.args[0].nonce != first.nonce
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "case", ["contradicted", "concurrent", "follower_past", "reconciled_again"]
+)
+def test_a_top_up_event_shows_at_least_the_deposit_confirmed_before_it_plus_its_amount(case):
+    """topUp sets the deposit before it plus its amount, and deposits only grow
+    (MPPI.sol open, topUp). The deposit confirmed when the intent was recorded,
+    before anything was sent, is the prior: the follower's later view may
+    already hold this top-up, from a refresh or from its own event."""
+
+    async def scenario():
+        client, current, sign = top_up_client()
+        ledger = client._ledger
+        # Deposit 100 confirmed before sending; the top-up of 10 lands at block 11.
+        deposit = 105 if case == "contradicted" else 130 if case == "concurrent" else 110
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 11, b"n" * 32)
+        outcome = SessionOperationOutcome(ledger.session_id, 10, deposit=deposit)
+
+        async def confirmed(operation, ref):
+            if case == "follower_past":
+                # A background refresh accepted block 11 during the wallet call.
+                current.block.observation.block_number = 11
+                state = current.sessions[ledger.session_id]
+                current.sessions[ledger.session_id] = replace(state, deposit=110)
+            result = OperationResult(
+                ref, OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=observation,
+                sessions=(outcome,),
+            )  # fmt: skip
+            client._operations[ref] = (operation, result)
+            return result
+
+        client._submit = AsyncMock(side_effect=confirmed)
+        if case == "contradicted":
+            with pytest.raises(ClientError, match="contradicts the confirmed deposit"):
+                await client._top_up(ledger.session_id, 10)
+            # Fail closed: the event raises no spending bound and sends no hint;
+            # its proven record and intent stay, and a reconcile checks it again.
+            client.chain.confirm.assert_not_called()
+            assert client._top_up_hint is None
+            ((ref, (_, result)),) = client._operations.items()
+            assert result.state is OperationState.CONFIRMED
+            assert client._saved["funding_intent"]["ref"] == ref
+            with pytest.raises(ClientError, match="contradicts the confirmed deposit"):
+                await client._top_up_confirmed(result)
+            # Its own authorization may still land: a retry reads it and resends
+            # it while unused, never a new nonce, and refuses once it is used.
+            first = sign.call_args.args[0]
+            await_count = client._submit.await_count
+            # A restart keeps no event: the restored record names no deposit.
+            client._operations[ref] = (client._operations[ref][0], replace(result, sessions=()))
+            with pytest.raises(ClientError, match="contradicts the confirmed deposit"):
+                await client._top_up(ledger.session_id, 10)
+            assert sign.call_args.args[0].nonce == first.nonce
+            assert client.chain.reader._call.call_args.args[1] == authorization_state(first.nonce)
+            assert client._submit.await_count == await_count + 1
+            client.chain.reader._call.return_value = (1).to_bytes(32, "big")
+            with pytest.raises(ClientError, match="earlier top-up of 10 took effect"):
+                await client._top_up(ledger.session_id, 10)
+            assert client._submit.await_count == await_count + 1
+        else:
+            result = await client._top_up(ledger.session_id, 10)
+            assert result.state is OperationState.CONFIRMED
+            ((_, state), _) = client.chain.confirm.call_args
+            assert state.deposit == deposit  # Another top-up may have landed first.
+            if case == "reconciled_again":
+                # Its own event is now in the follower's view of block 10.
+                current.sessions[ledger.session_id] = state
+                await client._top_up_confirmed(result)
+                assert client.chain.confirm.call_args.args[1].deposit == 110
+
+    asyncio.run(scenario())
+
+
+def test_an_intent_outliving_its_confirmation_is_read_before_any_new_top_up():
+    """A crash after a top-up was persisted CONFIRMED but before its intent was
+    spent: the intent alone cannot say whether that event was its own, so the
+    authorization is read, and once used every top-up waits for it to expire."""
+
+    async def scenario():
+        client, current, sign = top_up_client()
+        ledger = client._ledger
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 11, b"n" * 32)
+
+        def submitted(operation, ref):
+            # Persisted CONFIRMED; the process stops before the intent is spent.
+            result = OperationResult(
+                ref, OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=observation
+            )
+            client._operations[ref] = (operation, result)
+            return OperationResult(ref, OperationState.UNKNOWN)
+
+        client._submit = AsyncMock(side_effect=submitted)
+        await client._top_up(ledger.session_id, 10)
+        first = sign.call_args.args[0]
+        assert client._saved["funding_intent"]["nonce"] == first.nonce.hex()
+        client.chain.reader._call.return_value = (1).to_bytes(32, "big")
+        with pytest.raises(ClientError, match="earlier top-up of 10 took effect"):
+            await client._top_up(ledger.session_id, 10)
+        assert client.chain.reader._call.call_args.args[1] == authorization_state(first.nonce)
+        assert sign.call_count == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["used", "unreadable"])
+def test_a_retry_never_resends_an_authorization_usdc_already_used(case):
+    """A FAILED top-up can still have taken effect: a status-0 bundle can be
+    front-run while the same authorization funds the session. Before a retry
+    sends it again, USDC's authorizationState is read no earlier than where that
+    failure was seen. A used one took effect: nothing is sent, and every top-up
+    is refused the same way until it expires, so a caller retrying the error
+    never funds twice. An unreadable state sends nothing either."""
+
+    async def scenario():
+        client, current, sign = top_up_client()
+        ledger = client._ledger
+        seen = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 12, b"f" * 32)
+
+        def failed(operation, ref):
+            result = OperationResult(
+                ref, OperationState.FAILED, tx_hash=b"t" * 32, observation=seen,
+                cause="the MPPI call did not take effect in its transaction",
+            )  # fmt: skip
+            client._operations[ref] = (operation, result)
+            return result
+
+        client._submit = AsyncMock(side_effect=failed)
+        await client._top_up(ledger.session_id, 10)
+        first = sign.call_args.args[0]
+        later = SimpleNamespace(observation=seen, timestamp=current.block.timestamp + 6)
+
+        async def refresh():
+            current.block = later
+
+        client.chain.refresh = AsyncMock(side_effect=refresh)
+        client.chain.reader._call.return_value = (1).to_bytes(32, "big")
+        if case == "used":
+            with pytest.raises(ClientError, match="earlier top-up of 10 took effect"):
+                await client._top_up(ledger.session_id, 11)
+        else:
+            client.chain.reader._call.side_effect = ChainEvidenceError(
+                "RPC request returned no usable result"
+            )
+            with pytest.raises(ChainEvidenceError):
+                await client._top_up(ledger.session_id, 10)
+        # The follower was behind that failure's block: it refreshed, then read there.
+        client.chain.refresh.assert_awaited_once()
+        assert client.chain.reader._call.call_args.args == (
+            DESCRIPTOR.token,
+            authorization_state(first.nonce),
+            later,
+        )
+        assert sign.call_count == 1 and client._submit.await_count == 1  # Nothing resent.
+        assert client._saved["funding_intent"]["nonce"] == first.nonce.hex()
+        if case == "used":
+            with pytest.raises(ClientError, match="earlier top-up of 10 took effect"):
+                await client._top_up(ledger.session_id, 10)  # The same amount again.
+            assert sign.call_count == 1 and client._submit.await_count == 1
+            # Once it has expired, a new top-up gets a new nonce.
+            current.block = SimpleNamespace(observation=seen, timestamp=first.valid_before)
+            client._submit = AsyncMock(
+                side_effect=lambda operation, ref: OperationResult(ref, OperationState.UNKNOWN)
+            )
+            await client._top_up(ledger.session_id, 10)
+            assert sign.call_args.args[0].nonce != first.nonce
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "case", ["at_valid_before", "not_final", "before", "used", "noncanonical", "another_intent"]
+)
+def test_an_uncertain_top_up_is_void_only_at_a_canonical_block_past_its_authorization(case):
+    """An uncertain top-up blocks every later one. At a canonical block at or after
+    its valid_before, an authorization USDC holds unused never took effect and
+    never can (EIP3009.sol:313-324), so reconciling it reports FAILED."""
+
+    async def scenario():
+        client, current, sign = top_up_client()
+        ledger = client._ledger
+
+        def unknown(operation, ref):
+            result = OperationResult(ref, OperationState.UNKNOWN)
+            client._operations[ref] = (operation, result)
+            return result
+
+        client._submit = AsyncMock(side_effect=unknown)
+        await client._top_up(ledger.session_id, 10)
+        ((ref, _),) = client._operations.items()
+        auth = sign.call_args.args[0]
+        with pytest.raises(ClientError, match="reconcile pending funding"):
+            await client._top_up(ledger.session_id, 10)
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        current.block.timestamp = auth.valid_before  # Reached exactly.
+        if case == "before":
+            current.block.timestamp = auth.valid_before - 1
+        elif case == "used":
+            client.chain.reader._call.return_value = (1).to_bytes(32, "big")
+        elif case in ("not_final", "noncanonical"):
+            # Without instant finality the block is read again by number.
+            client.chain.reader.profile.instant_finality = False
+            if case == "noncanonical":
+                client.chain.reader._check_canonical.side_effect = ChainEvidenceError(
+                    "canonical block evidence changed during observation"
+                )
+        elif case == "another_intent":
+            client._saved["funding_intent"]["ref"] = "top-up-another"
+        result = await client._reconcile_ref(ref)
+        if case in ("at_valid_before", "not_final"):
+            assert result.state is OperationState.FAILED
+            assert result.cause == "authorization expired before any top-up"
+            assert client._operations[ref][1].state is OperationState.FAILED
+            assert client.chain.reader._call.call_args.args == (
+                DESCRIPTOR.token,
+                authorization_state(auth.nonce),
+                current.block,
+            )
+            if case == "not_final":
+                client.chain.reader._check_canonical.assert_called_once_with(current.block)
+            else:
+                client.chain.reader._check_canonical.assert_not_called()
+            # It no longer blocks: the next top-up is a new authorization.
+            await client._top_up(ledger.session_id, 10)
+            assert sign.call_args.args[0].nonce != auth.nonce
+        else:
+            assert result.state is OperationState.UNKNOWN
+            assert client._operations[ref][1].state is OperationState.UNKNOWN
+            if case in ("before", "another_intent"):
+                client.chain.reader._call.assert_not_called()
 
     asyncio.run(scenario())
 
@@ -2372,6 +3063,37 @@ def test_a_session_s_accepted_terms_and_run_outcomes_are_public():
         assert never.amount == 0 and never.counts == TokenCounts(0, 0, 0)
         with pytest.raises(ClientError, match="not retained"):
             await client._run_outcome(ledger.session_id, b"x" * 32)
+
+    asyncio.run(scenario())
+
+
+def test_a_money_steps_measured_parts_never_add_up_to_more_than_its_total():
+    """Parts of 36.7, 27.7 and 58.7 ms in a step of 123.2 ms: each rounded to
+    nearest, they summed to 124, more than the step's 123."""
+
+    async def scenario():
+        seen = []
+        done = threading.Event()
+
+        def record(timing):
+            seen.append(timing)
+            done.set()
+
+        client = component_client()
+        client._observers = Observers(Hooks(on_timing=record))
+
+        async def step():
+            timing = client_module._TIMING.get()
+            timing.parts.update(chain=0.0367, wallet_sign=0.0277, wallet_submit=0.0587)
+            timing.start = time.monotonic() - 0.1232
+            return OperationResult("requestClose-x", OperationState.PENDING)
+
+        await client._measured("requestClose", step())
+        assert await asyncio.to_thread(done.wait, 2)
+        (timing,) = seen
+        parts = timing.chain_ms + timing.wallet_sign_ms + timing.wallet_submit_ms
+        assert timing.provider_ms >= 0 and parts + timing.provider_ms == timing.total_ms
+        assert (timing.chain_ms, timing.wallet_sign_ms, timing.wallet_submit_ms) == (36, 27, 58)
 
     asyncio.run(scenario())
 

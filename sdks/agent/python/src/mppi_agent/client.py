@@ -2,7 +2,8 @@
 
 All grpc.aio objects live on that thread. Wallet, HTTP and chain I/O run outside
 the event loop; Control progresses independently of caller output consumption.
-No inference replay, implicit top-up, replacement session or automatic close.
+No inference replay, implicit top-up or automatic close; a new session is
+funded only after this agent's own confirmed close (Client._retire_closed).
 """
 
 from __future__ import annotations
@@ -10,12 +11,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import os
 import secrets
 import threading
 import time
-from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine, Iterator
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -42,8 +43,20 @@ from mppi_protocol.capabilities import (
     WalletCall,
 )
 from mppi_protocol.catalog import Catalog, parse_catalog, validate_model
-from mppi_protocol.chain import ChainEvidenceError, ChainLagError, ChainSession, DeploymentProfile
-from mppi_protocol.contract import ContractCalls, OperationKind, PreparedOperation
+from mppi_protocol.chain import (
+    Block,
+    ChainEvidenceError,
+    ChainLagError,
+    ChainSession,
+    DeploymentProfile,
+)
+from mppi_protocol.contract import (
+    ContractCalls,
+    OperationKind,
+    PreparedOperation,
+    _decode_exact,
+    _hash,
+)
 from mppi_protocol.discovery import ProviderIdentity, normalize_origin, parse_document
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.follower import ChainFollower, ChainSnapshot, RefreshFailure
@@ -92,9 +105,9 @@ from .state import Ledger, Run, monotone
 T = TypeVar("T")
 
 # Control reports that are rejected alone. One such report that fails
-# validation or cannot be proven now is set aside: nothing it carried is
-# applied, and the attachment and every run continue. A rejected
-# Meter also stops the session cursor; see Client._meter.
+# validation is set aside: nothing it carried is applied, and the attachment
+# and every run continue. A rejected Meter also stops the session cursor; see
+# Client._meter.
 _SINGLE_REPORTS = frozenset({"challenge", "low_credit", "receipt", "drain"})
 _PAYMENT_REPORTS = frozenset({"meter", "low_credit", "receipt", "drain", "close_result"})
 # Settled final runs still waiting for their Receipt, kept before the oldest is
@@ -103,14 +116,10 @@ _PAYMENT_REPORTS = frozenset({"meter", "low_credit", "receipt", "drain", "close_
 _UNRECEIPTED_FINALS = 1024
 # Longest a stuck attachment waits for live runs before ending them; see _meter.
 _RESYNC_WAIT_S = 60.0
-# Proven Receipt observations kept: the provider stamps each Receipt with its
-# follower's current block, so a session's Receipts share few observations.
-_PROVEN_OBSERVATIONS = 64
-# Receipts waiting for proof: as many as runs may be pending (state.py register).
-_RECEIPT_QUEUE = 1024
-# Receipt proofs that fail after reading chain state, per attachment, before
-# this attachment stops reading for Receipts (a provider wasting the agent's RPC).
-_RECEIPT_FAILURES = 16
+# USDC authorizationState(address,bytes32): true once the authorizer's EIP-3009
+# nonce is used or cancelled, never cleared (Circle stablecoin-evm fc85788,
+# contracts/v2/EIP3009.sol:64-70, :266, :335; in Arc USDC's verified ABI).
+_AUTHORIZATION_STATE = _hash(b"authorizationState(address,bytes32)")[:4]
 
 
 def _refused_before_admission(error: Exception) -> bool:
@@ -407,6 +416,12 @@ class Client:
     The caller keeps its signer credential in its wallet/secret service and
     supplies only its recoverable reference here. macOS and Linux are supported.
     The supplied ChainFollower is exclusively owned by this Client's loop.
+
+    ``voucher_headroom`` (USDC base units, default 0) is signed above each
+    voucher's requirement, within the confirmed deposit, so the provider admits
+    a later request it covers without asking for a voucher first. Whatever it
+    delivered, a provider can capture up to the signed voucher: the headroom
+    adds at most that much to the agent's trust exposure.
     """
 
     @classmethod
@@ -421,6 +436,7 @@ class Client:
         profile: DeploymentProfile | None = None,
         max_age_ms: int = 60_000,
         poll_interval_ms: int | None = None,
+        voucher_headroom: int = 0,
     ) -> Client:
         """Use completed CLI onboarding; funding still requires an explicit choice.
 
@@ -440,6 +456,7 @@ class Client:
             profile=profile,
             max_age_ms=max_age_ms,
             poll_interval_ms=poll_interval_ms,
+            voucher_headroom=voucher_headroom,
         )
 
     def __init__(
@@ -454,6 +471,7 @@ class Client:
         signer_reference: str,
         initial_session_tokens: int | None = None,
         agent_id: int | None = None,
+        voucher_headroom: int = 0,
         ca_file: str | None = None,
         timeout_ms: int = 10_000,
         request_timeout_ms: int | None = None,
@@ -486,6 +504,7 @@ class Client:
             uint64(initial_session_tokens, field="initial_session_tokens", positive=True)
         if agent_id is not None:
             uint256(agent_id, field="agent_id")
+        uint64(voucher_headroom, field="voucher_headroom")
         if on_low_credit is not None and not callable(on_low_credit):
             raise ClientError("on_low_credit must be callable")
         if on_funding_notice is not None and not callable(on_funding_notice):
@@ -495,6 +514,7 @@ class Client:
         self.provider, self.wallet, self.signer = provider, wallet, signer
         self.chain, self.contract, self.signer_reference = chain, contract, signer_reference
         self.initial_session_tokens, self.agent_id = initial_session_tokens, agent_id
+        self._voucher_headroom = voucher_headroom
         self.timeout, self.request_timeout = (
             timeout_ms / 1000,
             None if request_timeout_ms is None else request_timeout_ms / 1000,
@@ -539,17 +559,8 @@ class Client:
         # A rejected Meter stopped this attachment's session cursor, at _resync_at.
         self._resync: Exception | None = None
         self._resync_at = 0.0
-        # Receipt proofs run one at a time from a bounded queue, once per run
-        # per attachment, so they never crowd the follower's chain reads.
-        self._receipt_queue: deque[tuple[pb.Receipt, int]] = deque()
-        self._receipt_task: asyncio.Task[None] | None = None
-        self._receipts_seen: set[bytes] = set()
-        self._receipt_failures = 0
         # Runs whose Receipt was verified; see _prune.
         self._receipted: set[bytes] = set()
-        # (session, block number, block hash) -> settled total this agent read
-        # itself at that canonical block; see _verify_receipt.
-        self._proven: OrderedDict[tuple[bytes, int, bytes], int] = OrderedDict()
         self._outbound: ByteQueue | None = None
         self._nonce: asyncio.Future[bytes] | None = None
         self._snapshot_waiter: asyncio.Future[pb.SessionState] | None = None
@@ -992,7 +1003,6 @@ class Client:
             ledger.forget(identifier)
             self._outputs.pop(identifier, None)
             self._receipted.discard(identifier)
-            self._receipts_seen.discard(identifier)
 
     async def _persist(self) -> None:
         async with self._checkpoint_lock:
@@ -1038,7 +1048,9 @@ class Client:
             return result
         finally:
             _TIMING.reset(token)
-            ms = {part: round(seconds * 1000) for part, seconds in timing.parts.items()}
+            # Parts are rounded down and the total to nearest: parts measured
+            # within the step never add up to more than its total.
+            ms = {part: int(seconds * 1000) for part, seconds in timing.parts.items()}
             total = round((time.monotonic() - timing.start) * 1000)
             self._observers.emit(
                 "on_timing",
@@ -1119,10 +1131,7 @@ class Client:
             task.cancel()
         await asyncio.gather(*old_tasks, return_exceptions=True)
         self._pending_vouchers.clear()
-        self._renew_task = self._voucher_task = self._receipt_task = None
-        self._receipt_queue.clear()
-        self._receipts_seen.clear()
-        self._receipt_failures = 0
+        self._renew_task = self._voucher_task = None
         self._funding = None
         self._low_credit_task = None
         if self._ledger is not None:
@@ -1177,6 +1186,9 @@ class Client:
         self._observers.emit(
             "on_error", HookError("control", type(error).__name__, detail=_detail(kind, error))
         )
+        self._end_control(error)
+
+    def _end_control(self, error: Exception) -> None:
         self._control_failure = error
         self._attached_generation = 0
         if self._low_credit_task is not None:
@@ -1341,8 +1353,8 @@ class Client:
             ):
                 self._notify_low_credit(message.low_credit, deposit, coverage.required)
             self._observers.emit("on_low_credit", message.low_credit)
-            target = coverage.target
-            if target is not None:
+            required = coverage.required
+            if coverage.target is not None and required is not None:
                 request = message.low_credit.coverage_request
                 if (
                     request.run_id not in self._pending_vouchers
@@ -1351,31 +1363,34 @@ class Client:
                     # The ledger recorded nothing, and any funding notice went out.
                     raise ClientError("pending voucher queue is full")
                 ledger.cover(coverage)
-                self._pending_vouchers[request.run_id] = (target, request.control_generation)
+                # The requirement itself: _voucher adds any headroom and reuses
+                # a signed voucher that already covers both.
+                self._pending_vouchers[request.run_id] = (required, request.control_generation)
                 if self._voucher_task is None or self._voucher_task.done():
                     self._voucher_task = self._spawn(self._voucher_worker())
         elif kind == "receipt":
-            # Cheap checks first, with no chain read: a Receipt for an unknown
-            # run, other prices or an already proven run costs the agent nothing.
+            # Checked against the run's accepted terms, as its Terminal is, with
+            # no chain read. Its settled total and observation are the
+            # provider's report: the agent proves the settled total at close
+            # (SessionClosed) and reads it at every attachment.
             receipt = message.receipt
             ledger = self._require_ledger(receipt.session_id)
-            run = ledger._run(receipt.run_id)
-            if (receipt.model, receipt.rate_card_hash) != (
-                run.context.model,
-                run.context.rate_card_hash,
+            observation = observation_from_wire(receipt.chain_observation)
+            if (observation.chain_id, observation.contract_address) != (
+                ledger.domain.chain_id,
+                ledger.domain.verifying_contract,
             ):
-                raise ClientError("receipt differs from accepted run prices")
-            if receipt.run_id in self._receipts_seen:
-                return
-            if self._receipt_failures >= _RECEIPT_FAILURES:
-                raise ClientError("receipt proofs are suspended on this attachment")
-            if len(self._receipt_queue) >= _RECEIPT_QUEUE:
-                raise ClientError("receipt proof queue is full")
-            if self._receipt_task is None or self._receipt_task.done():
-                # The worker first runs after this step, so it sees the new entry.
-                self._receipt_task = self._spawn(self._receipt_worker())
-            self._receipts_seen.add(receipt.run_id)
-            self._receipt_queue.append((pb.Receipt.FromString(receipt.SerializeToString()), 0))
+                raise ClientError("receipt chain observation differs from session domain")
+            ledger.apply_final(receipt, self._observed_state().deposit)
+            if receipt.run_id in self._receipted:
+                return  # A copy, matching the final already applied.
+            self._receipted.add(receipt.run_id)
+            if receipt.run_id in self._outputs:
+                self._outputs[receipt.run_id].receipt = pb.Receipt.FromString(
+                    receipt.SerializeToString()
+                )
+            await self._persist()
+            self._observers.emit("on_receipt", receipt)
         else:
             ledger = self._require_ledger(message.drain.session_id)
             targets = (
@@ -1495,7 +1510,9 @@ class Client:
                     self._operations[self._opening_ref][1], await self._get(self._ledger.session_id)
                 )
             if self._ledger is not None and self._ledger.close_pending:
-                raise ClientError("session close is pending; new inference is ineligible")
+                if self._closed_error is not None:
+                    raise self._closed_error
+                await self._retire_closed(choice)
             if self._ledger is not None and self._snapshot_waiter is not None:
                 # An attachment nonce is single-use, including failed attempts.
                 self._control_lost(ClientError("opening a fresh Control attachment"))
@@ -1786,6 +1803,89 @@ class Client:
         self._saved.pop("ledger", None)
         self._saved.pop("funding_intent", None)
 
+    async def _closed_by_agent(self, ledger: Ledger) -> bool:
+        """Whether this agent's own close ended the session within its usage.
+
+        A cooperative close is proven from its SessionClosed event and state,
+        and _prove_close compared its capture with usage. A withdrawal or idle
+        release is proven from its receipt and event; its settled total is read
+        from fresh evidence at or after that block, where it is final: a closed
+        session can never move money again, since every payment path reverts
+        SessionIsClosed (MPPI.sol _existingSession). Current state, so no node
+        needs to keep history. Above usage, it fails closed as a cooperative
+        close does, and the session is kept.
+        """
+        if self._closed_result is not None:
+            return True
+        for kind in (OperationKind.WITHDRAW, OperationKind.RELEASE_IDLE):
+            entry = self._operations.get(kind.value + "-" + ledger.session_id.hex())
+            if entry is None or entry[1].state is not OperationState.CONFIRMED:
+                continue
+            outcome = entry[1]
+            if outcome.observation is None:
+                raise ClientError("confirmed exit has no canonical block")
+            exited = outcome.observation.block_number
+            current = await self._fresh()
+            if current.block.observation.block_number < exited:
+                with _timed("chain"):
+                    current = await asyncio.wait_for(self.chain.refresh(), self.timeout)
+            state = current.sessions.get(ledger.session_id)
+            if (
+                current.block.observation.block_number < exited
+                or state is None
+                or state.status is not SessionStatus.CLOSED
+            ):
+                raise ClientError("chain evidence does not yet show the exited session closed")
+            if state.settled_cumulative > ledger.usage_amount:
+                self._closed_error = CloseAccountingError(
+                    outcome, state.settled_cumulative, ledger.usage_amount
+                )
+                raise self._closed_error
+            return True
+        return False
+
+    async def _retire_closed(self, choice: int | None) -> None:
+        """Keep a session this agent closed itself beside the checkpoint, then forget it.
+
+        The last record is linked as <name>.<session id>.closed<suffix> before
+        the checkpoint drops it, so the history stays readable and the next
+        opening funds a new session with the same signer. A retry after a crash
+        keeps the first link. Only a new Control stream carries the new session.
+        """
+        ledger = self._require_ledger()
+        async with AsyncExitStack() as held:
+            await held.enter_async_context(self._funding_lock)
+            # A reconcile in flight must neither change the close it proves nor
+            # write its result into the next journal.
+            for lock in list(self._operation_locks.values()):
+                await held.enter_async_context(lock)
+            if not await self._closed_by_agent(ledger):
+                raise ClientError("session close is pending; new inference is ineligible")
+            if any(o.task is not None and not o.task.done() for o in self._outputs.values()):
+                raise ClientError("the closed session's requests are still ending")
+            # The closed session stays visible until a new one can be funded.
+            self._require_agent_id()
+            if choice is None and self.initial_session_tokens is None:
+                raise ClientError("initial_session_tokens is required before funding")
+            await self._persist()
+            path = self._checkpoint.path
+            archive = path.with_name(f"{path.stem}.{ledger.session_id.hex()}.closed{path.suffix}")
+            try:
+                await asyncio.to_thread(os.link, path, archive)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise ClientError("the closed session's record could not be kept") from None
+            self._end_control(ClientError("the session is closed"))
+            self._ledger = self._opening_ref = None
+            self._close_waiter = self._closed_result = self._top_up_hint = None
+            for retained in (self._operations, self._outputs, self._unsent, self._receipted):
+                retained.clear()
+            for key in ("ledger", "funding_intent", "confirmed_close", "reported_close"):
+                self._saved.pop(key, None)
+            await self._connect()
+            await self._persist()
+
     async def _opening_void(self) -> bool:
         """Whether the retained opening can never fund its session.
 
@@ -1885,6 +1985,8 @@ class Client:
         if ref not in self._operations:
             raise ClientError("unknown retained operation reference")
         async with self._operation_locks.setdefault(ref, asyncio.Lock()):
+            if ref not in self._operations:
+                raise ClientError("unknown retained operation reference")
             operation, previous = self._operations[ref]
             try:
                 if previous.tx_hash is not None:
@@ -1926,6 +2028,19 @@ class Client:
                     cause="authorization expired before any opening",
                 )
             if (
+                operation.kind is OperationKind.TOP_UP
+                and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
+                and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
+                and await self._top_up_void(ref)
+            ):
+                result = OperationResult(
+                    ref,
+                    OperationState.FAILED,
+                    result.wallet_operation_id,
+                    result.tx_hash,
+                    cause="authorization expired before any top-up",
+                )
+            if (
                 result.operation_ref != ref
                 or (
                     previous.tx_hash is not None
@@ -1953,6 +2068,10 @@ class Client:
                 result.sessions,
                 result.cause,
             )
+            retained = self._operations.get(ref)
+            if retained is None or retained[0] is not operation:
+                # Its session was retired while it read (_retire_closed).
+                raise ClientError("unknown retained operation reference")
             self._operations[ref] = (operation, result)
             await self._persist()
             if operation.kind is OperationKind.TOP_UP and result.state is OperationState.CONFIRMED:
@@ -2116,6 +2235,9 @@ class Client:
         await self._local_start()
         self._require_ledger(identifier)
         async with self._open_lock:
+            # A retirement may have run while this waited: never replace the
+            # next session's attachment for a session no longer retained.
+            self._require_ledger(identifier)
             # A caller-chosen recovery replaces a live owner as well as a lost
             # one. It never chooses a model, raises funding or replays Complete.
             if self._control is not None:
@@ -2185,9 +2307,12 @@ class Client:
             if not eligible():
                 return
             self._require_ready()
-            amount = max(target, ledger.voucher.cumulative if ledger.voucher is not None else 0)
-            if amount > self._observed_state().deposit:
+            current = ledger.voucher.cumulative if ledger.voucher is not None else 0
+            deposit = self._observed_state().deposit
+            if max(target, current) > deposit:
                 return
+            # The requirement plus the caller's headroom, within the deposit.
+            amount = max(min(target + self._voucher_headroom, deposit), current)
             if ledger.voucher is None or ledger.voucher.cumulative < amount:
                 signature = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -2220,7 +2345,10 @@ class Client:
                 return
             target = required_coverage((max(ledger.usage_numerator, ledger.coverage_numerator),))
             signed = ledger.voucher.cumulative if ledger.voucher is not None else None
-            if target > self._observed_state().deposit or (signed is not None and target <= signed):
+            deposit = self._observed_state().deposit
+            if target > deposit or (
+                signed is not None and min(target + self._voucher_headroom, deposit) <= signed
+            ):
                 return
             await self._voucher(target, generation=ledger.generation)
             if (ledger.voucher.cumulative if ledger.voucher is not None else None) == signed:
@@ -2403,7 +2531,7 @@ class Client:
                 output.call.cancel()
             await self._persist()
 
-    async def _verify_reference(self, message: pb.Terminal | pb.Receipt) -> None:
+    async def _verify_reference(self, message: pb.Terminal) -> None:
         if message.HasField("settlement_reference"):
             reference = message.settlement_reference
             observed = ConfirmedSettlementRef(
@@ -2419,89 +2547,6 @@ class Client:
                 self.timeout,
             )
 
-    async def _receipt_worker(self) -> None:
-        while self._receipt_queue:
-            await self._receipt(*self._receipt_queue.popleft())
-
-    async def _receipt(self, receipt: pb.Receipt, attempt: int = 0) -> None:
-        # A Receipt that cannot be validated or proven now is set aside alone;
-        # the run's Terminal on Complete, or a later snapshot, still accounts it.
-        try:
-            await self._verify_receipt(receipt)
-        except (TransportError, ChainLagError) as error:
-            # A transient or lagging chain read failed, not the Receipt: try
-            # once more after the queue, then let a later copy of it be proven.
-            if (
-                attempt == 0
-                and (isinstance(error, ChainLagError) or error.transient)
-                and len(self._receipt_queue) < _RECEIPT_QUEUE
-            ):
-                self._receipt_queue.append((receipt, 1))
-                return
-            self._receipts_seen.discard(receipt.run_id)
-            self._receipt_failures += 1
-            self._reject("receipt", error)
-        except (*_REPORT_FAILURES, TimeoutError) as error:
-            self._receipt_failures += 1
-            self._reject("receipt", error)
-
-    async def _verify_receipt(self, receipt: pb.Receipt) -> None:
-        ledger = self._require_ledger(receipt.session_id)
-        observation = observation_from_wire(receipt.chain_observation)
-        if (
-            observation.chain_id != ledger.domain.chain_id
-            or observation.contract_address != ledger.domain.verifying_contract
-        ):
-            raise ClientError("receipt chain observation differs from session domain")
-        # The provider stamps every Receipt with its follower's current block,
-        # so most Receipts repeat an observation already proven here. The
-        # cached total is one this agent read itself at that exact canonical
-        # block of this session; a provider cannot add an entry.
-        key = (ledger.session_id, observation.block_number, observation.block_hash)
-        settled = self._proven.get(key)
-        if settled is None:
-            block = await asyncio.wait_for(
-                asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
-            )
-            state = await asyncio.wait_for(
-                asyncio.to_thread(self.chain.reader.session, ledger.session_id, block),
-                self.timeout,
-            )
-            if block.observation != observation:
-                raise ClientError("receipt settlement total contradicts chain or accepted usage")
-            canonical = await asyncio.wait_for(
-                asyncio.to_thread(self.chain.reader.block, observation.block_number), self.timeout
-            )
-            if canonical != block:
-                raise ClientError("receipt observation became noncanonical")
-            settled = state.settled_cumulative
-            self._proven[key] = settled
-            if len(self._proven) > _PROVEN_OBSERVATIONS:
-                self._proven.popitem(last=False)
-        else:
-            self._proven.move_to_end(key)
-        if settled != receipt.settled_cumulative:
-            raise ClientError("receipt settlement total contradicts chain or accepted usage")
-        await self._verify_reference(receipt)
-        run = ledger._run(receipt.run_id)
-        rates = ledger.catalogs[run.context.rate_card_hash].rates_for(run.context.model)
-        reported = TokenCounts(receipt.input_tokens, receipt.cache_tokens, receipt.output_tokens)
-        prospective = (
-            ledger.usage_numerator
-            - priced_numerator(run.counts, rates)
-            + priced_numerator(reported, rates)
-        ) // 1_000_000
-        if receipt.settled_cumulative > prospective:
-            raise ClientError("receipt settlement total exceeds accepted usage")
-        ledger.apply_final(receipt, self._observed_state().deposit)
-        self._receipted.add(receipt.run_id)
-        if receipt.run_id in self._outputs:
-            self._outputs[receipt.run_id].receipt = pb.Receipt.FromString(
-                receipt.SerializeToString()
-            )
-        await self._persist()
-        self._observers.emit("on_receipt", receipt)
-
     async def _next(self, output: _Output) -> bytes | None:
         return await output.queue.get_or_end()
 
@@ -2510,8 +2555,10 @@ class Client:
         return type(value).FromString(value.SerializeToString()) if value is not None else None
 
     async def _cancel_run(self, identifier: bytes, output: _Output) -> None:
-        run = self._require_ledger().runs.get(identifier)
-        if run is not None:  # A settled, pruned run has nothing left to cancel.
+        # A settled, pruned run, or one whose session was retired, has nothing
+        # left to cancel in the ledger.
+        run = self._ledger.runs.get(identifier) if self._ledger is not None else None
+        if run is not None:
             run.failed_transport = True
         if output.call is not None:
             output.call.cancel()
@@ -2624,7 +2671,8 @@ class Client:
             ):
                 raise ClientError("reconcile pending funding before a new top-up")
             top_up_total(self._chain_state().deposit, amount)
-            auth = self._retained_top_up(ledger, amount) or self._funding_authorization(amount)
+            retained = await self._retained_top_up(ledger, amount)
+            auth = retained or self._funding_authorization(amount)
             ref = "top-up-" + secrets.token_hex(32)
             self._saved["funding_intent"] = {
                 "ref": ref,
@@ -2632,6 +2680,8 @@ class Client:
                 "nonce": auth.nonce.hex(),
                 "valid_after": auth.valid_after,
                 "valid_before": auth.valid_before,
+                # Confirmed before anything is sent: see _top_up_confirmed.
+                "deposit_before": self._chain_state().deposit,
             }
             await self._persist()
             # The opening proved this wallet's binding and signature; USDC still
@@ -2650,51 +2700,133 @@ class Client:
                 await self._top_up_confirmed(result)
             return result
 
-    def _retained_top_up(self, ledger: Ledger, amount: int) -> FundingAuthorization | None:
+    async def _retained_top_up(self, ledger: Ledger, amount: int) -> FundingAuthorization | None:
         """The authorization of an earlier top-up that never took effect, while
         it is still valid: a retry sends that same authorization, so even an
         earlier attempt that somehow landed cannot fund twice (its nonce is
         spent). An expired one is retired; a fresh top-up gets a new nonce.
+
+        Before a submitted authorization is sent again, USDC's authorizationState
+        for it is read at the follower's canonical block, refreshed first when
+        that is behind the block where its last attempt failed: a status-0
+        bundle can be front-run while the same authorization funds the session.
+        A used one took effect after all, and the deposit at that block holds
+        it: this call sends nothing, and until the authorization expires every
+        top-up is refused the same way, so a caller retrying an error never
+        funds twice.
         """
         intent = self._saved.get("funding_intent")
         if not isinstance(intent, dict) or not str(intent.get("ref", "")).startswith("top-up-"):
             return None
         previous = self._operations.get(intent["ref"])
-        if (previous is not None and previous[1].state is OperationState.CONFIRMED) or (
-            self.chain.snapshot().block.timestamp >= intent["valid_before"]
+        # A confirmation that proved this top-up spent its intent
+        # (_top_up_confirmed). One still named here was contradicted, so its own
+        # authorization can still land, or a crash came first: either way it is
+        # read and resent like one that never confirmed, and a restart, which
+        # keeps no event, cannot tell them apart.
+        failed = previous[1].observation if previous is not None else None
+        if (
+            failed is not None
+            and failed.block_number > self.chain.snapshot().block.observation.block_number
         ):
+            await self._timed_await(asyncio.wait_for(self.chain.refresh(), self.timeout))
+        block = self.chain.snapshot().block
+        if block.timestamp >= intent["valid_before"]:
             return None
-        if intent["amount"] != amount:
-            raise ClientError(
-                f"an earlier top-up of {intent['amount']} is still valid; retry that amount"
-            )
-        return FundingAuthorization(
+        auth = FundingAuthorization(
             ledger.domain.chain_id,
             ledger.descriptor.token,
             self.contract.token_domain_name,
             self.contract.token_domain_version,
             ledger.descriptor.agent,
             ledger.domain.verifying_contract,
-            amount,
+            intent["amount"],
             intent["valid_after"],
             intent["valid_before"],
             bytes.fromhex(intent["nonce"]),
         )
+        if previous is not None and await self._authorization_used(auth.nonce, block):
+            raise ClientError(
+                f"an earlier top-up of {auth.value} took effect: USDC holds its "
+                "authorization as used; a new top-up waits until it expires"
+            )
+        if auth.value != amount:
+            raise ClientError(
+                f"an earlier top-up of {auth.value} is still valid; retry that amount"
+            )
+        return auth
+
+    async def _authorization_used(self, nonce: bytes, block: Block) -> bool:
+        """Whether USDC holds this session's funding authorization ``nonce`` as
+        used (or cancelled by the wallet) at ``block``: one authorizationState
+        call pinned to the block's hash. A committed Arc block is final, so it
+        is not read again; without instant finality the block is read again
+        by number, as setup's USDC domain check does."""
+        ledger = self._require_ledger()
+        data = (
+            _AUTHORIZATION_STATE
+            + bytes(12)
+            + ledger.descriptor.agent
+            + fixed_bytes(nonce, 32, field="authorization nonce")
+        )
+        reader = self.chain.reader
+
+        def read() -> bool:
+            raw = reader._call(ledger.descriptor.token, data, block)
+            if not reader.profile.instant_finality:
+                reader._check_canonical(block)
+            return bool(_decode_exact(["bool"], raw)[0])
+
+        return await asyncio.wait_for(asyncio.to_thread(self._timed_read, read), self.timeout)
+
+    async def _top_up_void(self, ref: str) -> bool:
+        """Whether the uncertain top-up ``ref`` can never take effect.
+
+        At a canonical block whose timestamp has reached its authorization's
+        valid_before, USDC holds that authorization unused. topUp credits the
+        deposit only in the call that uses it, USDC never clears a used one,
+        and it refuses one once block.timestamp >= validBefore, so the top-up
+        never took effect and never can.
+        """
+        intent = self._saved.get("funding_intent")
+        if not isinstance(intent, dict) or intent.get("ref") != ref:
+            return False
+        try:
+            block = self.chain.snapshot().block
+            if block.timestamp < intent["valid_before"]:
+                return False
+            return not await self._authorization_used(bytes.fromhex(intent["nonce"]), block)
+        except (ChainEvidenceError, TransportError, TimeoutError, ValidationError):
+            return False  # Not proven: it stays uncertain.
 
     async def _top_up_confirmed(self, result: OperationResult) -> None:
         ledger = self._require_ledger()
-        proven = [o.deposit for o in result.sessions if o.session_id == ledger.session_id]
-        if proven and proven[0] is not None:
+        intent = self._saved.get("funding_intent")
+        if not (isinstance(intent, dict) and intent.get("ref") == result.operation_ref):
+            intent = None  # Not this top-up's intent.
+        proven = [o for o in result.sessions if o.session_id == ledger.session_id]
+        if proven and proven[0].deposit is not None:
             # The ToppedUp event names the new deposit: no refresh is needed.
+            # topUp sets it to the deposit before it plus the amount, and
+            # deposits only grow (MPPI.sol open, topUp). This attempt was sent
+            # after its intent recorded the confirmed deposit, so its own event
+            # shows at least that plus the amount. Less, and the event is not
+            # its own or the evidence is inconsistent: nothing is recorded from
+            # it, and the intent stays, so a retry reads and resends its own
+            # authorization (_retained_top_up).
+            if (
+                intent is not None
+                and proven[0].deposit < intent.get("deposit_before", 0) + intent["amount"]
+            ):
+                raise ClientError("top-up event contradicts the confirmed deposit")
             prior = self._observed_state()
             self.chain.confirm(
-                ledger.session_id, replace(prior, deposit=max(prior.deposit, proven[0]))
+                ledger.session_id, replace(prior, deposit=max(prior.deposit, proven[0].deposit))
             )
         else:
             await self.chain.refresh()
-        intent = self._saved.get("funding_intent")
-        if isinstance(intent, dict) and intent.get("ref") == result.operation_ref:
-            del self._saved["funding_intent"]  # Spent: the next top-up gets a new nonce.
+        if intent is not None:
+            self._saved.pop("funding_intent", None)  # Spent: the next top-up gets a new nonce.
             await self._persist()
         self._top_up_hint = result.tx_hash
         if self._control is not None and self._control_failure is None:

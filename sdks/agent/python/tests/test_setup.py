@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from contextlib import contextmanager
 from dataclasses import replace
 from importlib.resources import files
@@ -17,7 +18,8 @@ from mppi_agent import client as client_module
 from mppi_agent.checkpoint import Checkpoint
 from mppi_agent.credentials import CredentialError, load_session_signer
 from mppi_agent.onboarding import OnboardingError
-from mppi_protocol.chain import Block, ChainEvidenceError
+from mppi_protocol.chain import Block, ChainEvidenceError, ChainReader
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.contract import ARC_USDC
 from mppi_protocol.deployment import profile_from_mapping, profile_to_mapping
 from mppi_protocol.errors import ValidationError
@@ -315,6 +317,7 @@ def test_builtin_follower_allows_read_latency_but_same_head_still_expires(
     with Client.from_config(PROVIDER, config_path=boundary.config) as client:
         # Requests read no chain, so the background poll runs once per freshness limit.
         assert (client.chain.max_age_ms, client.chain.poll_interval_ms) == (60_000, 60_000)
+        assert client._voucher_headroom == 0  # Opt-in.
         assert client.chain.collection_margin_ms == 30_000
 
         async def scenario():
@@ -432,6 +435,10 @@ def test_completed_rerun_keeps_signer_and_zero_adopted_identity(boundary, monkey
     assert boundary.path(".signer").read_bytes() == before
     with Client.from_config(PROVIDER, config_path=boundary.config) as client:
         assert client.agent_id == 0 and client.initial_session_tokens is None
+    with Client.from_config(
+        PROVIDER, config_path=boundary.config, voucher_headroom=10_000
+    ) as client:
+        assert client._voucher_headroom == 10_000
     assert not boundary.submissions
 
 
@@ -554,13 +561,18 @@ def test_wrong_usdc_domain_or_precision_stops_before_registration(boundary, chan
     assert not boundary.config.exists() and not boundary.path(".signer").exists()
 
 
-def test_empty_wallet_cannot_complete_public_setup(boundary):
+@pytest.mark.parametrize("testnet", [True, False])
+def test_empty_wallet_cannot_complete_public_setup(boundary, monkeypatch, testnet):
+    options = {} if testnet else mainnet_selection(monkeypatch)
+    network = "testnet" if testnet else "mainnet"
     boundary.balance = 0
-    with pytest.raises(OnboardingError, match="fund"):
-        boundary.onboard()
+    with pytest.raises(
+        OnboardingError, match=f"fund the selected wallet with USDC on Arc {network}"
+    ):
+        boundary.onboard(**options)
     assert not boundary.submissions
     with pytest.raises(OnboardingError, match="complete"):
-        Client.from_config(PROVIDER, config_path=boundary.config)
+        Client.from_config(PROVIDER, config_path=boundary.config, **options)
 
 
 def test_same_setup_excludes_concurrent_clients_and_releases_lock(boundary):
@@ -770,3 +782,146 @@ def test_builtin_client_takes_the_callers_chain_timing(boundary):
     for options in ({"max_age_ms": 0}, {"poll_interval_ms": 61_000}, {"max_age_ms": True}):
         with pytest.raises((OnboardingError, ValidationError)):
             Client.from_config(PROVIDER, config_path=boundary.config, **options)
+
+
+def shared_adapter(monkeypatch):
+    # The real adapter runs the CLI; the fixture's reader supplies only its profile.
+    monkeypatch.setattr(
+        setup,
+        "CircleAgentWallet",
+        lambda *, chain, **options: CircleAgentWallet(
+            chain=ChainReader(object(), chain.profile), **options
+        ),
+    )
+
+
+def circle_cli(directory, *, chain="ARC-TESTNET", version="1.1.4", listing="listed"):
+    """A stand-in for Circle CLI 1.1.4 answering the adapter's wallet verification.
+
+    A refused listing exits 1 with its error on stderr and as JSON on stdout, as
+    the CLI does (dist/index.js:732-750, 100111-100119). It logs its arguments.
+    """
+    wallets = {"listed": WALLET, "other": "0x" + "33" * 20}
+    if listing == "refused":
+        reply = (
+            'echo \'{"error":{"code":"AUTH_REQUIRED","message":"private CLI output"}}\'\n'
+            "echo 'Error: private CLI output' >&2\nexit 1"
+        )
+    else:
+        row = {"type": "agent", "address": wallets[listing], "blockchain": chain}
+        reply = "echo '" + json.dumps({"data": {"wallets": [row]}}) + "'"
+    path = directory / "circle"
+    path.write_text(
+        '#!/bin/sh\necho "$*" >> "$0.log"\n'
+        f'if [ "$1" = --version ]; then echo {version}; exit 0; fi\n{reply}\n'
+    )
+    path.chmod(0o700)
+    return path
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_missing_circle_cli_is_named_before_any_setup(
+    boundary, monkeypatch, tmp_path_factory, override
+):
+    shared_adapter(monkeypatch)
+    empty = tmp_path_factory.mktemp("path")
+    monkeypatch.setenv("PATH", str(empty))
+    if override:
+        monkeypatch.setenv("MPPI_CIRCLE_CLI", str(empty / "circle"))
+        expected = "MPPI_CIRCLE_CLI does not name an executable file"
+    else:
+        monkeypatch.delenv("MPPI_CIRCLE_CLI", raising=False)
+        expected = (
+            "Circle CLI `circle` was not found on PATH; install it with "
+            "`npm install -g @circle-fin/cli@1.1.4` or set MPPI_CIRCLE_CLI to its path"
+        )
+    with pytest.raises(OnboardingError, match=re.escape(expected)):
+        boundary.onboard()
+    assert not boundary.config.exists() and not boundary.path(".signer").exists()
+    assert not boundary.submissions
+
+
+def test_circle_cli_found_but_not_started_is_not_reported_missing(
+    boundary, monkeypatch, tmp_path_factory
+):
+    shared_adapter(monkeypatch)
+    directory = tmp_path_factory.mktemp("bin")
+    circle_cli(directory).write_text("#!/nonexistent/interpreter\n")
+    monkeypatch.setenv("PATH", str(directory))
+    monkeypatch.delenv("MPPI_CIRCLE_CLI", raising=False)
+    with pytest.raises(CircleAgentWalletError, match="^Circle command is unavailable$"):
+        boundary.onboard()
+    assert not boundary.config.exists() and not boundary.path(".signer").exists()
+
+
+def test_cli_names_a_circle_cli_missing_from_path(boundary, monkeypatch, tmp_path_factory, capsys):
+    mainnet_selection(monkeypatch)
+    shared_adapter(monkeypatch)
+    monkeypatch.setenv("PATH", str(tmp_path_factory.mktemp("path")))
+    monkeypatch.delenv("MPPI_CIRCLE_CLI", raising=False)
+    args = ["onboard", "--mainnet", "--wallet", WALLET, "--config", str(boundary.config)]
+    assert cli.main(args) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.startswith("Circle CLI `circle` was not found on PATH;")
+
+
+@pytest.mark.parametrize("testnet", [True, False])
+@pytest.mark.parametrize("failure", ["refused", "other", "version"])
+def test_circle_cli_failures_name_their_cause_on_the_selected_network(
+    boundary, monkeypatch, tmp_path_factory, testnet, failure
+):
+    options = {} if testnet else mainnet_selection(monkeypatch)
+    network, chain, login = (
+        ("testnet", "ARC-TESTNET", "`circle wallet login EMAIL --testnet`")
+        if testnet
+        else ("mainnet", "ARC", "`circle wallet login EMAIL`")
+    )
+    shared_adapter(monkeypatch)
+    directory = tmp_path_factory.mktemp("bin")
+    monkeypatch.setenv("PATH", str(directory))
+    monkeypatch.delenv("MPPI_CIRCLE_CLI", raising=False)
+    if failure == "version":
+        circle_cli(directory, chain=chain, version="1.2.2")
+    else:
+        circle_cli(directory, chain=chain, listing=failure)
+    expected = {
+        "refused": (
+            f"Circle CLI could not verify the wallet on Arc {network}; "
+            f"`circle wallet list --type agent --chain {chain}` shows why; "
+            f"a missing, expired or {'mainnet' if testnet else 'testnet'}-only login "
+            f"needs {login}"
+        ),
+        "other": (
+            f"the Circle login for Arc {network} does not list this address as an agent "
+            f"wallet on {chain}; use an address from "
+            f"`circle wallet list --type agent --chain {chain}`"
+        ),
+        "version": "Circle CLI 1.1.4 is required; install it with "
+        "`npm install -g @circle-fin/cli@1.1.4`",
+    }[failure]
+    with pytest.raises(OnboardingError) as error:
+        boundary.onboard(**options)
+    assert str(error.value) == expected
+    assert not boundary.config.exists() and not boundary.path(".signer").exists()
+    assert not boundary.submissions
+
+
+def test_circle_cli_override_serves_setup_client_and_a_rerun_named_failure(
+    boundary, monkeypatch, tmp_path_factory
+):
+    shared_adapter(monkeypatch)
+    monkeypatch.setenv("PATH", str(tmp_path_factory.mktemp("path")))
+    directory = tmp_path_factory.mktemp("local")
+    monkeypatch.setenv("MPPI_CIRCLE_CLI", str(circle_cli(directory)))
+    assert boundary.onboard(agent_id=77).onboarding.complete
+    with Client.from_config(PROVIDER, config_path=boundary.config) as client:
+        assert client.wallet.address == ADDRESS
+    verification = ["--version", "wallet list --type agent --chain ARC-TESTNET --output json"]
+    assert (directory / "circle.log").read_text().splitlines() == verification * 3
+    retained = boundary.config.read_bytes(), boundary.path(".signer").read_bytes()
+    circle_cli(directory, listing="refused")  # The login has since expired.
+    with pytest.raises(OnboardingError, match="needs `circle wallet login EMAIL --testnet`$"):
+        boundary.onboard(agent_id=77)
+    assert (boundary.config.read_bytes(), boundary.path(".signer").read_bytes()) == retained
+    assert not boundary.submissions

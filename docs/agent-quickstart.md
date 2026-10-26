@@ -5,14 +5,14 @@ then handles discovery, payment messages and inference against the provider's
 MPPI endpoint. This guide uses Circle Agent Wallet on official Arc testnet,
 with Python 3.12+ on macOS or Linux.
 
-The built-in setup requires `mppi-agent` version `0.1.4.1`. Existing applications
+The built-in setup requires `mppi-agent` version `0.1.5`. Existing applications
 can continue using the [explicit composition interface](python-quickstart.md).
 
 ## 1. Install
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-agent==0.1.4.1'
+uv pip install 'mppi-agent==0.1.5'
 ```
 
 The shared protocol dependency installs automatically. Run the remaining
@@ -34,6 +34,11 @@ Complete Circle authentication yourself; its CLI retains its credentials. MPPI
 does not require your funding wallet's private key. If Circle authentication
 expires, log in again to restore access to the same wallet.
 
+The SDK runs `circle` from your `PATH` for onboarding and the client. To use
+another installation, such as a project-local npm install, set `MPPI_CIRCLE_CLI`
+to its executable path, for example
+`export MPPI_CIRCLE_CLI="$PWD/node_modules/.bin/circle"`.
+
 ## 3. Onboard
 
 Add `.mppi/` to your application's `.gitignore` before onboarding. If you choose
@@ -50,8 +55,14 @@ deployed code is verified before completion. Onboarding deposits no inference fu
 
 JSON `complete: true` and exit code `0` mean setup is ready. Exit code `2` means
 the original operation is pending: rerun the same command to reconcile it.
-Exit code `1` reports a failure. Completed reruns retain the same identity and
-signer. `--agent-id ID` adopts an existing identity after verifying its wallet.
+Exit code `1` reports a failure. Its message names the cause where the SDK can
+establish it: the Circle CLI is missing or not version `1.1.4`; Circle could not
+verify the wallet on the selected network, so the message gives the
+`circle wallet list` command that shows Circle's reason and the login that
+network needs; that login does not list the address; or the wallet holds no
+USDC on that network. Circle's own output is never printed. Completed reruns
+retain the same identity and signer. `--agent-id ID` adopts an existing
+identity after verifying its wallet.
 
 Keep the whole private `.mppi` directory across restarts and back it up securely.
 `.mppi/agent.json` is non-secret configuration. Its separate mode-0600 `.signer`
@@ -111,6 +122,10 @@ and provider across restarts. A conflicting provider or signer is rejected.
 Client shutdown releases connections; the session remains funded for reuse.
 Inspect `client.sessions.list()` and call `client.sessions.close(session_id)`
 when finished to settle and refund unused funds. Inspect the returned operation.
+Once this agent's own close is confirmed, the next request or `sessions.open`
+funds a new session with the same signer. The closed session's last record
+stays beside the checkpoint as
+`.mppi/agent.json.payments.<session id>.closed.json`.
 For pending or unknown wallet operations, use `sessions.reconcile(operation_ref)`.
 For cooperative close, repeat `sessions.close(session_id)` to inspect the same
 close operation. Never repeat inference to resolve an uncertain payment.

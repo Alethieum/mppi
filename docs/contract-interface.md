@@ -6,7 +6,7 @@
 [MPPI.sol](../contracts/src/MPPI.sol) implements payment execution and namespaced
 upgradeable storage; its [full ABI](../contracts/abi/MPPI.json) includes inherited
 OpenZeppelin entries. The official Arc mainnet and testnet deployments are
-[published](deployment.md), with explicit network selection in SDK `0.1.2`.
+[published](deployment.md), with explicit network selection since SDK `0.1.2`.
 Deployment records and security-review evidence describe separate acceptance scopes.
 No address in the signing fixtures is a deployment announcement.
 

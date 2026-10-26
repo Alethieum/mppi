@@ -2,8 +2,8 @@
 
 ## Arc mainnet
 
-The MPPI contracts are deployed on Arc mainnet, chain ID **5042**. SDK `0.1.2`
-packages this deployment profile for explicit mainnet selection.
+The MPPI contracts are deployed on Arc mainnet, chain ID **5042**. Since `0.1.2`,
+the SDKs package this deployment profile for explicit mainnet selection.
 
 | Contract | Deployed address |
 | --- | --- |
@@ -57,14 +57,16 @@ Providers and agents connect to the MPPI proxy. The protocol team's
 [DeployMPPI.s.sol](../contracts/script/DeployMPPI.s.sol) preparation procedure is
 documented below; providers and agents do not deploy these contracts.
 
-A future public testnet provider builds and hosts its own service using the
-provider SDK and this deployment profile. Agents obtain the service URL or
-ERC-8004 ID from that provider and use the agent SDK with the official profile.
-Provider endpoint availability is independent of the MPPI SDK release.
+Each provider builds and hosts its own service using the provider SDK and the
+deployment profile for its network. Agents obtain the service URL or ERC-8004
+ID from that provider, or from the providers page at
+[mppi.alethieum.com/discovery](https://mppi.alethieum.com/discovery), and use
+the agent SDK with the official profile. Provider endpoint availability is
+independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Agent `0.1.4.1` and provider `0.1.2` built-in setup package the verified official
+Agent `0.1.5` and provider `0.1.2` built-in setup package the verified official
 profiles for both Arc networks. `--testnet` and `--mainnet` select the respective
 profile without a separate download. Version `0.1.1` packages testnet only. The
 provider composition helpers use those same pins; they still verify chain ID,
@@ -144,7 +146,7 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 ## SDK installation inputs
 
 The provider quickstart uses `mppi-provider==0.1.2` from PyPI and native
-`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.4.1`.
+`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.5`.
 The agent depends on `mppi-protocol==0.1.3` and the provider on
 `mppi-protocol==0.1.1`. Use the release record to
 identify the reviewed source revision and exact artifact digests. For development, the

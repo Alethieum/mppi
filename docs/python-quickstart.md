@@ -12,7 +12,7 @@ Install the role your application uses:
 uv pip install 'mppi-provider==0.1.2'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.4.1'
+uv pip install 'mppi-agent==0.1.5'
 ```
 
 Each role installs its required protocol dependency: the agent
@@ -223,8 +223,9 @@ and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 | --- | --- |
 | `CONFIRMED` operation | Matching canonical chain evidence is available; retain its original reference. |
 | `PENDING` / `UNKNOWN` | Reconcile the original wallet operation with `sessions.reconcile(operation_ref)`; for cooperative close, repeat `sessions.close(session_id)` to inspect that same close. Do not replace funding or replay inference. |
-| `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. A `cause` beginning `NotSubmittedError` means the wallet adapter's own record proves nothing reached its service, so it is safe to try again: for an opening, calling `sessions.open` again sends the same intent under a new reference while its authorization is valid. An opening whose authorization expired is forgotten, and the next `sessions.open` starts a fresh one. |
+| `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. A `cause` beginning `NotSubmittedError` means the wallet adapter's own record proves nothing reached its service, so it is safe to try again: for an opening, calling `sessions.open` again sends the same intent under a new reference while its authorization is valid. An opening whose authorization expired is forgotten, and the next `sessions.open` starts a fresh one. A failed top-up retried while its authorization is valid sends that same authorization, unless USDC already holds it as used: then the earlier top-up took effect, nothing is sent, and `ClientError` says so for every top-up until that authorization expires, so retrying the error never funds twice. |
 | Uncertain opening, authorization expired | `sessions.reconcile(operation_ref)` returns `FAILED` with cause `authorization expired before any opening` once a canonical block at or after its `valid_before` shows no deposit: the opening never happened and never can. |
+| Uncertain top-up, authorization expired | An uncertain top-up refuses later top-ups until it is reconciled. `sessions.reconcile(operation_ref)` returns `FAILED` with cause `authorization expired before any top-up` once a canonical block at or after its `valid_before` shows USDC holding its authorization unused: the top-up never happened and never can. |
 | Missing final inference accounting | Retain the original run and reservation; do not invent token usage or replay inference. |
 | Provider unavailable | Agent `requestClose`, then eligible `withdraw`, provide the contract exit path. `releaseIdle` has its own eligibility. |
 

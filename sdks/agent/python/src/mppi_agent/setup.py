@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from mppi_protocol.amounts import uint64
 from mppi_protocol.chain import ChainReader, DeploymentProfile, HttpJsonRpc
-from mppi_protocol.circle import CircleAgentWallet
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
 from mppi_protocol.contract import (
     ARC_USDC,
     ContractCalls,
@@ -47,6 +48,8 @@ MAINNET_RPC_ENV = "ARC_RPC_URL_MAINNET"
 # Public endpoint documented at docs.arc.io/arc/references/connect-to-arc.
 DEFAULT_RPC = "https://rpc.blockdaemon.testnet.arc.io"
 _MAINNET_RPC = "https://rpc.blockdaemon.mainnet.arc.io"
+# Names the Circle CLI executable; unset or empty runs `circle` from PATH.
+CIRCLE_CLI_ENV = "MPPI_CIRCLE_CLI"
 # circle.py:CircleAgentWallet gives each CLI command 240 seconds. Reserve another
 # 60 seconds for wallet/code verification and reconciliation around that command;
 # this operation budget does not extend chain freshness or collection deadlines.
@@ -129,8 +132,55 @@ def _wallet(record: dict[str, Any], reader: ChainReader, config: Path) -> Circle
         chain=reader,
         address=parse_address(record["wallet"]),
         checkpoint_path=_path(config, ".wallet.json"),
+        command=(os.environ.get(CIRCLE_CLI_ENV) or "circle",),
         allow_registration_activation=True,
     )
+
+
+def _verify_circle(wallet: CircleAgentWallet, *, testnet: bool) -> None:
+    """Verify the wallet, naming each cause the pinned adapter's errors establish.
+
+    Those errors carry no CLI output. CLI 1.1.4 fails a listing with exit status
+    1 and gives its reason only in that output (dist/index.js:732-750,
+    100111-100119, 113249-113290). A listing fails without a current login for
+    the chain's own network (:20710-20716), so that failure names the command
+    showing Circle's reason and the login the network needs.
+    """
+    chain, flag = ("ARC-TESTNET", " --testnet") if testnet else ("ARC", "")
+    network, other = ("Arc testnet", "mainnet") if testnet else ("Arc mainnet", "testnet")
+    try:
+        wallet.verify_registration_wallet()
+    except CircleAgentWalletError as error:
+        cause = str(error)
+        executable = wallet._command[0]
+        if cause == "Circle command is unavailable" and shutil.which(executable) is None:
+            message = (
+                "Circle CLI `circle` was not found on PATH; install it with "
+                f"`npm install -g @circle-fin/cli@1.1.4` or set {CIRCLE_CLI_ENV} to its path"
+                if executable == "circle"
+                else f"{CIRCLE_CLI_ENV} does not name an executable file; set it to the "
+                "Circle CLI path or unset it to run `circle` from PATH"
+            )
+        elif cause == "Circle CLI version must match verified 1.1.4":
+            message = (
+                "Circle CLI 1.1.4 is required; install it with "
+                "`npm install -g @circle-fin/cli@1.1.4`"
+            )
+        elif cause == "Circle command did not return success":
+            message = (
+                f"Circle CLI could not verify the wallet on {network}; "
+                f"`circle wallet list --type agent --chain {chain}` shows why; a missing, "
+                f"expired or {other}-only login needs `circle wallet login EMAIL{flag}`"
+            )
+        elif cause == "Circle wallet selection does not match configured identity":
+            message = (
+                f"the Circle login for {network} does not list this address as an agent "
+                f"wallet on {chain}; use an address from "
+                f"`circle wallet list --type agent --chain {chain}`"
+            )
+        else:
+            raise
+        raise OnboardingError(message) from None
 
 
 def _verify_usdc(reader: ChainReader) -> None:
@@ -222,7 +272,7 @@ def onboard_circle(
             # Invalid selection or unavailable RPC leaves no credential to replace.
             initial_reader = _reader(saved)
             initial_wallet = _wallet(saved, initial_reader, config)
-            initial_wallet.verify_registration_wallet()
+            _verify_circle(initial_wallet, testnet=testnet)
             _verify_usdc(initial_reader)
             state.save(saved)
         record = _record(saved, selected)
@@ -268,7 +318,7 @@ def onboard_circle(
                 identity_state.close()
             record["initialized"] = True
             state.save(record)
-        wallet.verify_registration_wallet()
+        _verify_circle(wallet, testnet=testnet)
         _verify_usdc(reader)
         result = onboard(
             wallet=wallet,
@@ -295,6 +345,7 @@ def client_from_config(
     profile: DeploymentProfile | None = None,
     max_age_ms: int = 60_000,
     poll_interval_ms: int | None = None,
+    voucher_headroom: int = 0,
 ) -> Client:
     """Compose the installed client from completed onboarding without new wallet writes.
 
@@ -367,6 +418,7 @@ def client_from_config(
             signer_reference=str(_path(config, ".signer")),
             initial_session_tokens=initial_session_tokens,
             agent_id=identity.agent_id,
+            voucher_headroom=voucher_headroom,
             ca_file=ca_file,
             timeout_ms=_CIRCLE_OPERATION_TIMEOUT_MS,
         )

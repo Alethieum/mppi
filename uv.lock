@@ -959,7 +959,7 @@ wheels = [
 
 [[package]]
 name = "mppi-agent"
-version = "0.1.4.1"
+version = "0.1.5"
 source = { editable = "sdks/agent/python" }
 dependencies = [
     { name = "mppi-protocol" },

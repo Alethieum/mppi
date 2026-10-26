@@ -6,7 +6,6 @@ these cases check price authority, cursor cutover and economic idempotence.
 
 import asyncio
 import threading
-from collections import OrderedDict, deque
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -94,7 +93,7 @@ def component_client():
     client._control_failure = None
     client._attached_generation = 1
     client._outbound = ByteQueue()
-    client._voucher_lock = asyncio.Lock()
+    client._voucher_lock, client._voucher_headroom = asyncio.Lock(), 0
     client._background, client._pending_vouchers = set(), {}
     client._voucher_task = client._renew_task = None
     client._queue_options = {"max_messages": 4, "max_bytes": 16384, "wait_ms": 50}
@@ -108,11 +107,8 @@ def component_client():
     client._on_funding_notice = client._top_up_hint = None
     client._unsent = set()
     client._resync = None
-    client._receipt_queue, client._receipt_task = deque(), None
-    client._receipts_seen, client._receipt_failures = set(), 0
     client._receipted, client._closed_result = set(), None
     client._funding_lock = asyncio.Lock()
-    client._proven = OrderedDict()
     return client
 
 
@@ -1279,6 +1275,54 @@ def test_open_reconnects_after_funding_outlives_control_setup(monkeypatch):
             assert len(client._operations) == 1
             assert client._operations[original_ref][1].state is OperationState.CONFIRMED
             assert not client._outputs and not client._ledger.runs
+
+    asyncio.run(scenario())
+
+
+def test_a_lost_control_reattaches_on_the_next_request_never_in_the_background():
+    """After a provider restart nothing reattaches by itself. The next request
+    reconnects, proves its retained opening, attaches and runs on the new generation."""
+
+    async def scenario():
+        client = attachment_client()
+        ledger = client._ledger
+        ledger.ready, client._attached_generation = True, 1  # Attached before the loss.
+        client._open_lock, client._resync, client._snapshot_waiter = asyncio.Lock(), None, None
+        client._start = client._local_start = AsyncMock()
+        observation = client.chain.current.block.observation
+        opening = OperationResult(
+            "open-x", OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=observation
+        )
+        client._opening_ref, client._operations = "open-x", {"open-x": (None, opening)}
+        client._reconcile_ref = AsyncMock(return_value=opening)
+        client.chain.reader.opening = Mock(
+            return_value=SimpleNamespace(descriptor=DESCRIPTOR, initial_catalog=CATALOG)
+        )
+        client._renew, client._read_complete = AsyncMock(), AsyncMock()
+        client._channel, client.request_timeout = Mock(), None
+
+        async def connect():  # The provider's new stream opens with its nonce.
+            client._control_failure = None
+            client._nonce = client._loop.create_future()
+            client._nonce.set_result(NONCE)
+
+        client._connect = AsyncMock(side_effect=connect)
+        client._control_lost(ClientError("provider restarted"))
+        await asyncio.sleep(0.05)
+        client._connect.assert_not_awaited()
+        assert not client._background
+        with pytest.raises(ClientError, match="not ready"):
+            client._require_ready()
+
+        deliver_snapshot(client, snapshot(ledger))
+        payload = b'{"model":"test/model","messages":[],"stream":true}'
+        run_id, _ = await client._create(MODEL, True, payload)
+        client._connect.assert_awaited()
+        client.chain.reader.opening.assert_called_once()
+        sent = [call.args[0].WhichOneof("kind") for call in client._send.await_args_list]
+        assert sent == ["session_open", "reconnect_request"]
+        assert client._attached_generation == client._ledger.generation == 2
+        assert client._ledger.runs[run_id].context.control_generation == 2
 
     asyncio.run(scenario())
 

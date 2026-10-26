@@ -161,15 +161,33 @@ wallet/HTTP/chain calls run outside that loop. `create_raw` accepts validated JS
 bytes when the caller must retain exact numeric text. Nonstreaming create returns
 one original JSON response after a valid terminal and gRPC OK trailers.
 
+`Client(..., voucher_headroom=amount)`, also accepted by `Client.from_config`, is
+off by default (0). With a positive
+amount, each voucher the client signs is that many USDC base units above what
+the provider requires, within the confirmed deposit; a signed voucher already
+that large is reused. A provider admits a request at once when its accepted
+voucher already covers usage, every running request's reservation and that
+request's prefill and output buffer, and no earlier waiting run is still within
+its turn ([admission](protocol.md#admission-and-voucher-renewal), step 2), so a
+request that fits in the headroom left
+starts without the `LowCredit` and `Voucher` round trip. One that does not fit
+takes it, and the voucher it gets restores the headroom; a session's first
+request always does. Size the amount to the prompt and the provider's output
+buffer (`cover_output_tokens`, 1,000 tokens by default) of the requests it
+should admit, at their prices. The contract lets a provider capture up to the
+signed voucher and the deposit whatever it delivered, while the provider SDK
+captures actual usage: the headroom adds at most `amount` to that trust
+exposure, and close refunds what was not captured.
+
 Each run's Complete stream ends on its own terms. A lost Control attachment or a
 reattach never cancels it, so a run the provider already completed still
-delivers its answer and final. One Control report that fails validation or
-cannot be proven now (a challenge, `LowCredit`, `Receipt` or `Drain`) is set
-aside with an `on_error` record naming its kind and reason; the attachment and
-every run continue. A Receipt is first checked against its retained run and
-prices with no chain read; each run's Receipt is proven once per attachment,
-one proof at a time, and after 16 failed proofs on one attachment later
-Receipts are rejected without chain reads. A rejected `Meter` stops the session
+delivers its answer and final. One Control report that fails validation (a
+challenge, `LowCredit`, `Receipt` or `Drain`) is set aside with an `on_error`
+record naming its kind and reason; the attachment and every run continue. A
+Receipt is checked against its retained run and accepted prices, as its
+Terminal is, with no chain read. Its settled total and observation are the
+provider's report: the agent proves the settled total at a cooperative close
+and reads it at every attachment. A rejected `Meter` stops the session
 cursor: Control stays open so active runs finish (closing it would make the
 provider cancel them), no new run starts, and the next request re-syncs once
 no stream is live, or after 60 s, when a stream still live is ended. A run registered but never sent is recorded `NOT_ADMITTED`
@@ -206,7 +224,11 @@ states and reconcile original references after uncertainty. An
 (SDK-written, never remote text), and the same goes to `on_error`. A wallet
 adapter raises `NotSubmittedError` only when its own durable record proves the
 call never reached its service; the result is then `FAILED` and the call may be
-sent again. Any other wallet error leaves the result `UNKNOWN`. A request the
+sent again. Any other wallet error leaves the result `UNKNOWN`. A confirmed
+top-up whose event shows less than the deposit confirmed before it was sent,
+plus its amount, raises `ClientError`: nothing is recorded from that event, the
+next refresh reads the deposit, and a retry sends the same authorization again,
+since that attempt's own transaction may still land. A request the
 provider refuses before admission (`INSUFFICIENT_DEPOSIT`, or
 `SESSION_NOT_READY` for `AUTHORIZATION_REQUIRED` or `PRICE_CHANGED`) raises
 `PaymentError` and is recorded never admitted, so it does not stay unresolved
@@ -227,6 +249,112 @@ transaction instead of failing. Calling `sessions.close(session_id)` again, or
 `sessions.reconcile("close-" + session_id.hex())`, proves the same close; it never
 sends a second close request. Only the canonical event and state make it
 `CONFIRMED`.
+
+A checkpoint holds one session at a time. Once the agent's own close is
+`CONFIRMED` (a cooperative close within validated usage, or its own `withdraw`
+or `releaseIdle`), the next request or `sessions.open` retires that session and
+funds a new one with the same signer over a new Control stream. The checkpoint's
+last record for the closed session is kept beside it as
+`<checkpoint name>.<session id>.closed<suffix>`, and the checkpoint then drops
+that session's ledger and operations, so `sessions.get`, `list`, `terms`, `run`
+and `reconcile` no longer know it. Retirement waits until a new session can be
+funded: without `agent_id` or an `initial_session_tokens` choice, opening raises
+before anything is dropped. Retirement waits for no stream: while a
+request on the closed session is still ending, opening raises `ClientError`.
+A close above validated usage is never retired; opening raises its
+`CloseAccountingError`. For the agent's own `withdraw` or `releaseIdle`, the
+session's state at or after the exit's block, where its settled total is final,
+is compared with validated usage the same way. That is current state, which a
+closed session never changes, so no node needs to keep the exit's block. A close
+still `PENDING`, a `requestClose` and a session closed by its provider or anyone
+else are not retired.
+
+### Many requests in one session
+
+One `Client` can run many requests at once in its session. They share the
+session's deposit, its cumulative voucher ceiling and the prices it has
+accepted. Each request is its own run: a random 32-byte run ID, the model and
+price version it signed, its own Meters, Terminal and Receipt, and its own
+Complete stream beside the session's one Control stream.
+
+Every call runs on the client's own event loop thread, so calls made from
+several threads proceed together; concurrent first requests share one opening.
+In asyncio code, run each call with `asyncio.to_thread`.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from mppi_agent import Client
+
+tasks = ["Summarize the report", "List the open risks", "Draft a reply"]
+
+with Client.from_config(
+    "https://YOUR_PROVIDER",
+    initial_session_tokens=100_000,
+) as client:
+
+    def ask(task: str) -> bytes:
+        return client.chat.completions.create(
+            model="YOUR_PROVIDER/MODEL",
+            messages=[{"role": "user", "content": task}],
+        )
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        for response in pool.map(ask, tasks):
+            print(response.decode("utf-8"))
+```
+
+**Size the deposit for every run in flight.** The provider admits a run only
+when the confirmed deposit covers the session's usage so far, the remaining
+reservation of every admitted run and the new run's own: its prefill and an
+output bound of at least the provider's output buffer (a Challenge's
+`cover_output_tokens`, 1,000 output tokens by default). N runs in flight need
+about N times one run's reservation, beyond the usage already recorded
+([catalogs and pricing](protocol.md#catalogs-and-pricing)).
+`initial_session_tokens` converts token equivalents at the highest applicable
+rate, so N × (input tokens per request + output bound) covers N such runs at
+once in a new session. A request the deposit cannot cover fails with
+`INSUFFICIENT_DEPOSIT`, and `on_funding_notice` reports the shortfall; only an
+explicit `sessions.topUp` adds funds. A session keeps at most 1,024 unfinished
+runs.
+
+**Admission order.** When the voucher ceiling does not yet cover a new run, the
+provider sends a coverage request on Control and the run waits for the higher
+voucher, so each such admission may cost one voucher round trip. The client
+signs those vouchers within the confirmed deposit, one at a time. Provider SDK
+releases after `0.1.2` admit a session's waiting runs in the order they first
+waited, while each voucher arrives within the provider's turn
+([admission and voucher renewal](protocol.md#admission-and-voucher-renewal),
+step 4); with `0.1.2`, a later run can be admitted first.
+
+**Share one client between workers.** A session has one Control attachment:
+a successful reattachment replaces the previous one and starts a new
+generation, and requests signed for an earlier generation cannot start
+([attachment](protocol.md#control-directions-and-attachment)). The checkpoint
+lock also refuses a second `Client` on the same configuration ("already in
+use"). To fan work out to sub-agents or workers, give them the one `Client`, or
+route their requests through the process that holds it; do not attach a
+separate process per worker to the same session.
+
+For comparison, x402 sends a signed payment authorization with each paid
+request and leaves session handling out of its
+[v2 specification](https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md),
+and MPP's `session` intent is a
+[streaming payment over a payment channel](https://mpp.dev/protocol). In MPPI,
+one escrowed deposit and one cumulative voucher ceiling serve every run in
+flight, and each run streams on its own Complete RPC.
+
+### After Control loss
+
+If the provider restarts or the Control stream otherwise ends, the client
+reports it through `on_error` (operation `"control"`) and marks the session
+not ready; running Complete streams still end on their own terms. Nothing
+reattaches in the background. The next request, or
+`client.sessions.open(...)`, reattaches first: it reconnects Control, proves
+the retained opening again and authenticates a new generation. If the provider
+is still unavailable, that call fails and a later one tries again. Until then
+`client.sessions.get(session_id).readiness` reports `SESSION_NOT_READY` with
+reason `CONTROL_NOT_READY`. It only reports: send the next request instead of
+waiting for it to become ready.
 
 ## Fresh chain state
 

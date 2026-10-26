@@ -365,7 +365,7 @@ class Peers:
             await asyncio.gather(*pending, return_exceptions=True)
 
 
-def deploy(node, origin: str) -> tuple[dict, bytes, str]:
+def deploy(node, origin: str, sessions: int = 1) -> tuple[dict, bytes, str]:
     proxy_artifact = Artifact("ERC1967Proxy")
     registry_artifact, token, mppi = (
         Artifact("DiscoveryRegistry"),
@@ -409,7 +409,7 @@ def deploy(node, origin: str) -> tuple[dict, bytes, str]:
     # Snapshots read through Multicall3's interface at its canonical address.
     stand_in = node.deploy(Artifact("TestMulticall3"))
     node.call("anvil_setCode", [hx(MULTICALL3), node.call("eth_getCode", [hx(stand_in), "latest"])])
-    node.send(node.deployer, USDC, token.call("mint", (node.agent.address, 5_510_000)))
+    node.send(node.deployer, USDC, token.call("mint", (node.agent.address, 5_510_000 * sessions)))
 
     def pin(address: bytes) -> dict:
         return {
@@ -601,10 +601,9 @@ def paid_agent(
             time.sleep(0.02)
         streamed = meter.summary(mark)
         if mode != "rejected-meter":  # Its re-sync may read once to reattach.
-            # The request reads no chain. In the background, never gating it, the
-            # agent proves its Receipt's settled total: the block, the session at
-            # it, and the block again. No refresh (its batch reads the slots).
-            assert streamed["calls"] == {"eth_getBlockByNumber": 2, "eth_call": 1}, streamed
+            # The request and its Receipt read no chain: the Receipt is checked
+            # against the run's accepted terms, and close proves the settled total.
+            assert streamed["requests"] == 0, streamed
         for field in (
             "session_id",
             "run_id",
@@ -658,9 +657,40 @@ def paid_agent(
         assert closed.state is OperationState.CONFIRMED
         state = reader.session(identifier, reader.block())
         assert state.status is SessionStatus.CLOSED and state.settled_cumulative == 5_420_000
-    assert wallet.submissions == wallet.authorization_count == 1
+        sessions = [(identifier, opened.operation.tx_hash, closed.tx_hash)]
+        reopening = None
+        if mode == "reopen":
+            # The agent's own confirmed close retires that session: the next
+            # request funds another with the same signer, on a new Control stream.
+            mark = meter.mark()
+            with client.chat.completions.create_raw(REQUEST, model=MODEL, stream=True) as again:
+                assert list(again) == list(CHUNKS)
+            reopening = meter.summary(mark)
+            assert reopening["connections"] == 1, reopening
+            assert again.terminal is not None and again.terminal.amount == 5_420_000
+            (second,) = client.sessions.list().sessions
+            assert second.session_id != identifier and second.deposit == 5_510_000
+            assert second.descriptor.session_signer == signer.address
+            history = directory / f"agent-checkpoint.{identifier.hex()}.closed.json"
+            assert json.loads(history.read_text())["confirmed_close"]["tx"] == closed.tx_hash.hex()
+            record = json.loads((directory / "agent-checkpoint.json").read_text())
+            (opening_tx,) = (item["tx"] for item in record["operations"] if item["kind"] == "open")
+            deadline = time.monotonic() + 20
+            while reader.session(second.session_id, reader.block()).settled_cumulative != 5_420_000:
+                assert time.monotonic() < deadline, "Rust provider did not capture final usage"
+                time.sleep(0.05)
+            again_closed = client.sessions.close(second.session_id)
+            assert again_closed.state is OperationState.CONFIRMED
+            state = reader.session(second.session_id, reader.block())
+            assert state.status is SessionStatus.CLOSED and state.settled_cumulative == 5_420_000
+            sessions.append((second.session_id, bytes.fromhex(opening_tx), again_closed.tx_hash))
+    assert wallet.submissions == wallet.authorization_count == len(sessions)
     return {
-        "session_id": hx(identifier),
+        "session_id": hx(sessions[-1][0]),
+        "sessions": [
+            {"session_id": hx(sid), "opening_tx": hx(opening), "close_tx": hx(close)}
+            for sid, opening, close in sessions
+        ],
         "opening_tx": hx(opened.operation.tx_hash),
         "close_tx": hx(closed.tx_hash),
         "authorization": view.accepted_authorization,
@@ -669,13 +699,17 @@ def paid_agent(
         "funding_authorizations": wallet.authorization_count,
         "opening_reads": opening,
         "closing_reads": closing,
+        "reopening_reads": reopening,
     }
 
 
 def observe(node, proxy: bytes, start: str, agent: dict, provider: dict) -> None:
     token = Artifact("MockUSDC")
-    assert node.uint(USDC, token, "balanceOf", (node.agent.address,)) == 90_000
-    assert node.uint(USDC, token, "balanceOf", (node.recipient.address,)) == 5_420_000
+    sessions = agent["sessions"]
+    assert node.uint(USDC, token, "balanceOf", (node.agent.address,)) == 90_000 * len(sessions)
+    assert node.uint(USDC, token, "balanceOf", (node.recipient.address,)) == 5_420_000 * len(
+        sessions
+    )
     assert node.uint(USDC, token, "balanceOf", (proxy,)) == 0
     logs = node.call(
         "eth_getLogs", [{"address": hx(proxy), "fromBlock": start, "toBlock": "latest"}]
@@ -684,42 +718,45 @@ def observe(node, proxy: bytes, start: str, agent: dict, provider: dict) -> None
     # Resolve the opening event from the current compiled ABI: the observer
     # compares actual canonical logs rather than trusting either SDK's totals.
     events = {entry["name"]: entry for entry in Artifact("MPPI").abi if entry["type"] == "event"}
-    assert len(logs) == 3
-    for log, name, amounts in zip(
-        logs, ("SessionOpened", "Settled", "SessionClosed"), expected, strict=True
-    ):
-        entry = events[name]
-        signature = name + "(" + ",".join(OWNED.abi_type(field) for field in entry["inputs"]) + ")"
-        assert log["topics"][0] == hx(keccak(text=signature))
-        assert log["topics"][1] == agent["session_id"]
-        receipt = node.call("eth_getTransactionReceipt", [log["transactionHash"]])
-        block = node.call("eth_getBlockByNumber", [log["blockNumber"], False])
-        assert receipt["status"] == "0x1"
-        assert receipt["blockHash"] == log["blockHash"] == block["hash"]
-        assert log in receipt["logs"]
-        fields = [field for field in entry["inputs"] if not field["indexed"]]
-        values = decode([OWNED.abi_type(field) for field in fields], raw(log["data"]))
-        if amounts is None:
-            assert (
-                dict(zip((field["name"] for field in fields), values, strict=True))["deposit"]
-                == 5_510_000
+    assert len(logs) == 3 * len(sessions)
+    for index, session in enumerate(sessions):
+        own = logs[3 * index : 3 * index + 3]
+        for log, name, amounts in zip(
+            own, ("SessionOpened", "Settled", "SessionClosed"), expected, strict=True
+        ):
+            entry = events[name]
+            signature = (
+                name + "(" + ",".join(OWNED.abi_type(field) for field in entry["inputs"]) + ")"
             )
-        else:
-            assert values == amounts
-    assert logs[0]["transactionHash"] == agent["opening_tx"]
-    assert logs[-1]["transactionHash"] == agent["close_tx"]
+            assert log["topics"][0] == hx(keccak(text=signature))
+            assert log["topics"][1] == session["session_id"]
+            receipt = node.call("eth_getTransactionReceipt", [log["transactionHash"]])
+            block = node.call("eth_getBlockByNumber", [log["blockNumber"], False])
+            assert receipt["status"] == "0x1"
+            assert receipt["blockHash"] == log["blockHash"] == block["hash"]
+            assert log in receipt["logs"]
+            fields = [field for field in entry["inputs"] if not field["indexed"]]
+            values = decode([OWNED.abi_type(field) for field in fields], raw(log["data"]))
+            if amounts is None:
+                assert (
+                    dict(zip((field["name"] for field in fields), values, strict=True))["deposit"]
+                    == 5_510_000
+                )
+            else:
+                assert values == amounts
+        assert own[0]["transactionHash"] == session["opening_tx"]
+        assert own[-1]["transactionHash"] == session["close_tx"]
     assert {item["tx_hash"] for item in provider["operations"]} == {
-        logs[1]["transactionHash"],
-        logs[2]["transactionHash"],
+        log["transactionHash"] for index, log in enumerate(logs) if index % 3
     }
-    assert node.uint(USDC, token, "fundingCalls", ()) == 1
-    assert node.uint(USDC, token, "transferCalls", ()) == 2
+    assert node.uint(USDC, token, "fundingCalls", ()) == len(sessions)
+    assert node.uint(USDC, token, "transferCalls", ()) == 2 * len(sessions)
 
 
 @pytest.mark.parametrize(
     ("recovery", "mode"),
-    [(False, ""), (True, ""), (False, "rejected-meter")],
-    ids=["ordinary", "recovery-batch", "rejected-meter"],
+    [(False, ""), (True, ""), (False, "rejected-meter"), (False, "reopen")],
+    ids=["ordinary", "recovery-batch", "rejected-meter", "reopen"],
 )
 def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
     node, tmp_path: Path, recovery: bool, mode: str
@@ -746,7 +783,8 @@ def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
         try:
             origin = f"https://localhost:{ingress.sockets[0].getsockname()[1]}"
             endpoint = f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}/v1"
-            profile, proxy, start = deploy(node, origin)
+            runs = 2 if mode == "reopen" else 1
+            profile, proxy, start = deploy(node, origin, runs)
             with socket.socket() as available:
                 available.bind(("127.0.0.1", 0))
                 peers.grpc_port = available.getsockname()[1]
@@ -808,7 +846,7 @@ def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
                     f"Paid agent failed; peer errors={peers.errors!r}; "
                     f"discovery={peers.discovery_paths!r}; provider={logfile.read_text()}"
                 ) from error
-            assert peers.requests == [REQUEST], peers.errors
+            assert peers.requests == [REQUEST] * runs, peers.errors
             assert peers.h2_connections == connections_before_paid + (2 if recovery else 1)
             assert "/discover" in peers.discovery_paths
             assert "/models" in peers.discovery_paths
@@ -816,13 +854,14 @@ def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
             await asyncio.wait_for(process.wait(), 20)
             assert process.returncode == 0, logfile.read_text()
             provider = json.loads(result.read_text())
-            assert provider["preparations"] == 2
-            assert provider["executions"] == provider["final_reports"] == 1
-            assert provider["usage_reports"] == 1
-            assert provider["coverage_grants"] == 1 and provider["coverage_denials"] == 0
+            # Each run is prepared, plus the short-deposit request that is refused.
+            assert provider["preparations"] == runs + 1
+            assert provider["executions"] == provider["final_reports"] == runs
+            assert provider["usage_reports"] == runs
+            assert provider["coverage_grants"] == runs and provider["coverage_denials"] == 0
             assert provider["actual_usage"] == 5_420_000
             assert provider["session_id"] == agent["session_id"]
-            assert provider["wallet_submissions"] == 2
+            assert provider["wallet_submissions"] == 2 * runs
             assert provider["shutdown_unresolved_runs"] == 0
             assert provider["shutdown_pending_operations"] == 0
             assert provider["execution_errors"] == provider["stop_requests"] == 0
@@ -831,16 +870,20 @@ def test_python_agent_pays_native_rust_provider_through_controlled_upstream(
                 assert provider["recovery"]["batch_tx"] is not None
             else:
                 assert provider["recovery"] is None
-            assert provider["sessions"] == [
-                {
-                    "session_id": agent["session_id"],
-                    "deposit": 5_510_000,
-                    "settled_cumulative": 5_420_000,
-                    "authorization": 5_510_000,
-                    "usage": 5_420_000,
-                    "status": "CLOSED",
-                }
-            ]
+            assert sorted(provider["sessions"], key=lambda view: view["session_id"]) == sorted(
+                (
+                    {
+                        "session_id": session["session_id"],
+                        "deposit": 5_510_000,
+                        "settled_cumulative": 5_420_000,
+                        "authorization": 5_510_000,
+                        "usage": 5_420_000,
+                        "status": "CLOSED",
+                    }
+                    for session in agent["sessions"]
+                ),
+                key=lambda view: view["session_id"],
+            )
             observe(node, proxy, start, agent, provider)
             assert peers.errors == []
             (tmp_path / "interop-evidence.json").write_text(

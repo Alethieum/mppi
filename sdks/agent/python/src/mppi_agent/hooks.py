@@ -14,11 +14,13 @@ class OperationTiming:
     ``operation`` is ``open``, ``topUp``, ``close``, ``requestClose``,
     ``withdraw`` or ``releaseIdle``; ``state`` is its result's state, or
     ``None`` when it raised. ``chain_ms`` is this SDK's own chain reads:
-    snapshots, the funding check and receipt proofs. ``wallet_sign_ms`` is the
+    snapshots, the funding check and its transaction's receipt. ``wallet_sign_ms`` is the
     wallet adapter's signing; ``wallet_submit_ms`` its execute call until it
     returned, which for a custodial wallet service includes its own
     submission and any wait for the transaction to be mined.
     ``provider_ms`` is the provider exchange (challenge, attachment, close).
+    The measured parts are whole milliseconds rounded down; ``provider_ms`` is
+    the rest of ``total_ms``, never negative.
     """
 
     operation: str

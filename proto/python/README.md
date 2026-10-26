@@ -8,9 +8,9 @@ The implementation validates catalogs and report transitions, computes exact
 amounts, signs and verifies fixed-session proofs, prepares contract calls and
 checks canonical receipt evidence. Version `0.1.1` also supplies shared discovery
 validation and the Circle Agent Wallet adapter used by both Python roles.
-Version `0.1.3`, used by `mppi-agent` 0.1.4, keeps HTTP connections alive and
-sends a step's reads as one JSON-RPC batch (`HttpJsonRpc.call_many`), and treats
-a read timeout as transient. It adds:
+Version `0.1.3`, used by `mppi-agent` 0.1.4, 0.1.4.1 and 0.1.5, keeps HTTP connections
+alive and sends a step's reads as one JSON-RPC batch (`HttpJsonRpc.call_many`),
+and treats a read timeout as transient. It adds:
 
 - `ChainReader.latest`, a one-request snapshot through Multicall3, and the
   batched steps `observe` and `session_at`; on final networks

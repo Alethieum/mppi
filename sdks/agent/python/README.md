@@ -1,5 +1,43 @@
 # MPPI agent SDK for Python
 
+Version `0.1.5` keeps the wire protocol, contract and signatures, uses protocol
+package `0.1.3` and works with the providers running `0.1.2`. A caller of
+`0.1.4.1` notices these changes:
+
+- after the agent's own confirmed close (a cooperative close, or its own
+  `withdraw` or `releaseIdle`), the next request or `sessions.open` funds a new
+  session with the same signer instead of raising "session close is pending".
+  From then on the closed session is no longer retained: `sessions.get`,
+  `terms`, `run` and `reconcile` of its operations raise `ClientError`, and
+  `list` no longer shows it.
+  Its last record stays beside the checkpoint as
+  `<checkpoint name>.<session id>.closed<suffix>` (for the built-in setup,
+  `.mppi/agent.json.payments.<session id>.closed.json`). A close or exit whose
+  settled total exceeds validated usage is never retired: opening raises its
+  `CloseAccountingError`. After its own `withdraw` or `releaseIdle`, that check
+  may read the chain, so opening can raise a chain error while the RPC fails;
+- `Client(..., voucher_headroom=H)` and `Client.from_config(...,
+  voucher_headroom=H)` (default `0`) sign each voucher up to `H`
+  base units above its requirement, within the confirmed deposit, so the
+  provider admits a later request it covers without first asking for a voucher.
+  A provider can capture up to the signed voucher whatever it delivered, so the
+  headroom adds at most `H` to the agent's exposure;
+- a Receipt is checked against its run's accepted terms with no chain read. The
+  settled total is proven at close and at every attachment, and `sessions.get`
+  reports it;
+- a retried top-up first reads whether USDC already holds its authorization as
+  used: then the earlier top-up took effect, nothing is sent, and new top-ups
+  are refused until that authorization expires. An uncertain top-up whose
+  authorization expired unused reconciles to `FAILED`, and a top-up event below
+  the confirmed deposit plus its amount raises `ClientError`, after which a
+  retry sends that same authorization again, never a new one;
+- onboarding names a missing Circle CLI, a CLI other than `1.1.4`, a failed
+  wallet check (with the `circle wallet list` command that shows Circle's
+  reason and the login the network needs), an address that login does not list,
+  and the network of an empty wallet, as `OnboardingError`, where `0.1.4.1`
+  raised the adapter's `CircleAgentWalletError`. `MPPI_CIRCLE_CLI` names the CLI
+  executable.
+
 Version `0.1.4.1` fixes one defect in `0.1.4`. When a background chain refresh
 accepted a block after an opening's own while the opening was being signed and
 submitted, the next refresh could report the new session's state as regressed
@@ -162,12 +200,23 @@ funding wallet.
   An undelivered notice is discarded when Control is lost;
   an already running callback cannot be interrupted. Confirmed top-up rechecks
   the retained voucher target against fresh chain funding.
+- `Client(..., voucher_headroom=amount)` signs each voucher `amount` USDC base
+  units above what the provider requires, within the confirmed deposit (the
+  default 0 signs exactly the requirement). The provider then admits a later
+  request the headroom covers at once, without first asking for a voucher; one
+  that does not fit asks as before, and its voucher restores the headroom. Size
+  it to the prompt and the provider's output buffer (`cover_output_tokens`) of
+  the requests it should admit, at their prices. A provider can capture up to
+  the signed voucher whatever it delivered, so the headroom adds at most
+  `amount` to what you trust it with; close refunds what it did not capture.
 - `sessions.recover(session_id)` restores retained state and authenticates a new
   Control generation. It neither funds a session nor replays inference. Current
   observed prices still require explicit acceptance for later runs.
 - `sessions.close(session_id)` requests signed cooperative close. The explicit
   `requestClose`, `withdraw`, `releaseIdle` and `reconcile` methods retain their
-  respective chain eligibility and evidence checks.
+  respective chain eligibility and evidence checks. After the agent's own close
+  is confirmed, the next request or `sessions.open` funds a new session with the
+  same signer and keeps the closed record beside the checkpoint.
 - `Client.close()` and context-manager exit shut down local streams and return
   unresolved work. They do not implicitly close a funded session.
 

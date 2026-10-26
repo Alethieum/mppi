@@ -168,7 +168,12 @@ def onboard(
         block = registry.verified_block()
         balance = registry.balance(address, block=block)
         if balance <= 0:
-            raise OnboardingError("fund the selected wallet with USDC on Arc before onboarding")
+            network = {5042002: "Arc testnet", 5042: "Arc mainnet"}.get(
+                chain.profile.domain.chain_id, "Arc"
+            )
+            raise OnboardingError(
+                f"fund the selected wallet with USDC on {network} before onboarding"
+            )
         identity: RegistryIdentity | None
         # A requested external identity cannot erase an unresolved local mint.
         if agent_id is not None and (saved_id is not None or record["registration"] is None):

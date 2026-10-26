@@ -1,7 +1,6 @@
 """Settled runs are forgotten, so a long session's memory and checkpoint stay bounded."""
 
 import asyncio
-from collections import deque
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,8 +60,7 @@ def retention_client(path: Path) -> Client:
     client._checkpoint_lock = asyncio.Lock()
     client._saved, client._opening_ref, client._operations = {"version": 1}, None, {}
     client._outputs, client._closed_result = {}, None
-    client._receipted, client._receipts_seen = set(), set()
-    client._receipt_queue, client._receipt_task, client._receipt_failures = deque(), None, 0
+    client._receipted = set()
     client._queue_options = {"max_messages": 64, "max_bytes": 16384, "wait_ms": 50}
     client._resync = client._control_failure = None
     client._attached_generation = 1
