@@ -12,7 +12,7 @@ Install the role your application uses:
 uv pip install 'mppi-provider==0.1.2'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.4'
+uv pip install 'mppi-agent==0.1.4.1'
 ```
 
 Each role installs its required protocol dependency: the agent

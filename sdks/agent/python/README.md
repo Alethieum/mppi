@@ -1,5 +1,13 @@
 # MPPI agent SDK for Python
 
+Version `0.1.4.1` fixes one defect in `0.1.4`. When a background chain refresh
+accepted a block after an opening's own while the opening was being signed and
+submitted, the next refresh could report the new session's state as regressed
+and hold its requests at `INCONSISTENT_STATE` until its provider next
+collected payment. The opening now records its activity time only from a block
+no later than its own; otherwise the attachment reads the session at the
+provider's block, with no extra chain read. Nothing else changes.
+
 Version `0.1.4` keeps the wire protocol, contract, signatures and payment
 semantics and works with the providers running `0.1.2`. It reads the chain in
 a few batched round trips over kept-alive connections, and resolves outcomes

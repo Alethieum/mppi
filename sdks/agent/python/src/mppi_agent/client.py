@@ -1693,13 +1693,22 @@ class Client:
     def _confirm_opened(self, ledger: Ledger, outcome: OperationResult) -> None:
         """Requests can use the opening its SessionOpened event proved.
 
-        Its activity time is that of the evidence read before submission,
-        which is no later than the opening's block, so the deadline it implies
-        is never late.
+        Its activity time is that of the follower's accepted block, used only
+        when that block is no later than the opening's: block times never
+        decrease, so the deadline it implies is never late and a later read
+        never shows an earlier time. A background refresh may accept a later
+        block while the opening is signed and submitted; then nothing is
+        recorded here, and the attachment reads the session.
         """
         current = self.chain.current
         proven = [o.deposit for o in outcome.sessions if o.session_id == ledger.session_id]
-        if current is None or not proven or proven[0] is None:
+        if (
+            current is None
+            or not proven
+            or proven[0] is None
+            or outcome.observation is None
+            or current.block.observation.block_number > outcome.observation.block_number
+        ):
             return
         self.chain.confirm(
             ledger.session_id,
@@ -2056,14 +2065,11 @@ class Client:
         except ChainEvidenceError:
             current = None
         head = current.block.observation.block_number if current is not None else -1
-        if current is not None and head > number and session_id not in current.sessions:
-            current = await asyncio.wait_for(self.chain.refresh(), self.timeout)
-            head = current.block.observation.block_number
-        if current is not None and head >= number and session_id in current.sessions:
-            if head == number:
-                if current.block.observation.block_hash != block_hash:
-                    raise ClientError("snapshot block is not canonical")
-                return current, current.sessions[session_id]
+        if current is not None and head == number and session_id in current.sessions:
+            if current.block.observation.block_hash != block_hash:
+                raise ClientError("snapshot block is not canonical")
+            return current, current.sessions[session_id]
+        if current is not None and head > number:
             try:
                 _, observed = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -2079,6 +2085,18 @@ class Client:
                 raise
             except ChainEvidenceError as error:
                 raise ClientError("snapshot block is not canonical") from error
+            if session_id not in current.sessions:
+                # Not yet read, as when a refresh overtook a new session's
+                # opening, unless a refresh read it meanwhile. Its deposit,
+                # settlement and activity only grow, so this earlier state
+                # understates them and no later read finds it regressed.
+                latest = self.chain.current
+                assert latest is not None
+                if session_id not in latest.sessions:
+                    self.chain.confirm(session_id, observed)
+                    latest = self.chain.current
+                    assert latest is not None
+                current = latest
             return current, observed
         for delay in (0.25, 1.0, None):
             try:

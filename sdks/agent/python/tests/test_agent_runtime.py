@@ -2190,7 +2190,8 @@ def test_a_confirmed_top_up_takes_its_new_deposit_from_its_event():
 def test_a_fresh_opening_records_its_proven_session_for_requests():
     client = component_client()
     ledger = client._ledger
-    block = SimpleNamespace(timestamp=1_799_999_990)  # The evidence read before submission.
+    # The evidence read before submission, at a block before the opening's.
+    block = SimpleNamespace(observation=SimpleNamespace(block_number=11), timestamp=1_799_999_990)
     client.chain.current = SimpleNamespace(sessions={}, block=block)
     observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 12, b"o" * 32)
     outcome = OperationResult(
@@ -2207,6 +2208,141 @@ def test_a_fresh_opening_records_its_proven_session_for_requests():
     # An activity time no later than the opening's block: never a late deadline.
     assert state.last_activity == 1_799_999_990
     assert state.initial_rate_card_hash == ledger.initial_hash
+
+
+class _OpenedChain:
+    """A final network: the session opened at block 10; block n is at 1_800_000_000 + n // 2."""
+
+    profile = SimpleNamespace(instant_finality=True, domain=DOMAIN)
+
+    def __init__(self, opened: ChainSession, head: int) -> None:
+        self.opened, self.head, self.latest_reads = opened, head, 0
+
+    @staticmethod
+    def block(number: int) -> Block:
+        return Block(
+            ChainObservation(
+                DOMAIN.chain_id, DOMAIN.verifying_contract, number, bytes([number]) * 32
+            ),
+            1_800_000_000 + number // 2,
+            bytes([number - 1]) * 32,
+        )
+
+    def state(self, number: int) -> ChainSession:
+        return (
+            self.opened if number >= 10 else ChainSession(0, 0, SessionStatus.OPEN, 0, 0, bytes(32))
+        )
+
+    def latest(self, *, providers, sessions):
+        self.latest_reads += 1
+        states = {sid: self.state(self.head) for sid in sessions}
+        return self.block(self.head), PauseLevel.NONE, {}, states
+
+    def _observe_at(self, number, block_hash, *, providers, sessions, recheck):
+        assert block_hash == bytes([number]) * 32
+        states = {sid: self.state(number) for sid in sessions}
+        return self.block(number), None, PauseLevel.NONE, {}, states
+
+    def session_at(self, number, block_hash, session_id):
+        return self.block(number), self.state(number)
+
+
+@pytest.mark.parametrize(("head", "provider"), [(12, 11), (12, 12), (12, 14), (10, 12), (8, 12)])
+def test_an_opening_a_background_refresh_overtook_keeps_requests_ready(monkeypatch, head, provider):
+    """The opening lands at block 10. While the wallet signed and submitted it,
+    a background refresh accepted block `head`; the provider's snapshot names
+    block `provider`. The session's recorded activity is never later than the
+    chain's, the attachment adds no whole refresh, and the next refresh is
+    accepted."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(follower_module, "_sleep", AsyncMock())
+        client = component_client()
+        ledger = client._ledger
+        opened = ChainSession(100, 0, SessionStatus.OPEN, 0, 1_800_000_005, ledger.initial_hash)
+        chain = _OpenedChain(opened, head)
+        clock = [1_000.0, 1_800_000_010.0]
+        follower = ChainFollower(
+            chain,
+            max_age_ms=60_000,
+            collection_margin_ms=1_000,
+            monotonic=lambda: clock[0],
+            wall_clock=lambda: clock[1],
+        )
+        follower._running = True
+        await follower.refresh()  # Before the session is watched.
+        client.chain = follower
+        follower.follow(sessions=(ledger.session_id,))
+        client._confirm_opened(
+            ledger,
+            OperationResult(
+                "open-x",
+                OperationState.CONFIRMED,
+                tx_hash=b"t" * 32,
+                observation=chain.block(10).observation,
+                sessions=(SessionOperationOutcome(ledger.session_id, 100, deposit=100),),
+            ),
+        )
+        recorded = follower.current.sessions.get(ledger.session_id)
+        assert recorded is None or recorded.last_activity <= opened.last_activity
+        reads = chain.latest_reads
+        current, observed = await client._snapshot_evidence(
+            provider, bytes([provider]) * 32, ledger.session_id
+        )
+        assert chain.latest_reads == reads
+        assert current.sessions[ledger.session_id] == observed == opened
+        clock[0] += 15
+        clock[1] += 10
+        chain.head = 27
+        await follower.refresh()
+        assert follower.confirmed_readiness(ledger.session_id).ready
+        assert follower.current.sessions[ledger.session_id] == opened
+
+    asyncio.run(scenario())
+
+
+def test_a_refresh_accepted_during_the_attachment_read_keeps_its_newer_state(monkeypatch):
+    """The follower is past the provider's block without the new session. A
+    refresh that reads it, topped up since, is accepted while the attachment
+    reads it at the provider's block: the newer state stays."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(follower_module, "_sleep", AsyncMock())
+        client = component_client()
+        ledger = client._ledger
+        opened = ChainSession(100, 0, SessionStatus.OPEN, 0, 1_800_000_005, ledger.initial_hash)
+        topped = replace(opened, deposit=150, last_activity=1_800_000_006)
+        chain = _OpenedChain(opened, 12)
+        follower = ChainFollower(
+            chain,
+            max_age_ms=60_000,
+            collection_margin_ms=1_000,
+            monotonic=lambda: 1_000.0,
+            wall_clock=lambda: 1_800_000_010.0,
+        )
+        follower._running = True
+        await follower.refresh()
+        client.chain = follower
+        follower.follow(sessions=(ledger.session_id,))
+        newer = ChainSnapshot(
+            chain.block(13),
+            PauseLevel.NONE,
+            MappingProxyType({}),
+            MappingProxyType({ledger.session_id: topped}),
+            1_000.0,
+        )
+
+        def session_at(number, block_hash, session_id):
+            follower._accept(newer)  # A background refresh, meanwhile.
+            return chain.block(number), opened
+
+        chain.session_at = session_at
+        current, observed = await client._snapshot_evidence(11, bytes([11]) * 32, ledger.session_id)
+        assert observed == opened
+        assert current.sessions[ledger.session_id] == topped
+        assert follower.current.sessions[ledger.session_id] == topped
+
+    asyncio.run(scenario())
 
 
 def test_a_session_s_accepted_terms_and_run_outcomes_are_public():

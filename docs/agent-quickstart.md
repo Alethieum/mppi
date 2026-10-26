@@ -5,14 +5,14 @@ then handles discovery, payment messages and inference against the provider's
 MPPI endpoint. This guide uses Circle Agent Wallet on official Arc testnet,
 with Python 3.12+ on macOS or Linux.
 
-The built-in setup requires `mppi-agent` version `0.1.4`. Existing applications
+The built-in setup requires `mppi-agent` version `0.1.4.1`. Existing applications
 can continue using the [explicit composition interface](python-quickstart.md).
 
 ## 1. Install
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-agent==0.1.4'
+uv pip install 'mppi-agent==0.1.4.1'
 ```
 
 The shared protocol dependency installs automatically. Run the remaining

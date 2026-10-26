@@ -4,7 +4,7 @@ Start with the [agent quickstart](agent-quickstart.md) or
 [provider quickstart](provider-quickstart.md) for built-in Circle setup. This page
 documents custom wallet and application composition.
 
-Python agent `0.1.4` and provider `0.1.2` share the Circle Agent Wallet adapter
+Python agent `0.1.4.1` and provider `0.1.2` share the Circle Agent Wallet adapter
 from `mppi-protocol` (`0.1.3` and `0.1.1` respectively). Both built-in setup paths select the packaged official
 profile for the requested network. Explicit integrations below supply their own
 trusted profile. Python and Rust providers use the same native onboarding CLI.
@@ -22,7 +22,7 @@ explicit capabilities.
 Install your role into a Python 3.12+ environment:
 
 ```sh
-uv pip install 'mppi-agent==0.1.4'
+uv pip install 'mppi-agent==0.1.4.1'
 ```
 
 The provider environment installs `mppi-provider==0.1.2`. The shared protocol
