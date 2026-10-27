@@ -280,10 +280,13 @@ impl Fixture {
         )?))
     }
     async fn compose(&self) -> Result<Mppi, SetupError> {
+        let wallet = self
+            .make_wallet(true)
+            .map_err(|_| SetupError("operation record invalid"))?;
         compose(
             self.host(),
-            self.make_wallet(true)
-                .map_err(|_| SetupError("operation record invalid"))?,
+            wallet.clone(),
+            Some(&wallet),
             Arc::new(Callbacks),
             Arc::new(Callbacks),
             RuntimeOptions::default(),
@@ -331,9 +334,11 @@ async fn composition_preserves_existing_record_services_hooks_and_explicit_lifec
         },
         ..RuntimeOptions::default()
     };
+    let wallet = fixture.make_wallet(true).unwrap();
     let runtime = compose(
         fixture.host(),
-        fixture.make_wallet(true).unwrap(),
+        wallet.clone(),
+        Some(&wallet),
         Arc::new(Callbacks),
         Arc::new(Callbacks),
         options,
@@ -385,10 +390,12 @@ async fn composition_rejects_wallet_and_profile_mismatch_without_new_history() {
     let fixture = Fixture::new(None, operator());
     let mut host = fixture.host();
     host.profile = crate::deployment::official_testnet_profile().unwrap();
+    let wallet = fixture.make_wallet(true).unwrap();
     assert!(
         compose(
             host,
-            fixture.make_wallet(true).unwrap(),
+            wallet.clone(),
+            Some(&wallet),
             Arc::new(Callbacks),
             Arc::new(Callbacks),
             RuntimeOptions::default()
@@ -443,4 +450,105 @@ async fn operation_record_identity_is_checked_and_cannot_be_replaced() {
             value
         );
     }
+}
+
+/// Another operator capability, such as a key an HSM or KMS holds. Setup never
+/// submits or reconciles through it.
+struct Supplied(Address);
+#[tonic::async_trait]
+impl crate::capabilities::TransactionWallet for Supplied {
+    fn address(&self) -> Address {
+        self.0
+    }
+    async fn execute(
+        &self,
+        _: &crate::capabilities::WalletCall,
+        _: &str,
+    ) -> Result<crate::types::OperationResult, crate::capabilities::WalletError> {
+        panic!("setup cannot submit a wallet call")
+    }
+    async fn reconcile(
+        &self,
+        _: &str,
+    ) -> Result<crate::types::OperationResult, crate::capabilities::WalletError> {
+        panic!("setup cannot reconcile a wallet operation")
+    }
+}
+async fn supplied(host: HostConfiguration, address: Address) -> Result<Mppi, SetupError> {
+    runtime_from_config_with_wallet(
+        host,
+        Arc::new(Supplied(address)),
+        Arc::new(Callbacks),
+        Arc::new(Callbacks),
+        RuntimeOptions::default(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn another_wallet_composes_by_its_address_with_the_same_deployment_checks() {
+    let fixture = Fixture::new(None, operator());
+    let original = fs::read(&fixture.path).unwrap();
+    let runtime = supplied(fixture.host(), operator()).await.unwrap();
+    assert!(runtime.discovery("/discover").is_none());
+    let _services = runtime.grpc_services();
+    // No Circle CLI call; the Circle operation record is neither read nor written.
+    assert_eq!(fixture.service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    assert!(!fixture.rpc.calls.lock().unwrap().is_empty());
+    // Another operator is refused before any chain read.
+    let fixture = Fixture::new(None, operator());
+    let error = supplied(fixture.host(), Address::repeat_byte(0x55))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "saved provider operator differs from the supplied wallet"
+    );
+    assert!(fixture.rpc.calls.lock().unwrap().is_empty());
+    let mut host = fixture.host();
+    host.profile = crate::deployment::official_testnet_profile().unwrap();
+    assert!(supplied(host, operator()).await.is_err());
+    assert!(fixture.rpc.calls.lock().unwrap().is_empty());
+    for altered in ["network", "code", "separator", "canonical"] {
+        let fixture = Fixture::new(Some(altered), operator());
+        assert!(
+            supplied(fixture.host(), operator()).await.is_err(),
+            "accepted {altered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_circle_wallet_for_another_operator_keeps_its_message() {
+    let fixture = Fixture::new(None, operator());
+    let wallet = Arc::new(
+        CircleAgentWallet::with_command(
+            fixture.host().chain,
+            Address::repeat_byte(0x55),
+            &fixture.directory.join("other-operations.json"),
+            CircleOptions::default(),
+            false,
+            fixture.service.clone(),
+        )
+        .unwrap(),
+    );
+    let error = compose(
+        fixture.host(),
+        wallet.clone(),
+        Some(&wallet),
+        Arc::new(Callbacks),
+        Arc::new(Callbacks),
+        RuntimeOptions::default(),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "saved provider operator differs from Circle Agent Wallet"
+    );
+    assert_eq!(fixture.service.calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.rpc.calls.lock().unwrap().is_empty());
 }

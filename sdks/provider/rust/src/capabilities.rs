@@ -8,6 +8,7 @@ use crate::errors::{ValidationCode, ValidationError};
 use crate::types::OperationResult;
 pub use crate::types::WalletCall;
 use alloy_primitives::{Address, B256, U256};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FundingAuthorization {
@@ -107,9 +108,18 @@ impl core::fmt::Display for WalletError {
 impl std::error::Error for WalletError {}
 
 /// Executes and reconciles the original exact call bound to `operation_ref`.
-/// A hashless `Failed` result attests that submission definitively never began.
+/// A hashless `Failed` result attests that submission definitively never began,
+/// and leaves no binding: the runtime may execute that reference again with a
+/// newly prepared call, as a close continues under its reference. A `Failed`
+/// result with a transaction hash, mined and reverted, stays bound to that
+/// transaction: a close then continues under a successor reference.
 /// Once submission was attempted, service-reported failure without canonical
 /// transaction evidence remains `Unknown`; it must not authorize a replacement.
+/// The runtime may call `execute` and `reconcile` for different operations,
+/// or the same one, at once (a recovery reads before taking the runtime's
+/// locks), so an implementation serializes access to its own records, as
+/// [`CircleAgentWallet`](crate::circle::CircleAgentWallet) does.
+/// Every requirement is in docs/sdk-interfaces.md, Wallet requirements.
 #[tonic::async_trait]
 pub trait TransactionWallet: Send + Sync {
     fn address(&self) -> Address;
@@ -119,8 +129,42 @@ pub trait TransactionWallet: Send + Sync {
         operation_ref: &str,
     ) -> Result<OperationResult, WalletError>;
     async fn reconcile(&self, operation_ref: &str) -> Result<OperationResult, WalletError>;
+    /// Forget the bindings of `operation_refs` once `at` has passed: from
+    /// then on they are never presented again. The runtime passes each
+    /// reference as soon as no session it covers needs it, with the time from
+    /// which none does: when the last of them retired, or up to
+    /// `closed_retention` ahead for one a later confirmed collection
+    /// superseded. An implementation that forgets keeps the earliest `at`
+    /// given with each as durably as the binding, so a restart does not lose
+    /// it, and a `reconcile` of a reference, or its record gaining a
+    /// transaction hash, withdraws its `at`: a recovery from an older
+    /// checkpoint may present it again, and the runtime passes it again once
+    /// no session needs it. Keep any binding whose call may have reached the
+    /// wallet's service without a transaction to show for it.
+    /// Keeping every binding, the default, is always safe.
+    async fn retire(&self, _operation_refs: &[String], _at: SystemTime) -> Result<(), WalletError> {
+        Ok(())
+    }
+    /// Whether the adapter's own records are near the bound past which it
+    /// refuses new calls as never submitted. The runtime reads it on every
+    /// maintenance pass, so it must not block, and reports each rise as an
+    /// `on_error` `HookError`. The default is never.
+    fn near_capacity(&self) -> bool {
+        false
+    }
+    /// The largest calldata, in bytes, the wallet accepts in one call. The
+    /// runtime sizes each batch it builds to fit it, and refuses a larger
+    /// batch before recording any intent. The default, 61,440, is the Circle
+    /// adapter's bound. A wallet whose real limit is gas rather than bytes
+    /// states a smaller size. The runtime refuses, at construction, a bound
+    /// below one settlement call: 452 bytes.
+    fn max_call_bytes(&self) -> usize {
+        61_440
+    }
 }
 
+/// An agent's funding wallet. Every requirement is in docs/sdk-interfaces.md,
+/// Wallet requirements.
 #[tonic::async_trait]
 pub trait FundingWallet: TransactionWallet {
     async fn sign_funding_authorization(

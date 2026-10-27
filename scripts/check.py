@@ -141,6 +141,12 @@ def main() -> int:
                 "Python runtime dependency audit",
                 ["pip-audit", "--disable-pip", "--no-deps", "-r", str(requirements)],
             )
+            # cargo-audit reads the crate's ignored advisories from ./.cargo/audit.toml.
+            check(
+                "Rust dependency audit",
+                ["cargo", "audit", "--file", str(RUST.with_name("Cargo.lock"))],
+                RUST.parent,
+            )
         failed = False
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"\nFAILED: {error}", file=sys.stderr)

@@ -1,6 +1,9 @@
 //! Ordered collection over retained immutable wallet intents.
 
-use super::*;
+use super::{
+    hooks::{Part, Timing},
+    *,
+};
 use crate::{
     chain::ChainSession,
     contract::OperationKind,
@@ -9,7 +12,7 @@ use crate::{
     types::{OperationState, PauseLevel, Readiness, SessionPage, SessionView, validate_page_limit},
 };
 use alloy_primitives::hex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 fn unknown(reference: &str) -> Result<OperationResult, ValidationError> {
     OperationResult::new(reference, OperationState::Unknown, None, None, None, vec![])
@@ -63,6 +66,57 @@ fn unresolved(operation: &PendingOperation, sid: B256) -> bool {
         && !covered(operation, sid)
 }
 
+/// A close mined and reverted: the wallet's binding of its reference holds
+/// that transaction, so a retry needs another reference.
+fn reverted(operation: &PendingOperation) -> bool {
+    operation.prepared.kind() == OperationKind::Close
+        && operation.result.state() == OperationState::Failed
+        && operation.result.tx_hash().is_some()
+}
+
+/// The reference a close takes after one mined and reverted: the same close
+/// reference with its retry count after a dot, `close:<id>.1`, `.2`, and so on.
+/// It derives from the reverted reference alone, so a runtime restored from
+/// evidence older than a retry derives the same successor, and the wallet's
+/// binding of it continues that retry rather than sending another.
+fn successor(reference: &str) -> String {
+    if let Some((base, count)) = reference.rsplit_once('.')
+        && let Ok(retries) = count.parse::<u64>()
+        && retries.to_string() == count
+        && let Some(next) = retries.checked_add(1)
+    {
+        return format!("{base}.{next}");
+    }
+    format!("{reference}.1")
+}
+
+/// When no session `reference` covers needs it any longer: the latest of their
+/// times, once every one has one.
+fn due(covered: &BTreeMap<B256, Option<SystemTime>>) -> Option<SystemTime> {
+    covered
+        .values()
+        .try_fold(SystemTime::UNIX_EPOCH, |latest, at| {
+            at.map(|at| latest.max(at))
+        })
+}
+
+/// Hand each reference that no covered session needs any longer to retirement,
+/// due at `due`, as soon as that is known: the wallet keeps the time durably.
+pub(super) fn hand_over(state: &mut State) {
+    let State {
+        references,
+        retirable,
+        ..
+    } = state;
+    references.retain(|reference, covered| match due(covered) {
+        Some(at) => {
+            retirable.push((reference.clone(), at));
+            false
+        }
+        None => true,
+    });
+}
+
 fn deadline(state: &ChainSession) -> Option<Duration> {
     let timestamp = match state.status() {
         SessionStatus::Open => state.last_activity().checked_add(86400),
@@ -97,17 +151,19 @@ fn retained_identity(
         .wallet_operation_id()
         .or(known.wallet_operation_id())
         .map(str::to_owned);
-    Ok((
-        OperationResult::new(
-            known.operation_ref(),
-            incoming.state(),
-            wallet_id,
-            incoming.tx_hash(),
-            incoming.observation(),
-            incoming.sessions().to_vec(),
-        )?,
-        false,
-    ))
+    let result = OperationResult::new(
+        known.operation_ref(),
+        incoming.state(),
+        wallet_id,
+        incoming.tx_hash(),
+        incoming.observation(),
+        incoming.sessions().to_vec(),
+    )?;
+    let result = match incoming.cause() {
+        Some(cause) => result.with_cause(cause)?,
+        None => result,
+    };
+    Ok((result, false))
 }
 
 fn operation_evidence(operation: &PendingOperation) -> RecoveryOperation {
@@ -122,7 +178,96 @@ fn operation_evidence(operation: &PendingOperation) -> RecoveryOperation {
     }
 }
 
+impl Session {
+    /// Nothing remains to serve, collect or reconcile: the follower shows the
+    /// session `Closed`, which is terminal on chain (every payment path reverts
+    /// `SessionIsClosed`, MPPI.sol `_existingSession`); no run is active or
+    /// preparing; every retained operation is resolved, and a confirmed close
+    /// of ours has its result; and it is not inconsistent, which waits for its
+    /// operator however long. A close another exit completed (`withdraw`,
+    /// `releaseIdle`) is final with no close result.
+    pub(super) fn is_final(&self, snapshot: &ChainSnapshot) -> bool {
+        let awaiting_result = self.close_result.is_none()
+            && self.operation.as_ref().is_some_and(|operation| {
+                operation.prepared.kind() == OperationKind::Close
+                    && operation.result.state() == OperationState::Confirmed
+            });
+        snapshot
+            .sessions()
+            .get(&self.sid)
+            .is_some_and(|chain| chain.status() == SessionStatus::Closed)
+            && self
+                .runs
+                .values()
+                .all(|run| !run.active() && run.phase != RunPhase::Preparing)
+            && [&self.operation, &self.baseline]
+                .into_iter()
+                .flatten()
+                .all(|operation| !unresolved(operation, self.sid))
+            && !awaiting_result
+            && !self.inconsistent
+    }
+}
+
 impl Runtime {
+    /// Retire each session final for `closed_retention` that no live
+    /// attachment owns. Its watch is released unless an opening or recovery
+    /// holds it; the host's checkpoints keep its history. A retired session is
+    /// never reinstalled: openings and final recovery evidence for a closed
+    /// session are refused `SESSION_CLOSED`. A session that retires no longer
+    /// needs any reference it covers, from the time it retired: retirement
+    /// counts as no delay (`State::references`).
+    pub(super) fn retire_locked(&self, state: &mut State) {
+        let Some(snapshot) = self.chain.current() else {
+            return;
+        };
+        let now = Instant::now();
+        let State {
+            sessions,
+            attachments,
+            ..
+        } = state;
+        let retired = sessions
+            .iter_mut()
+            .filter_map(|(sid, session)| {
+                if !session.is_final(&snapshot) {
+                    session.final_since = None;
+                    return None;
+                }
+                let since = *session.final_since.get_or_insert(now);
+                let owned = session
+                    .owner
+                    .and_then(|id| attachments.get(&id))
+                    .is_some_and(|owner| owner.live);
+                (!owned && now.duration_since(since) >= self.limits.closed_retention)
+                    .then_some(*sid)
+            })
+            .collect::<BTreeSet<_>>();
+        for &sid in &retired {
+            let session = state.sessions.remove(&sid).expect("final session");
+            state.retained_request_bytes -= session
+                .runs
+                .values()
+                .map(|run| run.retained_bytes)
+                .sum::<usize>();
+            if !state.pending_watch.contains_key(&sid) {
+                let _ = self.chain.unwatch_session(sid);
+            }
+            self.observers.emit(hooks::Event::SessionRetired(sid));
+        }
+        if !retired.is_empty() {
+            let now = SystemTime::now();
+            for covered in state.references.values_mut() {
+                for (sid, at) in covered.iter_mut() {
+                    if retired.contains(sid) {
+                        *at = Some(now);
+                    }
+                }
+            }
+            hand_over(state);
+        }
+    }
+
     pub(super) fn view_locked(
         &self,
         state: &State,
@@ -179,14 +324,18 @@ impl ProviderSessions for Mppi {
         let session = state
             .sessions
             .get(&sid)
-            .ok_or_else(|| not_ready("STATE_UNAVAILABLE", Some(sid), None))?;
-        if !session.history_available
-            || session
-                .runs
-                .values()
-                .any(|run| run.phase == RunPhase::Preparing)
+            .ok_or_else(|| super::recovery::missing(sid, "the session is not held"))?;
+        if !session.history_available {
+            return Err(
+                super::recovery::missing(sid, "the session's history is unavailable").into(),
+            );
+        }
+        if session
+            .runs
+            .values()
+            .any(|run| run.phase == RunPhase::Preparing)
         {
-            return Err(not_ready("STATE_UNAVAILABLE", Some(sid), None).into());
+            return Err(super::recovery::missing(sid, "a run is still preparing").into());
         }
         let snapshot = runtime.session_state_locked(&state, session, &[0; 32], true)?;
         let current = runtime.chain.snapshot()?;
@@ -319,6 +468,7 @@ impl Mppi {
                 .ok()
                 .map(|time| (snapshot, time))
         });
+        let accepted = runtime.chain.current();
         let interval = Duration::from_millis(runtime.config.settlement().interval_ms());
         let margin = Duration::from_millis(runtime.config.payment().collection_margin_ms())
             .checked_mul(2)
@@ -329,7 +479,12 @@ impl Mppi {
         }
         let mut due = Vec::new();
         for (sid, session) in &state.sessions {
-            if state.collecting.contains(sid) || session.close_result.is_some() {
+            if state.collecting.contains(sid)
+                || session.close_result.is_some()
+                || accepted
+                    .as_ref()
+                    .is_some_and(|snapshot| session.is_final(snapshot))
+            {
                 continue;
             }
             let timed = session.last_collection.elapsed() >= interval;
@@ -341,6 +496,12 @@ impl Mppi {
                     && operation.prepared.kind() == OperationKind::Close
                     && operation.result.state() == OperationState::Failed
                 {
+                    // A failed transaction does not invalidate close intent: a
+                    // close that never began, or was mined and reverted, is
+                    // prepared again at most once per interval.
+                    if timed {
+                        due.push((*sid, true));
+                    }
                     continue;
                 }
                 // Cooperative-close reconciliation continues independently of
@@ -449,140 +610,180 @@ impl Mppi {
         close: bool,
         batch: bool,
     ) -> IntegrationResult<OperationResult> {
+        let operation = if close {
+            "close"
+        } else if batch {
+            "settleBatch"
+        } else {
+            "settle"
+        };
+        let timing = Timing::new(&self.inner.observers, operation, Instant::now());
+        let result = self.collect_timed(ids, close, batch, &timing).await;
+        timing.finish(result.as_ref().ok().map(|result| result.state().as_str()));
+        result
+    }
+
+    async fn collect_timed(
+        &self,
+        ids: &[B256],
+        close: bool,
+        batch: bool,
+        timing: &Timing<'_>,
+    ) -> IntegrationResult<OperationResult> {
         let runtime = &self.inner;
         let _operations = runtime.operations.lock().await;
-        let (mut pending, submit, close_reference) = {
-            let mut state = runtime.lock()?;
-            if !state.started || state.stopping {
-                return Err(not_ready("CONTROL_NOT_READY", ids.first().copied(), None).into());
-            }
-            for sid in ids {
-                if !state.sessions.contains_key(sid) {
-                    return Err(not_ready("STATE_UNAVAILABLE", Some(*sid), None).into());
+        // The call a reverted close's successor last simulated, below.
+        let mut simulated = None;
+        let (mut pending, submit, close_reference) = 'collect: loop {
+            let next_close = 'locked: {
+                let mut state = runtime.lock()?;
+                if !state.started || state.stopping {
+                    return Err(not_ready("CONTROL_NOT_READY", ids.first().copied(), None).into());
                 }
-            }
-            if close {
-                let sid = ids[0];
-                let session = state.sessions.get_mut(&sid).expect("known session");
-                if session.close_result.is_some()
-                    && let Some(operation) = &session.operation
+                for sid in ids {
+                    if !state.sessions.contains_key(sid) {
+                        return Err(not_ready("STATE_UNAVAILABLE", Some(*sid), None).into());
+                    }
+                }
+                if close {
+                    let sid = ids[0];
+                    let session = state.sessions.get_mut(&sid).expect("known session");
+                    if session.close_result.is_some()
+                        && let Some(operation) = &session.operation
+                    {
+                        return Ok(operation.result.as_ref().clone());
+                    }
+                    if session.close_reference.is_none() {
+                        session.close_reference =
+                            Some(format!("close:{}", hex::encode(random_id()?.as_slice())));
+                    }
+                    // Close intent is accepted once: its runs stop and its owner is
+                    // told once (Drain). A later call, the agent's or maintenance's,
+                    // only continues the close.
+                    let accepted = !session.close_pending;
+                    session.close_pending = true;
+                    if accepted {
+                        runtime.stop_session_locked(&mut state, sid);
+                    }
+                } else {
+                    for sid in ids {
+                        if state.sessions[sid].close_pending {
+                            return Err(not_ready("CLOSE_PENDING", Some(*sid), None).into());
+                        }
+                    }
+                }
+                let close_reference = ids
+                    .first()
+                    .and_then(|sid| state.sessions[sid].close_reference.clone());
+                // One intersecting unresolved submission must be reconciled before
+                // any new calldata is prepared. This includes a larger old batch
+                // when the caller now requests only one of its sessions.
+                let previous = ids
+                    .iter()
+                    .find_map(|sid| {
+                        state.sessions[sid]
+                            .operation
+                            .as_ref()
+                            .filter(|op| unresolved(op, *sid))
+                    })
+                    .or_else(|| {
+                        ids.first()
+                            .and_then(|sid| state.sessions[sid].operation.as_ref())
+                    })
+                    .or_else(|| {
+                        ids.is_empty()
+                            .then_some(state.empty_batch.as_ref())
+                            .flatten()
+                    })
+                    .cloned();
+                // A close mined and reverted changed no state; it is prepared again
+                // under its successor reference, at most once per settlement
+                // interval, since each attempt is a transaction.
+                let retry = previous.as_ref().filter(|op| close && reverted(op));
+                if let Some(operation) = retry
+                    && state.sessions[&ids[0]].last_collection.elapsed()
+                        < Duration::from_millis(runtime.config.settlement().interval_ms())
                 {
                     return Ok(operation.result.as_ref().clone());
                 }
-                if session.close_reference.is_none() {
-                    session.close_reference =
-                        Some(format!("close:{}", hex::encode(random_id()?.as_slice())));
-                }
-                session.close_pending = true;
-                runtime.stop_session_locked(&mut state, sid);
-                runtime.changed.notify_waiters();
-            } else {
-                for sid in ids {
-                    if state.sessions[sid].close_pending {
-                        return Err(not_ready("CLOSE_PENDING", Some(*sid), None).into());
-                    }
-                }
-            }
-            let close_reference = ids
-                .first()
-                .and_then(|sid| state.sessions[sid].close_reference.clone());
-            // One intersecting unresolved submission must be reconciled before
-            // any new calldata is prepared. This includes a larger old batch
-            // when the caller now requests only one of its sessions.
-            let previous = ids
-                .iter()
-                .find_map(|sid| {
-                    state.sessions[sid]
-                        .operation
-                        .as_ref()
-                        .filter(|op| unresolved(op, *sid))
-                })
-                .or_else(|| {
-                    ids.first()
-                        .and_then(|sid| state.sessions[sid].operation.as_ref())
-                })
-                .or_else(|| {
-                    ids.is_empty()
-                        .then_some(state.empty_batch.as_ref())
-                        .flatten()
-                })
-                .cloned();
-            if let Some(operation) = previous.as_ref()
-                && operation.prepared.kind() == OperationKind::Close
-            {
-                // A close reference always identifies this exact call; even a
-                // terminal failure never licenses replacing its calldata.
-                if operation.result.state() == OperationState::Failed {
+                let close_reference = retry
+                    .map(|operation| successor(operation.result.operation_ref()))
+                    .or(close_reference);
+                if let Some(operation) = previous.as_ref()
+                    && operation.prepared.kind() == OperationKind::Close
+                    && operation.result.state() != OperationState::Failed
+                {
+                    // A close reference identifies its submitted call: continue it.
+                    break 'collect (operation.clone(), false, close_reference);
+                } else if let Some(operation) = previous.as_ref().filter(|op| {
+                    matches!(
+                        op.result.state(),
+                        OperationState::Pending | OperationState::Unknown
+                    ) && op.result.observation().is_none()
+                }) {
+                    break 'collect (operation.clone(), false, close_reference);
+                } else if ids.is_empty()
+                    && let Some(operation) = previous.as_ref().filter(|op| {
+                        op.result.observation().is_some()
+                            && op.result.state() != OperationState::Failed
+                    })
+                {
                     return Ok(operation.result.as_ref().clone());
-                }
-                (operation.clone(), false, close_reference)
-            } else if let Some(operation) = previous.as_ref().filter(|op| {
-                matches!(
-                    op.result.state(),
-                    OperationState::Pending | OperationState::Unknown
-                ) && op.result.observation().is_none()
-            }) {
-                (operation.clone(), false, close_reference)
-            } else if ids.is_empty()
-                && let Some(operation) = previous.as_ref().filter(|op| {
-                    op.result.observation().is_some() && op.result.state() != OperationState::Failed
-                })
-            {
-                return Ok(operation.result.as_ref().clone());
-            } else {
-                let snapshot = runtime.chain.snapshot()?;
-                if snapshot.pause_level() != PauseLevel::None {
-                    return Err(wire::payment_status(&PaymentFailure::new(
-                        PaymentCode::SessionNotReady,
-                        Some("CONTRACT_PAUSED".into()),
-                        ids.first().copied(),
-                        None,
-                        None,
-                        None,
-                        Some(snapshot.pause_level()),
-                    )?)
-                    .into());
-                }
-                let mut items = Vec::with_capacity(ids.len());
-                let mut units = BTreeMap::new();
-                for sid in ids {
-                    let session = &state.sessions[sid];
-                    if session.inconsistent || !session.history_available {
-                        return Err(not_ready("INCONSISTENT_STATE", Some(*sid), None).into());
+                } else {
+                    let snapshot = runtime.chain.snapshot()?;
+                    if snapshot.pause_level() != PauseLevel::None {
+                        return Err(wire::payment_status(&PaymentFailure::new(
+                            PaymentCode::SessionNotReady,
+                            Some("CONTRACT_PAUSED".into()),
+                            ids.first().copied(),
+                            None,
+                            None,
+                            None,
+                            Some(snapshot.pause_level()),
+                        )?)
+                        .into());
                     }
-                    if close && session.active().next().is_some() {
-                        return Ok(unknown(
-                            close_reference.as_deref().expect("close reference"),
-                        )?);
-                    }
-                    let observed = snapshot
-                        .sessions()
-                        .get(sid)
-                        .ok_or_else(|| not_ready("STATE_UNAVAILABLE", Some(*sid), None))?;
-                    if !observed.exists() {
-                        return Err(not_ready("STATE_UNAVAILABLE", Some(*sid), None).into());
-                    }
-                    if observed.status() == SessionStatus::Closed {
-                        return Err(not_ready("SESSION_CLOSED", Some(*sid), None).into());
-                    }
-                    #[cfg(test)]
-                    tests::before_timestamp(*sid);
-                    let expired = runtime
-                        .chain
-                        .estimated_timestamp_for_snapshot(&snapshot)
-                        .map_err(|_| not_ready("CHAIN_STATE_STALE", Some(*sid), None))?
-                        >= deadline(observed)
-                            .ok_or_else(|| not_ready("CLAIM_DEADLINE", Some(*sid), None))?;
-                    if !close && (expired || observed.status() != SessionStatus::Open) {
-                        return Err(not_ready("CLAIM_DEADLINE", Some(*sid), None).into());
-                    }
-                    let capture = if close && expired {
-                        observed.settled_cumulative()
-                    } else {
-                        session.usage()?.max(observed.settled_cumulative())
-                    };
-                    let (cumulative, signature) =
-                        if capture > observed.settled_cumulative() || !close {
+                    let mut items = Vec::with_capacity(ids.len());
+                    let mut units = BTreeMap::new();
+                    for sid in ids {
+                        let session = &state.sessions[sid];
+                        if session.inconsistent || !session.history_available {
+                            return Err(not_ready("INCONSISTENT_STATE", Some(*sid), None).into());
+                        }
+                        if close && session.active().next().is_some() {
+                            return Ok(unknown(
+                                close_reference.as_deref().expect("close reference"),
+                            )?);
+                        }
+                        let observed = snapshot
+                            .sessions()
+                            .get(sid)
+                            .ok_or_else(|| not_ready("STATE_UNAVAILABLE", Some(*sid), None))?;
+                        if !observed.exists() {
+                            return Err(not_ready("STATE_UNAVAILABLE", Some(*sid), None).into());
+                        }
+                        if observed.status() == SessionStatus::Closed {
+                            return Err(not_ready("SESSION_CLOSED", Some(*sid), None).into());
+                        }
+                        #[cfg(test)]
+                        tests::before_timestamp(*sid);
+                        let expired = runtime
+                            .chain
+                            .estimated_timestamp_for_snapshot(&snapshot)
+                            .map_err(|_| not_ready("CHAIN_STATE_STALE", Some(*sid), None))?
+                            >= deadline(observed)
+                                .ok_or_else(|| not_ready("CLAIM_DEADLINE", Some(*sid), None))?;
+                        if !close && (expired || observed.status() != SessionStatus::Open) {
+                            return Err(not_ready("CLAIM_DEADLINE", Some(*sid), None).into());
+                        }
+                        let capture = if close && expired {
+                            observed.settled_cumulative()
+                        } else {
+                            session.usage()?.max(observed.settled_cumulative())
+                        };
+                        let (cumulative, signature) = if capture > observed.settled_cumulative()
+                            || !close
+                        {
                             let voucher = session.voucher.as_ref().ok_or_else(|| {
                                 not_ready("AUTHORIZATION_REQUIRED", Some(*sid), None)
                             })?;
@@ -601,65 +802,101 @@ impl Mppi {
                         } else {
                             (capture, &[][..])
                         };
-                    items.push((session.opening.descriptor(), cumulative, capture, signature));
-                    units.insert(*sid, session.units()?);
-                }
-                if !close
-                    && let Some(operation) = previous.as_ref()
-                    && operation.prepared.session_ids() == ids
-                    && operation
-                        .prepared
-                        .amounts()
-                        .iter()
-                        .copied()
-                        .eq(items.iter().map(|i| i.2))
-                    && ids.iter().all(|sid| covered(operation, *sid))
-                {
-                    return Ok(operation.result.as_ref().clone());
-                }
-                let prepared = if close {
-                    let (descriptor, cumulative, capture, signature) = items[0];
-                    runtime
-                        .contract
-                        .close(descriptor, cumulative, capture, signature)?
-                } else if batch {
-                    runtime.contract.settle_batch(&items)?
-                } else {
-                    let (descriptor, cumulative, capture, signature) = items[0];
-                    runtime
-                        .contract
-                        .settle(descriptor, cumulative, capture, signature)?
-                };
-                if prepared.call().data().len() > wire::MAX_MESSAGE_BYTES {
-                    return Err(Status::resource_exhausted(
-                        "batch calldata exceeds resource limit",
-                    )
-                    .into());
-                }
-                let reference = if close {
-                    close_reference.clone().expect("close reference")
-                } else {
-                    format!("settle:{}", hex::encode(random_id()?.as_slice()))
-                };
-                let pending = PendingOperation {
-                    prepared: Arc::new(prepared),
-                    result: Arc::new(unknown(&reference)?),
-                    units: Arc::new(units),
-                };
-                // No await or external call may precede retention of this exact
-                // ordered intent, including duplicated session ids and targets.
-                if ids.is_empty() {
-                    state.empty_batch = Some(pending.clone());
-                } else {
-                    for sid in ids {
-                        let session = state.sessions.get_mut(sid).expect("known session");
-                        session.operation = Some(pending.clone());
-                        session.last_collection = Instant::now();
+                        items.push((session.opening.descriptor(), cumulative, capture, signature));
+                        units.insert(*sid, session.units()?);
                     }
+                    if !close
+                        && let Some(operation) = previous.as_ref()
+                        && operation.prepared.session_ids() == ids
+                        && operation
+                            .prepared
+                            .amounts()
+                            .iter()
+                            .copied()
+                            .eq(items.iter().map(|i| i.2))
+                        && ids.iter().all(|sid| covered(operation, *sid))
+                    {
+                        return Ok(operation.result.as_ref().clone());
+                    }
+                    let prepared = if close {
+                        let (descriptor, cumulative, capture, signature) = items[0];
+                        runtime
+                            .contract
+                            .close(descriptor, cumulative, capture, signature)?
+                    } else if batch {
+                        runtime.contract.settle_batch(&items)?
+                    } else {
+                        let (descriptor, cumulative, capture, signature) = items[0];
+                        runtime
+                            .contract
+                            .settle(descriptor, cumulative, capture, signature)?
+                    };
+                    // A call the wallet would refuse records no intent.
+                    if prepared.call().data().len()
+                        > wire::MAX_MESSAGE_BYTES.min(runtime.max_call_bytes)
+                    {
+                        return Err(Status::resource_exhausted(
+                            "batch calldata exceeds resource limit",
+                        )
+                        .into());
+                    }
+                    // A reverted close's successor is recorded and sent only as
+                    // the call last simulated, below.
+                    if retry.is_some() && simulated.as_ref() != Some(prepared.call()) {
+                        break 'locked prepared;
+                    }
+                    let reference = if close {
+                        close_reference.clone().expect("close reference")
+                    } else {
+                        format!("settle:{}", hex::encode(random_id()?.as_slice()))
+                    };
+                    let pending = PendingOperation {
+                        prepared: Arc::new(prepared),
+                        result: Arc::new(unknown(&reference)?),
+                        units: Arc::new(units),
+                    };
+                    // No await or external call may precede retention of this exact
+                    // ordered intent, including duplicated session ids and targets.
+                    if ids.is_empty() {
+                        state.empty_batch = Some(pending.clone());
+                    } else {
+                        state
+                            .references
+                            .entry(reference.clone())
+                            .or_insert_with(|| ids.iter().map(|sid| (*sid, None)).collect());
+                        for sid in ids {
+                            let session = state.sessions.get_mut(sid).expect("known session");
+                            session.operation = Some(pending.clone());
+                            session.last_collection = Instant::now();
+                            if close {
+                                // The close intent names its current reference.
+                                session.close_reference = Some(reference.clone());
+                            }
+                        }
+                    }
+                    state.unsubmitted_collection = Some(reference);
+                    break 'collect (pending, true, close_reference);
                 }
-                state.unsubmitted_collection = Some(reference);
-                (pending, true, close_reference)
+            };
+            // Simulated outside the lock, as a batch is. One that fails records
+            // no intent and sends nothing; the attempt counts toward the
+            // interval. One that passes is prepared again under the lock, with
+            // every check, and recorded only if it is still the simulated call.
+            if let Err(error) = timing
+                .part(
+                    Part::Chain,
+                    runtime
+                        .reader
+                        .simulate(&next_close, runtime.wallet.address()),
+                )
+                .await
+            {
+                if let Some(session) = runtime.lock()?.sessions.get_mut(&ids[0]) {
+                    session.last_collection = Instant::now();
+                }
+                return Err(error.into());
             }
+            simulated = Some(next_close.call().clone());
         };
 
         let _unsubmitted = submit.then(|| UnsubmittedCollection {
@@ -667,15 +904,21 @@ impl Mppi {
             reference: pending.result.operation_ref().to_owned(),
         });
         if submit && pending.prepared.kind() == OperationKind::SettleBatch {
-            runtime
-                .reader
-                .simulate(&pending.prepared, runtime.wallet.address())
+            timing
+                .part(
+                    Part::Chain,
+                    runtime
+                        .reader
+                        .simulate(&pending.prepared, runtime.wallet.address()),
+                )
                 .await?;
         }
         #[cfg(test)]
         if let Some(sid) = ids.first() {
             tests::before_submit(*sid).await;
         }
+        // Whether the wallet is asked here: a confirmed result is kept as is.
+        let asked = submit || pending.result.state() != OperationState::Confirmed;
         let incoming = if submit {
             {
                 let mut state = runtime.lock()?;
@@ -690,37 +933,61 @@ impl Mppi {
                 // the intent Unknown even if cancellation interrupts its result.
                 state.unsubmitted_collection = None;
             }
-            submit_wallet_operation(
-                runtime.wallet.as_ref(),
-                &pending.prepared,
-                pending.result.operation_ref(),
-                &runtime.reader,
-            )
-            .await?
+            timing
+                .part(
+                    Part::Wallet,
+                    submit_wallet_operation(
+                        runtime.wallet.as_ref(),
+                        &pending.prepared,
+                        pending.result.operation_ref(),
+                        &runtime.reader,
+                    ),
+                )
+                .await?
         } else if pending.result.state() == OperationState::Confirmed {
             pending.result.as_ref().clone()
         } else {
-            reconcile_wallet_operation(
-                runtime.wallet.as_ref(),
-                &pending.prepared,
-                pending.result.operation_ref(),
-                &runtime.reader,
-            )
-            .await?
+            timing
+                .part(
+                    Part::Wallet,
+                    reconcile_wallet_operation(
+                        runtime.wallet.as_ref(),
+                        &pending.prepared,
+                        pending.result.operation_ref(),
+                        &runtime.reader,
+                    ),
+                )
+                .await?
         };
-        let (mut result, _) = retained_identity(&pending.result, incoming)?;
+        let (mut result, _) = retained_identity(&pending.result, incoming.clone())?;
+        if asked {
+            // A record kept against an answer that disagrees with it is
+            // handed to retire only through the wallet check
+            // (`State::unconfirmed`); an answer that matches clears it.
+            let mut state = runtime.lock()?;
+            let reference = result.operation_ref();
+            if super::recovery::agrees(&result, &incoming) {
+                state.unconfirmed.remove(reference);
+            } else if state.references.contains_key(reference) {
+                state
+                    .unconfirmed
+                    .insert(reference.to_owned(), result.clone());
+            }
+        }
         // No suspension between returned wallet handles and their retention on
         // every session. Cancellation during chain I/O preserves both handles.
         pending.result = Arc::new(result.clone());
         runtime.retain_collection(&pending)?;
         if result.state() != OperationState::Confirmed && result.tx_hash().is_some() {
-            result = runtime
-                .reader
-                .reconcile(
-                    &pending.prepared,
-                    result.operation_ref(),
-                    result.tx_hash(),
-                    result.wallet_operation_id(),
+            result = timing
+                .part(
+                    Part::Chain,
+                    runtime.reader.reconcile(
+                        &pending.prepared,
+                        result.operation_ref(),
+                        result.tx_hash(),
+                        result.wallet_operation_id(),
+                    ),
                 )
                 .await?;
         }
@@ -738,9 +1005,13 @@ impl Mppi {
             && result.state() == OperationState::Confirmed
         {
             if let Some(tx) = result.tx_hash() {
-                runtime
-                    .reader
-                    .closing(tx, pending.prepared.session_ids()[0])
+                timing
+                    .part(
+                        Part::Chain,
+                        runtime
+                            .reader
+                            .closing(tx, pending.prepared.session_ids()[0]),
+                    )
                     .await
                     .ok()
             } else {
@@ -750,7 +1021,7 @@ impl Mppi {
             None
         };
         // A refresh outage neither erases evidence nor invents another operation.
-        let _ = runtime.chain.refresh().await;
+        let _ = timing.part(Part::Chain, runtime.chain.refresh()).await;
         if let Some(closing) = closing {
             let sid = pending.prepared.session_ids()[0];
             let mut state = runtime.lock()?;
@@ -774,7 +1045,6 @@ impl Mppi {
                 );
             }
         }
-        runtime.changed.notify_waiters();
         if close && pending.prepared.kind() != OperationKind::Close {
             return Ok(unknown(
                 close_reference.as_deref().expect("close reference"),
@@ -805,7 +1075,6 @@ impl Runtime {
         {
             state.empty_batch = None;
         }
-        self.changed.notify_waiters();
     }
 
     fn retain_collection(&self, pending: &PendingOperation) -> Result<(), Status> {
@@ -841,7 +1110,50 @@ impl Runtime {
                 session.baseline = Some(pending.clone());
             }
         }
+        if pending.result.state() == OperationState::Confirmed {
+            self.supersede_locked(&mut state, pending);
+        }
         Ok(())
+    }
+
+    /// A confirmed collection supersedes, for each session it covers, every
+    /// other reference that session's checkpoint no longer names (neither its
+    /// operation nor its baseline): a checkpoint taken before then may still
+    /// present one, for `closed_retention` (the age rule, docs/rust-runtime.md).
+    fn supersede_locked(&self, state: &mut State, pending: &PendingOperation) {
+        let at = SystemTime::now() + self.limits.closed_retention;
+        let confirmed = pending.result.operation_ref();
+        let ids = pending
+            .prepared
+            .session_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let State {
+            sessions,
+            references,
+            ..
+        } = &mut *state;
+        for (reference, covered) in references.iter_mut() {
+            if reference == confirmed {
+                continue;
+            }
+            for (sid, since) in covered.iter_mut() {
+                let named = |operation: &Option<PendingOperation>| {
+                    operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.result.operation_ref() == reference)
+                };
+                if since.is_none()
+                    && ids.contains(sid)
+                    && sessions
+                        .get(sid)
+                        .is_some_and(|held| !named(&held.operation) && !named(&held.baseline))
+                {
+                    *since = Some(at);
+                }
+            }
+        }
+        hand_over(state);
     }
 }
 
@@ -914,6 +1226,8 @@ mod tests {
         lookups: AtomicU64,
         return_hash: AtomicBool,
         block_execute: AtomicBool,
+        not_submitted: AtomicBool,
+        lose_result: AtomicBool,
         entered: Notify,
     }
     #[tonic::async_trait]
@@ -930,6 +1244,24 @@ mod tests {
             self.entered.notify_one();
             if self.block_execute.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
+            }
+            if self.not_submitted.load(Ordering::SeqCst) {
+                // The adapter's own record proves nothing reached the wallet.
+                return Ok(OperationResult::new(
+                    reference,
+                    OperationState::Failed,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )
+                .unwrap());
+            }
+            if self.lose_result.load(Ordering::SeqCst) {
+                return Ok(unknown(reference)
+                    .unwrap()
+                    .with_cause("Unavailable (TIMEOUT)")
+                    .unwrap());
             }
             Ok(OperationResult::new(
                 reference,
@@ -1153,6 +1485,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unresolved_settlement_keeps_the_wallet_cause() {
+        let wallet = Arc::new(Wallet::default());
+        wallet.lose_result.store(true, Ordering::SeqCst);
+        let fixture = paid_fixture(wallet.clone(), Arc::new(ReceiptProbe::default())).await;
+        let result = fixture.provider.settle(fixture.sid).await.unwrap();
+        assert_eq!(result.state(), OperationState::Unknown);
+        assert_eq!(result.cause(), Some("Unavailable (TIMEOUT)"));
+        let retained = fixture.provider.checkpoint(fixture.sid).await.unwrap();
+        assert_eq!(
+            retained.operation.unwrap().result.cause(),
+            Some("Unavailable (TIMEOUT)")
+        );
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn shutdown_fences_public_collection_paused_before_wallet_submission() {
         let _scope = HookScope;
         let wallet = Arc::new(Wallet::default());
@@ -1309,6 +1657,145 @@ mod tests {
             fixture.provider.collections_due().unwrap(),
             vec![(fixture.sid, true)]
         );
+    }
+
+    /// Drain messages queued for the fixture's owner since the last call.
+    async fn drains(fixture: &Fixture) -> usize {
+        let queue = fixture.provider.inner.lock().unwrap().attachments[&1]
+            .queue
+            .clone();
+        let mut drains = 0;
+        while queue.buffered().unwrap().0 > 0 {
+            let message =
+                proto::ControlMessage::decode(queue.get().await.unwrap().as_slice()).unwrap();
+            drains += usize::from(matches!(
+                message.kind,
+                Some(proto::control_message::Kind::Drain(_))
+            ));
+        }
+        drains
+    }
+
+    #[tokio::test]
+    async fn a_submitted_close_is_reconciled_every_pass_and_drains_its_owner_once() {
+        let wallet = Arc::new(Wallet::default());
+        let fixture = Fixture::with_wallet(1000, wallet.clone(), |rpc| rpc).await;
+        let initial = fixture.provider.close(fixture.sid).await.unwrap();
+        assert_eq!(initial.state(), OperationState::Pending);
+        assert_eq!(drains(&fixture).await, 1);
+        for _ in 0..3 {
+            fixture.provider.inner.maintain_once();
+            while !fixture.provider.inner.lock().unwrap().collecting.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }
+        fixture.provider.close(fixture.sid).await.unwrap();
+        // Each pass and the repeated call reconciled it, with no new Drain.
+        assert_eq!(wallet.lookups.load(Ordering::SeqCst), 4);
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(drains(&fixture).await, 0, "a close drained its owner again");
+    }
+
+    /// A runtime restarted over the same chain, wallet and configuration,
+    /// holding the fixture's session from its checkpoint.
+    async fn restored(fixture: &Fixture) -> Mppi {
+        let evidence = fixture.provider.checkpoint(fixture.sid).await.unwrap();
+        let source = &fixture.provider.inner;
+        let provider = Mppi::new(
+            source.config.clone(),
+            source.chain.clone(),
+            source.contract.clone(),
+            source.wallet.clone(),
+            source.coverage.clone(),
+            source.execution.clone(),
+        )
+        .unwrap();
+        {
+            let mut state = provider.inner.lock().unwrap();
+            state.started = true;
+            state.start_block = Some(100);
+        }
+        provider.recover(evidence).await.unwrap();
+        provider
+    }
+
+    /// Restored, a close that never began was Unknown (chain reconciliation
+    /// of no transaction) and never prepared again.
+    #[tokio::test]
+    async fn a_restored_close_that_never_began_is_prepared_again_under_its_reference() {
+        let wallet = Arc::new(Wallet::default());
+        wallet.not_submitted.store(true, Ordering::SeqCst);
+        let fixture = Fixture::with_wallet(1000, wallet.clone(), |rpc| rpc).await;
+        let first = fixture.provider.close(fixture.sid).await.unwrap();
+        assert_eq!(first.state(), OperationState::Failed);
+        assert!(first.tx_hash().is_none());
+        let provider = restored(&fixture).await;
+        let retained = provider.inner.lock().unwrap().sessions[&fixture.sid]
+            .operation
+            .clone()
+            .unwrap();
+        assert_eq!(retained.result.state(), OperationState::Failed);
+        wallet.not_submitted.store(false, Ordering::SeqCst);
+        let again = provider.close(fixture.sid).await.unwrap();
+        assert_eq!(again.operation_ref(), first.operation_ref());
+        assert_eq!(again.state(), OperationState::Pending);
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 2);
+    }
+
+    /// Restored, a settlement that never began stranded its session, only
+    /// ever reconciled.
+    #[tokio::test]
+    async fn a_restored_settlement_that_never_began_is_replaced_at_the_next_collection() {
+        let wallet = Arc::new(Wallet::default());
+        wallet.not_submitted.store(true, Ordering::SeqCst);
+        let fixture = paid_fixture(wallet.clone(), Arc::new(ReceiptProbe::default())).await;
+        let first = fixture.provider.settle(fixture.sid).await.unwrap();
+        assert_eq!(first.state(), OperationState::Failed);
+        let provider = restored(&fixture).await;
+        wallet.not_submitted.store(false, Ordering::SeqCst);
+        let again = provider.settle(fixture.sid).await.unwrap();
+        assert_ne!(again.operation_ref(), first.operation_ref());
+        assert_eq!(again.state(), OperationState::Pending);
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 2);
+        // Nothing was read from the wallet for the call that never began.
+        assert_eq!(wallet.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_close_that_never_began_is_prepared_again_under_its_reference() {
+        let wallet = Arc::new(Wallet::default());
+        wallet.not_submitted.store(true, Ordering::SeqCst);
+        let fixture = Fixture::with_wallet(1000, wallet.clone(), |rpc| rpc).await;
+        let first = fixture.provider.close(fixture.sid).await.unwrap();
+        assert_eq!(first.state(), OperationState::Failed);
+        assert!(first.tx_hash().is_none());
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 1);
+        // Maintenance prepares it again once per settlement interval, so a
+        // failure that repeats never spins the wallet.
+        assert!(fixture.provider.collections_due().unwrap().is_empty());
+        let interval =
+            Duration::from_millis(fixture.provider.inner.config.settlement().interval_ms());
+        fixture
+            .provider
+            .inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&fixture.sid)
+            .unwrap()
+            .last_collection = Instant::now().checked_sub(interval).unwrap();
+        assert_eq!(
+            fixture.provider.collections_due().unwrap(),
+            vec![(fixture.sid, true)]
+        );
+        fixture.provider.collection_finished(fixture.sid);
+        // The close intent survives the failure; the same reference continues it.
+        wallet.not_submitted.store(false, Ordering::SeqCst);
+        let second = fixture.provider.close(fixture.sid).await.unwrap();
+        assert_eq!(second.operation_ref(), first.operation_ref());
+        assert_eq!(second.state(), OperationState::Pending);
+        assert_eq!(wallet.executions.load(Ordering::SeqCst), 2);
+        assert!(fixture.provider.inner.lock().unwrap().sessions[&fixture.sid].close_pending);
     }
 
     #[tokio::test]

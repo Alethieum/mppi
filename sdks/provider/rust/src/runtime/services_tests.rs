@@ -181,7 +181,6 @@ async fn failed_initial_challenge_retains_no_attachment_or_identifier() {
         let runtime = Arc::get_mut(&mut fixture.provider.inner).unwrap();
         runtime.limits = RuntimeLimits::new(
             1,
-            1,
             WireLimits::new(
                 wire::MAX_MESSAGE_BYTES,
                 1,
@@ -287,7 +286,10 @@ async fn sufficient_voucher_after_authorization_deadline_never_dispatches() {
     // leaving this unspawned service future unpolled until the voucher is set.
     tokio::time::advance(Duration::from_millis(10_001)).await;
     fixture.voucher(1);
-    fixture.provider.inner.changed.notify_waiters();
+    {
+        let state = fixture.provider.inner.lock().unwrap();
+        fixture.provider.inner.wake_locked(&state, fixture.sid);
+    }
     let error = match future.await {
         Err(error) => error,
         Ok(_) => panic!("expired authorization wait granted paid execution"),
@@ -414,8 +416,8 @@ async fn concurrent_runs_are_admitted_in_the_order_they_first_waited_under_stead
                                 })),
                             });
                         }
+                        provider.inner.wake_locked(&state, sid);
                     }
-                    provider.inner.changed.notify_waiters();
                 });
             }
         })
@@ -536,4 +538,95 @@ async fn control_loss_ends_every_run_waiting_in_the_queue_at_once() {
             .values()
             .all(|run| run.waiting().is_none())
     );
+}
+
+/// Asks for more coverage than the deposit holds, or none, then fails with a
+/// host error of its own, as a host whose renewal was refused does.
+struct RefusedRenewal(bool);
+struct Failing(
+    Option<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::interfaces::IntegrationError> + Send>,
+        >,
+    >,
+);
+impl futures_core::Stream for Failing {
+    type Item = IntegrationResult<Vec<u8>>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let Some(failure) = self.0.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        let error = std::task::ready!(failure.as_mut().poll(cx));
+        self.0 = None;
+        std::task::Poll::Ready(Some(Err(error)))
+    }
+}
+#[tonic::async_trait]
+impl CoverageProvider for RefusedRenewal {
+    async fn coverage(
+        &self,
+        _: &PreparedRequest,
+        _: &RunContext,
+    ) -> IntegrationResult<TokenCounts> {
+        Ok(counts(1000))
+    }
+}
+impl ExecutionProvider for RefusedRenewal {
+    fn execute(
+        &self,
+        _: PreparedRequest,
+        context: RunContext,
+        runs: Arc<dyn ProviderRuns>,
+        _: CancellationToken,
+    ) -> ExecutionStream {
+        let renew = self.0;
+        Box::pin(Failing(Some(Box::pin(async move {
+            if renew {
+                // 1,000,000 output tokens at 700 per million is 700 > the 100 deposit.
+                let renewal = runs.require_coverage(&context, counts(1_000_000)).await;
+                assert!(!renewal.unwrap().granted());
+            }
+            Box::new(std::io::Error::other("host stream failed"))
+                as crate::interfaces::IntegrationError
+        }))))
+    }
+}
+
+#[tokio::test]
+async fn a_host_error_after_a_refused_renewal_ends_the_run_with_that_refusal() {
+    use futures_core::Stream;
+    use proto::chat_server::Chat;
+    use std::future::poll_fn;
+    for (renew, expected) in [
+        (true, PaymentCode::InsufficientDeposit),
+        (false, PaymentCode::SessionNotReady),
+    ] {
+        let mut fixture = Fixture::new(700).await;
+        {
+            let runtime = Arc::get_mut(&mut fixture.provider.inner).unwrap();
+            runtime.coverage = Arc::new(RefusedRenewal(renew));
+            runtime.execution = Arc::new(RefusedRenewal(renew));
+        }
+        fixture.voucher(1);
+        let mut output = fixture
+            .provider
+            .completions(tonic::Request::new(fixture.request(1)))
+            .await
+            .unwrap()
+            .into_inner();
+        let status = poll_fn(|cx| std::pin::Pin::new(&mut output).poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let failure = wire::parse_payment_error(&status).unwrap().unwrap();
+        assert_eq!(failure.code(), expected);
+        if !renew {
+            // An arbitrary host error stays sanitized.
+            assert_eq!(failure.reason(), Some("STATE_UNAVAILABLE"));
+        }
+        assert_eq!(failure.run_id(), Some(hash(1)));
+    }
 }

@@ -1,8 +1,8 @@
 # Python SDK interfaces
 
-The two role packages are **`mppi-agent`** version `0.1.5` and
-**`mppi-provider`** version `0.1.2`, requiring Python 3.12 or newer. They share
-support distribution `mppi-protocol` (`0.1.3` and `0.1.1` respectively),
+The two role packages are **`mppi-agent`** version `0.1.6` and
+**`mppi-provider`** version `0.2.0`, requiring Python 3.12 or newer. They share
+support distribution `mppi-protocol` `0.1.4`,
 containing generated wire bindings, exact payment primitives
 and the Circle Agent Wallet adapter.
 The support library is not an additional role SDK.
@@ -130,7 +130,8 @@ pending operations. It does not close escrow, stop a caller-owned server or infe
 that a job terminated. `Mppi` implements this resource lifetime.
 
 `AgentSessions` defines synchronous `open`, `topUp`, `close`, `requestClose`,
-`withdraw`, `releaseIdle`, `recover`, `reconcile`, `get` and `list`. Opening carries the explicit funding
+`withdraw`, `releaseIdle`, `recover`, `reconcile`, `get`, `list`, `terms` and
+`run`. Opening carries the explicit funding
 choice. `topUp` accepts integer six-decimal USDC base units. `list` covers known
 sessions, uses an opaque cursor and a checked limit from 1 through 1,000. The
 network `Client` owns its I/O loop and exposes this interface for its selected
@@ -155,7 +156,14 @@ caused an event. Entirely silent batches remain unresolved.
 `checkpoint` returns `RecoveryEvidence`, including `RecoveryRun` and
 `RecoveryOperation` records. `recover` requires complete provider-supplied
 history and rechecks canonical evidence; it never establishes readiness by
-trusting a saved ready flag. A new authenticated Control attachment and resolved
+trusting a saved ready flag. `RecoveryEvidence.is_final()` (Rust `is_final()`)
+reports evidence of a closed session with no reservation and no unresolved
+operation that is not inconsistent; `recover` refuses it `SESSION_CLOSED` once
+the chain shows the session closed, and hands to retirement each operation
+reference it names that the wallet's own record agrees with, so a host passes
+such records at startup rather than skipping them. A runtime retires such a
+session after its retention window and never
+reinstalls it. A new authenticated Control attachment and resolved
 prior execution are required. The provider chooses how to retain this evidence.
 Restored transaction hashes must match read-only wallet reconciliation of their
 original operation references before their chain outcomes are accepted. An
@@ -167,7 +175,7 @@ state or submitting another transaction.
 `SessionSigner` declares the four fixed-key MPPI signing capabilities: Voucher,
 RunAuth, CloseAuth and ReconnectAuth. `FundingWallet` separately declares USDC
 authorization signing and wallet execution/reconciliation; any wallet provider
-fits behind it ([adapter contract](python-onboarding.md#funding-wallet-adapters)).
+fits behind it ([wallet requirements](#wallet-requirements)).
 Funding requires the agent's ERC-8004 id. Before submitting an opening, the
 agent checks the registry binds that id to the wallet and checks the signature
 as USDC will. `FundingAuthorization`
@@ -185,6 +193,209 @@ not-ready and cannot imply permission to run.
 Constructing a record does not verify signatures, finality, deployed identity,
 current ownership, freshness, transaction success or payment eligibility. Those
 checks belong to the runtime and must be demonstrated before paid operation.
+
+## Wallet requirements
+
+Circle Agent Wallet is the recommended wallet, and both SDKs include an adapter
+for it. Any other wallet, such as MetaMask, Coinbase or Privy, works behind a
+thin adapter that meets the requirements below: the agent's `FundingWallet` and
+the provider's `TransactionWallet`, in Python
+[`mppi_protocol.capabilities`](../proto/python/src/mppi_protocol/capabilities.py)
+and in Rust [`capabilities`](../sdks/provider/rust/src/capabilities.rs). The
+agent and both provider runtimes assume nothing else of a wallet. What the
+Circle adapter does beyond them, such as its CLI check and its journal, is
+documented as the Circle adapter's
+([Python](python-onboarding.md#circle-agent-wallet-adapter),
+[Rust](rust-cli.md#local-records-and-results)). MPPI accepts any wallet that
+meets them, whatever its implementation or version; the Circle adapter alone
+drives the Circle CLI's exact command line, so it accepts only the verified
+`@circle-fin/cli` 1.1.4 and refuses any other version before anything is sent.
+
+**Address.** `address` is the account that sends every call: the agent's
+funding wallet, or the provider's configured operator. It does not change,
+and reading it must not block or fail: the runtimes and the agent read it
+synchronously, in Python on the event loop.
+
+**Operation references.**
+
+- `execute(call, operation_ref)` binds the reference durably to exactly that
+  call (from `address`, with its chain, destination and calldata, and zero
+  native value) before anything can reach the wallet's service, then sends it
+  once. The binding lasts until `retire` lets it go. A wallet whose records are
+  full refuses new calls as not submitted; it never forgets a binding to make
+  room.
+- The same reference with the same call is the same submission: answer as
+  `reconcile` does and send nothing. With another call, refuse it as an error,
+  which leaves the result `UNKNOWN`, never as not submitted: the first call may
+  have been sent.
+- A new reference is a new submission, even of a call identical to an earlier
+  one. The agent sends a failed exit again under `<reference>.1`, `.2`, and a
+  failed opening or top-up under a new reference with the same authorization;
+  a provider sends a reverted close again under `close:<id>.1`, `.2`, and each
+  settlement under a new reference. A wallet that matched calls across
+  references would hand back the earlier transaction.
+- After a not-submitted result (below), the reference binds nothing: a later
+  `execute` of it, with that call or another, is a new submission. A provider
+  continues such a close under its own reference.
+
+**Results.** `execute` and `reconcile` return an `OperationResult` for the
+reference they were given; one naming another reference is never its answer
+(it counts as `UNKNOWN` with no identifiers, and a recovery's lookup refuses
+it). A wallet's state is never chain evidence:
+
+- With a transaction hash, the runtimes and the agent read that transaction's
+  receipt and MPPI events, whatever state the wallet reported. The hash is the Arc
+  transaction that carries the call: for a smart account or a bundler, the
+  outer transaction.
+- Without one, `FAILED` asserts that the wallet's own durable record proves
+  nothing under the reference reached its service, so the call may be sent
+  again. Nothing else is `FAILED`: not a failure after the call may have
+  reached the service, and not a reference forgotten after `retire`.
+  `PENDING` with a wallet operation id stays pending; anything else is
+  `UNKNOWN`.
+- From `execute`, a Python adapter may instead raise `NotSubmittedError`, or a
+  subclass, with that same proof; any other exception is `UNKNOWN`. Rust has no
+  such error: return the `Failed` result, whose cause by convention begins
+  `NotSubmittedError`; an `Err(WalletError)` is `Unknown`. Return identifiers
+  the wallet knows in an `UNKNOWN` result rather than an error, so they are
+  kept.
+- `wallet_operation_id`, when present, is a nonempty string of at most 256
+  characters (onboarding refuses a longer one). `cause`, when present, is the
+  adapter's own short reason, never text from its service: the agent passes an
+  `execute`'s to `on_error`, and both roles keep it with the result.
+
+**`reconcile`** reports the wallet's record of the reference and never sends;
+for a reference it holds no binding for, it answers `UNKNOWN`.
+
+- It never contradicts an earlier answer: a transaction hash and a wallet
+  operation id, once reported, are reported again unchanged, after a restart
+  too, until `retire` lets the binding go, and a reference reported not
+  submitted shows no transaction later unless a later `execute` of it sent one.
+  The agent refuses an answer that changes them; a provider keeps the first and
+  asks the wallet again before handing the reference to `retire`. The Circle
+  adapter falls short of this in two cases: an answer its journal could not
+  take lives only in its memory until its next journal step, so a restart
+  before then loses it ([Python runtime](python-runtime.md),
+  [Rust runtime](rust-runtime.md)); and one a damaged journal contradicts is
+  dropped at that step, so a later `reconcile` reports the journal's record.
+- A provider refuses to recover a checkpoint holding a transaction hash unless
+  the wallet's answer for its reference names that hash, and the checkpoint's
+  wallet operation id when it names one: keep both in the durable record.
+- It withdraws any time `retire` gave the reference. A provider recovering an
+  older checkpoint looks up each saved transaction again, and hands the
+  reference to `retire` again once no session needs it.
+
+**Without a transaction hash.** A result has none before the service names a
+transaction, when its answer was lost, or when nothing was sent. Unless it is
+`FAILED`, the runtimes and the agent keep the operation unresolved, never send
+it again, and reconcile it:
+
+- a provider reconciles it before preparing another collection for its
+  sessions, and asks the wallet about one it restored without a hash, or kept
+  against an answer that disagreed, before handing it to `retire`;
+- the agent finds an uncertain opening by its `SessionOpened` log, treats an
+  opening or top-up whose authorization expired unused as `FAILED`, and asks
+  the wallet about its own exit before deciding whose close closed its session.
+
+**Funding (agent).**
+
+- `sign_funding_authorization(authorization)` returns 1 to 65,536 bytes that
+  USDC accepts for exactly that authorization from `address`: an ECDSA
+  signature for an account without code, or bytes its ERC-1271
+  `isValidSignature` approves. The agent checks them before submitting an
+  opening. A smart account must have code when it funds.
+- A wallet whose service creates the signature as it executes declares
+  `signs_at_execute = True` (exactly `True`): `sign_funding_authorization`
+  returns a placeholder, and `execute` replaces it with the real signature
+  before sending. The agent then checks only that the registry binds its id to
+  `address`; USDC checks the real signature on chain. The placeholder is still
+  1 to 65,536 bytes, and the binding is to the call as given, placeholder
+  included: `execute` sends it with only the signature replaced.
+
+**`retire` (optional).** Python `retire(*, operation_refs, at)`, with `at` in
+Unix seconds; Rust `retire(&self, operation_refs: &[String], at: SystemTime)`.
+
+- From `at` on, the wallet may forget the bindings of `operation_refs`; none is
+  presented again. A wallet that forgets keeps the earliest `at` given for each
+  as durably as the binding, so a restart before `at` loses nothing, and a
+  `reconcile` withdraws it.
+- A wallet clears a reference's retirement time whenever its record of that
+  reference gains a transaction hash, as a `reconcile` does; the binding then
+  stays until `retire` names it again. A provider may hand over a reference
+  with no hash, and asks about one it restores without a hash from an older
+  checkpoint only at its next reconcile: a binding forgotten as soon as its
+  hash arrived would leave that reconcile `UNKNOWN`, with no hash to read on
+  chain. The Circle adapter meets this by construction: only an `execute` or
+  `reconcile` of a reference records its hash, an `execute` on the record it
+  has just created and a `reconcile` after withdrawing the retirement time, or
+  an answer of theirs it kept in memory, written at the start of a later
+  journal step before that step marks anything.
+- It keeps any binding whose call may have reached its service without a
+  transaction to show for it.
+- The agent passes the references of a session it retired, once its
+  checkpoint no longer names them, and only those its own record holds a
+  transaction hash for; that hash may come from the chain, as for an opening
+  found by its log, rather than from the wallet; it may pass none at all. A
+  provider may pass one with no hash: one whose call never began, or whose
+  record and the wallet's latest answer both name none.
+- An error refuses the call: a provider tries again at least one settlement
+  interval later; the agent reports `HookError("retire", ...)` to `on_error`
+  and goes on, leaving the records.
+- A provider makes one call at a time, outside its locks, for each whole
+  second its references fall due in, with the latest `at` of that second:
+  never before a reference is due.
+- Without it, the default, the wallet keeps every binding, which is always
+  safe; its records then grow with every operation.
+
+**`near_capacity` and `max_call_bytes` (optional, provider).**
+
+- `near_capacity` is true while the wallet's records are near the bound past
+  which it refuses new calls as not submitted. A provider reads it on every
+  maintenance pass, so it must not block, and reports each rise to `on_error`
+  as a `HookError` with operation `"wallet"`. In Python it is a property, read
+  on the event loop, and only `True` itself counts. The default is never.
+- `max_call_bytes` is the largest calldata the wallet accepts in one call, in
+  Python an `int` attribute: at least 452, one settlement call, read once when
+  the runtime is built. Each batch the runtime builds fits it, and a larger `settleBatch` is
+  refused before any intent is recorded. The default, 61,440, is the Circle
+  adapter's bound; a wallet with a smaller limit, or a gas limit, states its
+  own.
+
+**Concurrency and time.**
+
+- The runtimes and the agent may call `execute` and `reconcile` at once, from
+  several threads in Python and several tasks in Rust, for different
+  references or the same one: a provider's recovery reads before taking the
+  runtime's locks, maintenance asks about references it hands over, and an
+  agent's `execute` that outlived its wait goes on while a later `reconcile`
+  runs. A wallet serializes access to its own records; a `reconcile` of a
+  reference whose `execute` has not returned answers from the binding that
+  `execute` saved, never `FAILED`.
+- A Rust runtime may drop any wallet future before it completes, as at
+  shutdown: `execute`, `reconcile` or `retire`, each of which must leave the
+  wallet's records consistent. The binding saved before anything was sent
+  keeps an `execute`'s reference reconcilable; the Circle adapter finishes the
+  call on a task of its own, so its answer is still recorded.
+- The agent waits at most its `timeout_ms` for each wallet call: 10 seconds by
+  default, 300 with the built-in Circle setup. An `execute` still running then
+  leaves its operation `UNKNOWN`, to be reconciled; a signature that has not
+  returned refuses that funding, with nothing sent; a `reconcile` reads
+  `UNKNOWN`; and a `retire` is reported to `on_error`. Choose a timeout longer than the wallet's
+  usual execute.
+- `execute`, `reconcile` and `sign_funding_authorization` must return in
+  bounded time. The provider runtimes do not bound them: each collection makes
+  its wallet call under the runtime's operations lock, so a call that never
+  returns stalls every collection after it. The agent stops waiting at its
+  `timeout_ms`, as above. The Circle adapter stops each read command, such as
+  a page of the transaction list a `reconcile` reads, at its CLI timeout (240
+  seconds by default). It deliberately sets no limit on `wallet execute` or
+  `wallet sign`: stopping one could lose the answer to a call Circle may
+  already have accepted, so it waits for the CLI to finish. MPPI does not rely
+  on the CLI's own limits; with Circle CLI 1.1.4 (verified) each request to
+  Circle times out after 30 seconds, and `wallet execute` stops waiting for its
+  challenge after about 60 seconds and for its transaction after about 120;
+  `wallet sign` does not poll. Other CLI versions may differ, and the adapter
+  accepts only the verified 1.1.4 today.
 
 ## Conformance and remaining work
 

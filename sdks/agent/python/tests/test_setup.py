@@ -298,12 +298,14 @@ def test_builtin_follower_allows_read_latency_but_same_head_still_expires(
         def _blocks(self, numbers):
             return [self.block(number) for number in numbers]
 
-        def _observe_at(self, number, block_hash, *, providers=(), sessions=(), recheck=None):
+        def _observe_at(
+            self, number, block_hash, *, providers=(), sessions=(), recheck=None, funding=None
+        ):
             block = self.block(number)
-            assert block.observation.block_hash == block_hash
+            assert block.observation.block_hash == block_hash and funding is None
             self.verify_deployment(block)
             again = self.block(recheck) if recheck is not None else None
-            return block, again, self.pause_level(block), {}, {}
+            return block, again, self.pause_level(block), {}, {}, None
 
     def follower(reader, **options):
         return ChainFollower(

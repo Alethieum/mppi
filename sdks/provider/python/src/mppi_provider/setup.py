@@ -14,6 +14,7 @@ import re
 from importlib.resources import files
 from pathlib import Path
 
+from mppi_protocol.capabilities import TransactionWallet
 from mppi_protocol.chain import ChainReader, DeploymentProfile, HttpJsonRpc
 from mppi_protocol.circle import CircleAgentWallet
 from mppi_protocol.contract import ARC_USDC, ContractCalls, _decode_exact, _hash
@@ -61,9 +62,10 @@ def _rpc(config: ProviderConfig, rpc_env: str | None) -> HttpJsonRpc:
 def _wallet(
     config: ProviderConfig, reader: ChainReader, config_path: str | Path
 ) -> CircleAgentWallet:
+    """Restore the onboarding Circle wallet, then verify its account and network."""
     path = Path(config_path)
     try:
-        return CircleAgentWallet(
+        wallet = CircleAgentWallet(
             chain=reader,
             address=config.identity.wallet_address,
             checkpoint_path=path.with_name(path.name + ".wallet-operations.json"),
@@ -73,6 +75,11 @@ def _wallet(
         raise SetupError(
             "restore the original Circle wallet operation record for this configuration"
         ) from None
+    try:
+        wallet.verify_wallet()
+    except Exception:
+        raise SetupError("Circle wallet verification failed") from None
+    return wallet
 
 
 def _verify_usdc(reader: ChainReader) -> None:
@@ -105,22 +112,26 @@ def _prepare(
     testnet: bool,
     profile: DeploymentProfile | None,
     rpc_env: str | None,
-) -> tuple[ProviderConfig, ChainReader, CircleAgentWallet, ContractCalls]:
-    """Blocking configuration and verification; creates no event-loop objects."""
+    wallet: TransactionWallet | None = None,
+) -> tuple[ProviderConfig, ChainReader, TransactionWallet, ContractCalls]:
+    """Blocking configuration and verification; creates no event-loop objects.
+
+    A supplied wallet is checked by its address alone; its own account, network
+    and access are the wallet's to check.
+    """
     config = ProviderConfig.from_file(config_path)
     try:
         selected = _profile(config, testnet, profile)
         rpc = _rpc(config, rpc_env)
         reader = ChainReader(rpc, selected)
-        wallet = _wallet(config, reader, config_path)
+        if wallet is None:
+            wallet = _wallet(config, reader, config_path)
+        elif wallet.address != config.identity.wallet_address:
+            raise SetupError("saved provider operator differs from the supplied wallet")
     except SetupError:
         raise
     except Exception:
         raise SetupError("provider setup configuration is unavailable or invalid") from None
-    try:
-        wallet.verify_wallet()
-    except Exception:
-        raise SetupError("Circle wallet verification failed") from None
     try:
         _verify_usdc(reader)
     except SetupError:

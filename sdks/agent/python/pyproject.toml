@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mppi-agent"
-version = "0.1.5"
+version = "0.1.6"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 description = "MPPI agent SDK: typed payment interfaces and exact primitives"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["mppi-protocol==0.1.3"]
+dependencies = ["mppi-protocol==0.1.4"]
 
 [project.scripts]
 mppi-agent = "mppi_agent.cli:main"

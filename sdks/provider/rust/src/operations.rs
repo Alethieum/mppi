@@ -95,15 +95,18 @@ fn wallet_result(
             _ => OperationState::Unknown,
         }
     };
-    OperationResult::new(
+    let result = OperationResult::new(
         reference,
         state,
         response.wallet_operation_id().map(str::to_owned),
         response.tx_hash(),
         None,
         vec![],
-    )
-    .map_err(ChainError::from)
+    )?;
+    Ok(match response.cause() {
+        Some(cause) => result.with_cause(cause)?,
+        None => result,
+    })
 }
 
 pub(crate) async fn submit_wallet_operation(

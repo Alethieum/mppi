@@ -44,3 +44,24 @@ def test_handled_failures_report_failure(tmp_path: Path, failure: object) -> Non
     ):
         assert CHECKS.main() == 1
     assert json.loads(report.read_text())["status"] == "FAIL"
+
+
+def test_rust_audit_runs_where_cargo_audit_reads_the_crate_exceptions() -> None:
+    calls: list[tuple[list[str], Path]] = []
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((command, Path(str(options["cwd"]))))
+        if "--example" in command:
+            canonical = CHECKS.RUST.parent / "src/generated/mppi.v1.rs"
+            (Path(command[-1]) / "mppi.v1.rs").write_bytes(canonical.read_bytes())
+        return subprocess.CompletedProcess(command, 0)
+
+    with (
+        patch.object(sys, "argv", ["check.py"]),
+        patch.object(CHECKS.subprocess, "run", side_effect=run),
+    ):
+        assert CHECKS.main() == 0
+    command, cwd = calls[-1]
+    assert command == ["cargo", "audit", "--file", str(CHECKS.RUST.with_name("Cargo.lock"))]
+    # cargo-audit 0.22.2 reads ./.cargo/audit.toml from its working directory.
+    assert (cwd / ".cargo/audit.toml").is_file()

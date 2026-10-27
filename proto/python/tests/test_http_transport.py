@@ -1,6 +1,8 @@
 """Real HTTP/TLS tests; credentials exist only in a temporary test directory."""
 
+import calendar
 import json
+import math
 import ssl
 import subprocess
 import threading
@@ -10,11 +12,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from eth_abi.abi import decode, encode
+from mppi_protocol import chain
 from mppi_protocol.catalog import DEFAULT_CATALOG_BYTES, parse_catalog
 from mppi_protocol.chain import ChainEvidenceError, HttpJsonRpc
 from mppi_protocol.discovery import MAX_DOCUMENT_BYTES, parse_document
 from mppi_protocol.errors import ValidationCode, ValidationError
-from mppi_protocol.http import MAX_RPC_RESPONSE_BYTES, HttpTransport, TransportError
+from mppi_protocol.http import (
+    MAX_RPC_RESPONSE_BYTES,
+    HttpTransport,
+    TransportError,
+    _retry_after,
+)
 
 
 def catalog_at_size(size):
@@ -52,8 +60,9 @@ class Peer(BaseHTTPRequestHandler):
         response = {"jsonrpc": "2.0", "id": request["id"], "result": "0x4cef52"}
         if self.path.startswith("/slow"):
             threading.Event().wait(1)
-        if self.path.startswith(("/status/", "/flaky/")):
-            _, kind, status, failures = (self.path + "/0").split("/")[:4]
+        if self.path.startswith(("/status/", "/flaky/", "/after/")):
+            # /after/<status>/<failures>/<Retry-After name>: refusals carry that field.
+            _, kind, status, failures, after = (self.path + "/0/none").split("/")[:5]
             with ATTEMPTS_LOCK:
                 ATTEMPTS[self.path] = ATTEMPTS.get(self.path, 0) + 1
                 failing = kind == "status" or ATTEMPTS[self.path] <= int(failures)
@@ -62,6 +71,8 @@ class Peer(BaseHTTPRequestHandler):
                 self.send_response(int(status))
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                for value in RETRY_AFTER.get(after, []):
+                    self.send_header("Retry-After", value)
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -85,6 +96,14 @@ class Peer(BaseHTTPRequestHandler):
 
 ATTEMPTS: dict[str, int] = {}
 ATTEMPTS_LOCK = threading.Lock()
+RETRY_AFTER = {
+    "seconds": ["2"],
+    "padded": ["7 \t"],
+    "long": ["30"],
+    "past": ["Fri, 31 Dec 1999 23:59:59 GMT"],
+    "twice": ["2", "3"],
+    "invalid": ["soon"],
+}
 
 
 @contextmanager
@@ -279,24 +298,120 @@ def test_transport_marks_dropped_connections_and_timeouts_but_not_content_transi
     )
 
 
-def test_rpc_read_retries_rate_limits_with_bounded_backoff(monkeypatch):
+def test_rpc_read_retries_rate_limits_with_bounded_jittered_backoff(monkeypatch):
+    # Full jitter: each repeat waits a uniform share of its 250 ms or 1 s ceiling.
     delays = []
     monkeypatch.setattr(time, "sleep", delays.append)
+    shares = iter([0.5, 0.25, 0.0, 1.0])
+    monkeypatch.setattr(chain, "_jitter", lambda: next(shares))
     with server() as port:
         endpoint = f"http://127.0.0.1:{port}"
         assert HttpJsonRpc(endpoint + "/flaky/429/2").call("eth_chainId", []) == "0x4cef52"
-        assert ATTEMPTS["/flaky/429/2"] == 3 and delays == [0.25, 1.0]
+        assert ATTEMPTS["/flaky/429/2"] == 3 and delays == [0.125, 0.25]
         delays.clear()
         with pytest.raises(TransportError) as exhausted:
             HttpJsonRpc(endpoint + "/flaky/503/9").call("eth_chainId", [])
         assert exhausted.value.transient and ATTEMPTS["/flaky/503/9"] == 3
-        assert delays == [0.25, 1.0]
+        assert delays == [0.0, 1.0]
         delays.clear()
         with pytest.raises(TransportError):
             HttpJsonRpc(endpoint + "/flaky/404/1", HttpTransport(timeout_ms=200)).call(
                 "eth_chainId", []
             )
         assert ATTEMPTS["/flaky/404/1"] == 1 and delays == []
+
+
+@pytest.mark.parametrize(
+    ("after", "wait"),
+    [
+        ("seconds", 2.0),
+        ("padded", 7.0),
+        ("past", 0.0),
+        ("long", 30.0),
+        ("twice", None),
+        ("invalid", None),
+        ("none", None),
+    ],
+)
+def test_a_refusal_keeps_the_wait_its_retry_after_asks_for(after, wait):
+    with server() as port:
+        with pytest.raises(TransportError) as caught:
+            HttpTransport(timeout_ms=1000).request(
+                f"http://127.0.0.1:{port}/after/503/1/{after}", body=b'{"id":1}'
+            )
+    assert caught.value.transient and caught.value.retry_after == wait
+
+
+# Sun, 06 Nov 1994 08:49:30 GMT: seven seconds before RFC 9110's example date.
+EXAMPLE_NOW = calendar.timegm((1994, 11, 6, 8, 49, 30))
+
+
+@pytest.mark.parametrize(
+    ("value", "wait"),
+    [
+        ("120", 120.0),
+        ("0", 0.0),
+        ("0012", 12.0),
+        pytest.param("9" * 400, math.inf, id="400-digits"),
+        ("Sun, 06 Nov 1994 08:49:37 GMT", 7.0),  # IMF-fixdate
+        ("Sunday, 06-Nov-94 08:49:37 GMT", 7.0),  # obsolete RFC 850 format
+        ("Sun Nov  6 08:49:37 1994", 7.0),  # ANSI C asctime()
+        ("Sun Nov 06 08:49:37 1994", 7.0),
+        ("Sun, 06 Nov 1994 08:49:00 GMT", 0.0),  # Already past: no wait.
+        ("Sun, 06 Nov 1994 08:50:60 GMT", 90.0),  # A leap second.
+        ("Thu, 29 Feb 1996 00:00:00 GMT", calendar.timegm((1996, 2, 29, 0, 0, 0)) - EXAMPLE_NOW),
+        ("1.5", None),
+        ("-1", None),
+        ("+1", None),
+        ("", None),
+        ("\u0661\u0662", None),  # Not ASCII digits.
+        ("sun, 06 nov 1994 08:49:37 gmt", None),  # HTTP-date is case sensitive.
+        ("Sun, 6 Nov 1994 08:49:37 GMT", None),
+        ("Sun,  06 Nov 1994 08:49:37 GMT", None),
+        ("Sun, 06 Nov 1994 08:49:37 UTC", None),
+        ("Sun, 31 Nov 1994 08:49:37 GMT", None),
+        ("Fri, 29 Feb 1995 00:00:00 GMT", None),
+        ("Sun, 06 Nov 1994 24:00:00 GMT", None),
+        ("Sun, 06 Nov 1994 08:60:00 GMT", None),
+        ("Sun Nov 6 08:49:37 1994", None),
+        ("Sun, 06-Nov-94 08:49:37 GMT", None),
+        ("Sunday, 06 Nov 1994 08:49:37 GMT", None),
+    ],
+)
+def test_retry_after_accepts_delay_seconds_and_each_http_date_format(value, wait):
+    # RFC 9110 section 10.2.3; a recipient must accept all three HTTP-date
+    # formats (section 5.6.7).
+    assert _retry_after(value, EXAMPLE_NOW) == wait
+
+
+def test_a_two_digit_year_more_than_fifty_years_ahead_is_the_century_before():
+    # RFC 9110 section 5.6.7, for rfc850-date.
+    late_2099 = calendar.timegm((2099, 12, 31, 23, 59, 50))
+    assert _retry_after("Friday, 01-Jan-00 00:00:00 GMT", late_2099) == 10.0
+    now = calendar.timegm((2026, 10, 27, 0, 0, 0))
+    fifty_years = calendar.timegm((2076, 10, 27, 0, 0, 0)) - now
+    assert _retry_after("Tuesday, 27-Oct-76 00:00:00 GMT", now) == fifty_years
+    assert _retry_after("Wednesday, 28-Oct-76 00:00:00 GMT", now) == 0.0  # 1976.
+    assert _retry_after("Monday, 26-Oct-26 00:00:00 GMT", now) == 0.0
+
+
+def test_a_read_waits_out_retry_after_then_its_jittered_delay(monkeypatch):
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(chain, "_jitter", lambda: 0.5)
+    with server() as port:
+        endpoint = f"http://127.0.0.1:{port}"
+        assert HttpJsonRpc(endpoint + "/after/429/1/seconds").call("eth_chainId", []) == (
+            "0x4cef52"
+        )
+        assert ATTEMPTS["/after/429/1/seconds"] == 2 and delays == [2.125]
+        delays.clear()
+        # A wait that cannot end before the read's repeats must start is not
+        # waited: the read fails at once. Attempts are 5 s, repeats start within 6.25 s.
+        with pytest.raises(TransportError) as refused:
+            HttpJsonRpc(endpoint + "/after/429/1/long").call("eth_chainId", [])
+        assert refused.value.retry_after == 30.0
+        assert ATTEMPTS["/after/429/1/long"] == 1 and delays == []
 
 
 class KeptAlive(BaseHTTPRequestHandler):
@@ -317,9 +432,12 @@ class KeptAlive(BaseHTTPRequestHandler):
             KEPT["connections"] += 1
 
     def do_POST(self):
-        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        size = int(self.headers["Content-Length"])
+        payload = json.loads(self.rfile.read(size))
         with KEPT_LOCK:
             KEPT["requests"] += 1
+            KEPT["bodies"].append(payload)
+            KEPT["sizes"].append(size)
             stall = self.path == "/stall-once" and KEPT["requests"] == 1
         if stall:
             threading.Event().wait(0.6)  # Longer than the client waits.
@@ -328,7 +446,7 @@ class KeptAlive(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if isinstance(payload, list) and self.path == "/single":
+        if isinstance(payload, list) and self.path in ("/single", "/single-limited"):
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600}}
         elif isinstance(payload, list):
             response = [self.answer(call) for call in reversed(payload)]
@@ -350,23 +468,26 @@ class KeptAlive(BaseHTTPRequestHandler):
             self.close_connection = True  # The client gave up on a stalled reply.
 
     def answer(self, call):
-        if self.path == "/limited" and call["params"][0] == "limited":
+        value = call["params"][0]
+        if self.path in ("/limited", "/single-limited") and value.startswith("limited"):
+            # Each such call is refused once, as a per-second limit refuses some
+            # entries of a batch (QuickNode -32007).
             with KEPT_LOCK:
-                KEPT["limited"] += 1
-                limited = KEPT["limited"] == 1
+                limited = value not in KEPT["limited"]
+                KEPT["limited"].add(value)
             if limited:
                 return {"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32007}}
-        return {"jsonrpc": "2.0", "id": call["id"], "result": call["params"][0]}
+        return {"jsonrpc": "2.0", "id": call["id"], "result": value}
 
 
-KEPT = {"connections": 0, "requests": 0, "limited": 0}
+KEPT: dict = {"connections": 0, "requests": 0, "limited": set(), "bodies": [], "sizes": []}
 KEPT_LOCK = threading.Lock()
 
 
 @contextmanager
 def kept_alive():
     with KEPT_LOCK:
-        KEPT.update(connections=0, requests=0, limited=0)
+        KEPT.update(connections=0, requests=0, limited=set(), bodies=[], sizes=[])
     peer = ThreadingHTTPServer(("127.0.0.1", 0), KeptAlive)
     peer.daemon_threads = True
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
@@ -407,15 +528,97 @@ def test_a_batch_is_one_round_trip_and_matched_by_id():
     assert (KEPT["requests"], KEPT["connections"]) == (2, 1)
 
 
-def test_a_rate_limited_entry_repeats_its_batch(monkeypatch):
+def test_no_request_body_exceeds_the_transport_bound():
+    # 1 MiB: a longer body is refused before anything is sent (port 9 is never
+    # contacted, so the refusal is not a transient connection failure).
+    with pytest.raises(TransportError) as refused:
+        HttpTransport().request("http://127.0.0.1:9/", body=b" " * (MAX_DOCUMENT_BYTES + 1))
+    assert not refused.value.transient
+    call = ("eth_call", [{"to": "0x" + "ca11" * 10, "data": "0x" + "00" * 49_500}, "latest"])
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint)
+        # Twelve calls of about 99 KB each: two batches, never one over 1 MiB.
+        assert len(rpc.call_many([call] * 12)) == 12
+        assert KEPT["requests"] == 2 and max(KEPT["sizes"]) <= MAX_DOCUMENT_BYTES
+        # A call that cannot fit one body is refused before anything is sent.
+        oversized = ("eth_call", [{"to": "0x" + "ca11" * 10, "data": "0x" + "00" * (1 << 19)}])
+        with pytest.raises(TransportError) as refused:
+            rpc.call_many([oversized])
+        assert not refused.value.transient and KEPT["requests"] == 2
+        assert len(rpc.call_many([call] * 2)) == 2  # Batches stay on.
+        assert KEPT["requests"] == 3
+        rpc.close()
+
+
+def sent(body):
+    """The first parameter of each call in a request body, in order."""
+    return [call["params"][0] for call in body] if isinstance(body, list) else body["params"][0]
+
+
+def test_only_the_refused_entries_of_a_batch_are_sent_again(monkeypatch):
+    # JSON-RPC 2.0 section 6 matches each answer to its call by id, so the
+    # entries a batch answered are kept and only the refused ones repeat.
     delays = []
     monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(chain, "_jitter", lambda: 1.0)
     with kept_alive() as endpoint:
         rpc = HttpJsonRpc(endpoint + "/limited")
-        calls = [("eth_getBlockByNumber", ["limited", False]), ("eth_chainId", ["0x1"])]
-        assert rpc.call_many(calls) == ["limited", "0x1"]
+        calls = [
+            ("eth_getBlockByNumber", [value, False])
+            for value in ("limited-a", "0x1", "limited-b", "0x2")
+        ]
+        assert rpc.call_many(calls) == ["limited-a", "0x1", "limited-b", "0x2"]
+        calls = [("eth_getBlockByNumber", [value, False]) for value in ("0x3", "limited-c")]
+        assert rpc.call_many(calls) == ["0x3", "limited-c"]
         rpc.close()
-    assert KEPT["requests"] == 2 and delays == [0.25]
+    assert [sent(body) for body in KEPT["bodies"]] == [
+        ["limited-a", "0x1", "limited-b", "0x2"],
+        ["limited-a", "limited-b"],
+        ["0x3", "limited-c"],
+        "limited-c",  # One refused entry is sent again as a single call.
+    ]
+    assert delays == [0.25, 0.25]
+
+
+def test_one_call_at_a_time_a_refused_call_repeats_without_those_answered(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    with kept_alive() as endpoint:
+        rpc = HttpJsonRpc(endpoint + "/single-limited")
+        calls = [("eth_getBlockByNumber", [value, False]) for value in ("0x0", "limited", "0x2")]
+        assert rpc.call_many(calls) == ["0x0", "limited", "0x2"]
+        rpc.close()
+    assert [sent(body) for body in KEPT["bodies"]] == [
+        ["0x0", "limited", "0x2"],  # Refused as a batch: then one call at a time.
+        "0x0",
+        "limited",
+        "limited",
+        "0x2",
+    ]
+
+
+def test_a_definite_answer_in_a_batch_ends_the_read_even_beside_a_refusal(monkeypatch):
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    requests = []
+
+    def reply(endpoint, *, body):
+        sent = json.loads(body)
+        requests.append(sent)
+        return json.dumps(
+            [
+                {"jsonrpc": "2.0", "id": sent[0]["id"], "error": {"code": -32005}},
+                {"jsonrpc": "2.0", "id": sent[1]["id"], "error": {"code": -32602}},
+            ]
+        ).encode()
+
+    monkeypatch.setattr(
+        HttpTransport, "request", lambda self, url, *, body=None: reply(url, body=body)
+    )
+    with pytest.raises(ChainEvidenceError, match="no usable result"):
+        HttpJsonRpc("http://127.0.0.1:9").call_many(
+            [("eth_chainId", []), ("eth_getBlockByNumber", ["latest", False])]
+        )
+    assert len(requests) == 1 and delays == []
 
 
 def test_an_endpoint_without_batches_is_read_one_call_at_a_time():

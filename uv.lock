@@ -959,7 +959,7 @@ wheels = [
 
 [[package]]
 name = "mppi-agent"
-version = "0.1.5"
+version = "0.1.6"
 source = { editable = "sdks/agent/python" }
 dependencies = [
     { name = "mppi-protocol" },
@@ -1005,7 +1005,7 @@ dev = [
 
 [[package]]
 name = "mppi-protocol"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "proto/python" }
 dependencies = [
     { name = "eth-abi" },
@@ -1028,7 +1028,7 @@ requires-dist = [
 
 [[package]]
 name = "mppi-provider"
-version = "0.1.4"
+version = "0.2.0"
 source = { editable = "sdks/provider/python" }
 dependencies = [
     { name = "mppi-protocol" },

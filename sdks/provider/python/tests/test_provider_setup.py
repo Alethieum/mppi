@@ -292,9 +292,10 @@ def test_composition_verifies_adapters_preserves_callbacks_and_starts_no_lifecyc
 
         monkeypatch.setattr(Mppi, "__init__", init)
         monkeypatch.setattr(runtime_module, "ChainFollower", follower)
-        result = await boundary.create(hooks=hooks, control_auth_timeout=19)
+        result = await boundary.create(hooks=hooks, control_auth_timeout=19, closed_retention=7200)
         assert result.coverage is forbidden and result.execution is forbidden
         assert result._control_auth_timeout == 19
+        assert result._closed_retention == 7200
         assert isinstance(result.wallet, CircleAgentWallet)
         assert result.wallet.address == ADDRESS
         assert result.contract.domain == boundary.profile.domain
@@ -516,6 +517,41 @@ def test_circle_wallet_mismatch_stops_setup(boundary, field, value):
         asyncio.run(boundary.create())
     assert value not in str(error.value)
     assert not boundary.calls
+    boundary.unchanged()
+
+
+class SuppliedWallet:
+    """Another operator capability, such as a key an HSM or KMS holds."""
+
+    def __init__(self, address=ADDRESS):
+        self.address = address
+
+    execute = reconcile = forbidden
+
+
+def test_another_wallet_composes_by_its_address_with_the_same_deployment_checks(
+    boundary, monkeypatch
+):
+    boundary.retain_wallet = False
+    wallet = SuppliedWallet()
+    result = asyncio.run(boundary.create(wallet=wallet))
+    assert result.wallet is wallet
+    # No Circle CLI call, and no Circle operation record is created.
+    assert not boundary.wallet_calls
+    assert not boundary.record_path.exists() and not boundary.lock_path.exists()
+    assert {call[0] for call in boundary.calls} >= {"eth_getCode", "eth_call"}
+    boundary.unchanged()
+    boundary.calls.clear()
+    with pytest.raises(
+        SetupError, match="saved provider operator differs from the supplied wallet"
+    ):
+        asyncio.run(boundary.create(wallet=SuppliedWallet(b"\x55" * 20)))
+    assert not boundary.calls
+    boundary.separator = b"x" * 32
+    monkeypatch.setattr(Mppi, "__init__", forbidden)
+    with pytest.raises(SetupError, match="separator"):
+        asyncio.run(boundary.create(wallet=wallet))
+    assert not boundary.wallet_calls
     boundary.unchanged()
 
 

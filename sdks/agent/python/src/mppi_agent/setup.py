@@ -50,7 +50,8 @@ DEFAULT_RPC = "https://rpc.blockdaemon.testnet.arc.io"
 _MAINNET_RPC = "https://rpc.blockdaemon.mainnet.arc.io"
 # Names the Circle CLI executable; unset or empty runs `circle` from PATH.
 CIRCLE_CLI_ENV = "MPPI_CIRCLE_CLI"
-# circle.py:CircleAgentWallet gives each CLI command 240 seconds. Reserve another
+# circle.py:CircleAgentWallet stops each read command at 240 seconds and lets
+# execute and sign finish within the CLI's own limits. Reserve another
 # 60 seconds for wallet/code verification and reconciliation around that command;
 # this operation budget does not extend chain freshness or collection deadlines.
 _CIRCLE_OPERATION_TIMEOUT_MS = 300_000
@@ -140,8 +141,9 @@ def _wallet(record: dict[str, Any], reader: ChainReader, config: Path) -> Circle
 def _verify_circle(wallet: CircleAgentWallet, *, testnet: bool) -> None:
     """Verify the wallet, naming each cause the pinned adapter's errors establish.
 
-    Those errors carry no CLI output. CLI 1.1.4 fails a listing with exit status
-    1 and gives its reason only in that output (dist/index.js:732-750,
+    Those errors carry no CLI output beyond a failed command's listed error code
+    in parentheses, which is ignored here. CLI 1.1.4 fails a listing with exit
+    status 1 and gives its reason in that output (dist/index.js:732-750,
     100111-100119, 113249-113290). A listing fails without a current login for
     the chain's own network (:20710-20716), so that failure names the command
     showing Circle's reason and the login the network needs.
@@ -151,7 +153,7 @@ def _verify_circle(wallet: CircleAgentWallet, *, testnet: bool) -> None:
     try:
         wallet.verify_registration_wallet()
     except CircleAgentWalletError as error:
-        cause = str(error)
+        cause = str(error).partition(" (")[0]
         executable = wallet._command[0]
         if cause == "Circle command is unavailable" and shutil.which(executable) is None:
             message = (

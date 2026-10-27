@@ -297,3 +297,36 @@ def test_wallet_address_backend_failure_is_redacted_before_handoff(chain) -> Non
         submit_operation(UnavailableWallet(), OPEN, operation_ref=REF, chain=chain)
     assert "secret" not in str(error.value)
     assert error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("helper", (submit_operation, reconcile_operation))
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    (
+        (
+            OperationResult(REF, OperationState.UNKNOWN, cause="WalletError: lost"),
+            OperationState.UNKNOWN,
+        ),
+        (
+            OperationResult(REF, OperationState.FAILED, cause="WalletError: refused"),
+            OperationState.FAILED,
+        ),
+        (
+            OperationResult(REF, OperationState.PENDING, WALLET_ID, cause="queued"),
+            OperationState.PENDING,
+        ),
+        (
+            OperationResult(REF, OperationState.UNKNOWN, WALLET_ID, TX, cause="lost"),
+            OperationState.UNKNOWN,
+        ),
+    ),
+)
+def test_a_wallets_cause_survives_an_unproven_result(
+    helper, response, expected, wallet, chain
+) -> None:
+    # Diagnostic only and never compared, as in the Rust SDK (operations.rs).
+    wallet.execute.return_value = wallet.reconcile.return_value = response
+    chain.reconcile.side_effect = TimeoutError("RPC unavailable")
+    result = helper(wallet, OPEN, operation_ref=REF, chain=chain)
+    assert result.state is expected
+    assert result.cause == response.cause

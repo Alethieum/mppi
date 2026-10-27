@@ -159,6 +159,36 @@ def test_an_account_with_code_must_answer_erc1271_magic(answer, valid) -> None:
     assert evidence.signature_valid is valid
 
 
+@pytest.mark.parametrize(
+    "answer,valid",
+    [
+        ({"result": hx(MAGIC)}, True),
+        ({"result": hx(MAGIC + bytes(32))}, True),
+        ({"result": hx(bytes.fromhex("1626ba7e"))}, False),
+        ({"error": {"code": 3, "message": "execution reverted"}}, False),
+    ],
+)
+def test_a_signature_alone_is_decided_as_usdc_does_without_the_binding(answer, valid) -> None:
+    """A snapshot read the binding: the signature is still USDC's rule at its block."""
+    node = Node(code=b"\x60\x80", answer=answer)
+    reader = ChainReader(HttpJsonRpc("https://rpc.example/private-key", node), PROFILE)
+    assert reader.funding_signature(authorization(SMART), b"\x01" * 97, BLOCK) is valid
+    (batch,) = node.requests
+    assert [call["method"] for call in batch] == [
+        "eth_chainId",
+        "eth_getBlockByNumber",
+        "eth_getCode",
+        "eth_call",
+    ]
+    assert node.checked == (funding_digest(authorization(SMART)), b"\x01" * 97)
+    # An account without code at that block must recover by ECDSA instead.
+    owner = bytes.fromhex(OWNER.address[2:])
+    auth = authorization(owner)
+    plain = ChainReader(HttpJsonRpc("https://rpc.example/private-key", Node()), PROFILE)
+    assert plain.funding_signature(auth, eoa_signature(auth), BLOCK)
+    assert not plain.funding_signature(auth, b"\x01" * 65, BLOCK)
+
+
 def test_delegated_code_is_checked_through_erc1271_as_usdc_does() -> None:
     # USDC's isContract is extcodesize > 0, so a delegated account answers ERC-1271
     # even though its own key could sign.

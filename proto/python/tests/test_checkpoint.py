@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +29,36 @@ def test_checkpoint_persists_nonsecret_intent_and_excludes_another_owner(tmp_pat
     reopened = Checkpoint(path)
     assert reopened.load() == record
     reopened.close()
+
+
+def test_a_lock_held_only_by_an_inherited_copy_is_awaited(tmp_path: Path) -> None:
+    path = tmp_path / "agent.json"
+    checkpoint = Checkpoint(path)
+    assert checkpoint._lock is not None
+    # A child process spawned meanwhile holds a copy until it execs.
+    inherited = os.dup(checkpoint._lock)
+    checkpoint.close()
+    exec_ = threading.Timer(0.05, os.close, (inherited,))
+    exec_.start()
+    try:
+        Checkpoint(path).close()
+    finally:
+        exec_.join()
+
+
+def test_a_lock_another_owner_holds_is_awaited_up_to_the_wait_given(tmp_path: Path) -> None:
+    path = tmp_path / "agent.json"
+    holder = Checkpoint(path)
+    release = threading.Timer(1.5, holder.close)
+    release.start()
+    try:
+        # Past the default second, within the wait given.
+        Checkpoint(path, lock_wait=10).close()
+    finally:
+        release.join()
+    for wait in (-1, float("nan"), float("inf"), True, "1"):
+        with pytest.raises(ValidationError):
+            Checkpoint(path, lock_wait=wait)  # type: ignore[arg-type]
 
 
 def test_failed_replace_preserves_previous_economic_intent(tmp_path: Path) -> None:

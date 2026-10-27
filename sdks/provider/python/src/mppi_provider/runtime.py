@@ -9,9 +9,13 @@ does not coordinate independent processes or recover missing private history.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import math
 import secrets
+import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -33,7 +37,7 @@ from mppi_protocol.amounts import (
     required_coverage,
     uint64,
 )
-from mppi_protocol.capabilities import TransactionWallet
+from mppi_protocol.capabilities import TransactionWallet, WalletCall
 from mppi_protocol.catalog import Catalog, parse_catalog
 from mppi_protocol.chain import ChainEvidenceError, DeploymentProfile, OpeningEvidence
 from mppi_protocol.contract import ContractCalls, OperationKind, PreparedOperation
@@ -77,7 +81,7 @@ from mppi_protocol.wire import (
 
 from .config import ProviderConfig
 from .discovery import DiscoveryDocuments
-from .hooks import HookError, Hooks, ObserverStats
+from .hooks import HookError, Hooks, ObserverStats, OperationTiming
 from .interfaces import (
     CoverageProvider,
     CoverageResult,
@@ -101,6 +105,43 @@ _SESSION_STATUS = {
     SessionStatus.CLOSING: pb.SESSION_STATUS_CLOSING,
     SessionStatus.CLOSED: pb.SESSION_STATUS_CLOSED,
 }
+
+
+# Calldata the runtime prepares, in bytes. Every argument has a fixed size, so
+# these are exact for every session, the worst case included. One settle or
+# close: the 4-byte selector, the descriptor's seven 32-byte words, the
+# cumulative and capture words, the signature's offset and length words, and its
+# 65 bytes padded to 96 (452; a refund-only close has no signature, 356). A
+# settleBatch: the selector, four head offsets and four array lengths (260), then
+# per session the descriptor's seven words, the two amount words, and the
+# signature's offset, length and 96 padded bytes (448).
+_SETTLE_CALL_BYTES = 4 + 7 * 32 + 2 * 32 + 2 * 32 + 96
+_BATCH_CALL_BYTES = 4 + 4 * 32 + 4 * 32
+_BATCH_ITEM_BYTES = 7 * 32 + 2 * 32 + 2 * 32 + 96
+# A wallet that states no max_call_bytes gets the Circle adapter's bound.
+_MAX_CALL_BYTES = 61_440
+
+
+def _successor(reference: str) -> str:
+    """The reference a close takes after one mined and reverted: the same close
+    reference with its retry count after a dot, ``close:<id>.1``, ``.2`` and so
+    on. It derives from the reverted reference alone, so a runtime restored from
+    evidence older than a retry derives the same successor, and the wallet's
+    binding of it continues that retry rather than sending another."""
+    base, dot, count = reference.rpartition(".")
+    if dot and count.isascii() and count.isdigit() and str(int(count)) == count:
+        retries = int(count)
+        if retries < 2**64 - 1:
+            return f"{base}.{retries + 1}"
+    return reference + ".1"
+
+
+def _batch_sessions(max_call_bytes: int) -> int:
+    """The most sessions one batch holds within ``max_call_bytes``: 260 + 448 n
+    bytes. Circle's 61,440 hold (61,440 - 260) // 448 = 136 sessions in 61,188
+    bytes; 137 would take 61,636. At least one: a single session is collected by
+    settle, which fits every bound the runtime accepts."""
+    return max(1, (max_call_bytes - _BATCH_CALL_BYTES) // _BATCH_ITEM_BYTES)
 
 
 class UpstreamFailure(Exception):
@@ -127,9 +168,10 @@ class _RpcFailure(Exception):
         code: grpc.StatusCode,
         reason: str,
         payment: PaymentFailure | None = None,
+        detail: str | None = None,
     ) -> None:
-        self.code, self.reason, self.payment = code, reason, payment
-        super().__init__(reason)
+        self.code, self.reason, self.payment, self.detail = code, reason, payment, detail
+        super().__init__(reason if detail is None else f"{reason}: {detail}")
 
 
 def _not_ready(reason: str, sid: bytes | None = None, rid: bytes | None = None) -> _RpcFailure:
@@ -139,6 +181,169 @@ def _not_ready(reason: str, sid: bytes | None = None, rid: bytes | None = None) 
 def _payment(failure: PaymentFailure) -> _RpcFailure:
     code, reason, _ = payment_status(failure)
     return _RpcFailure(code, reason, failure)
+
+
+def _inconsistent(sid: bytes, check: str) -> _RpcFailure:
+    """The evidence contradicts itself, the chain, the wallet or a session
+    already held. The payment failure stays INCONSISTENT_STATE; the message
+    names the check that failed, in the SDK's words, never remote text. Each
+    check is listed in the provider runtime tests, which keep every refusal in
+    recovery to one literal from that list."""
+    return _labelled("INCONSISTENT_STATE", sid, check)
+
+
+def _missing(sid: bytes, check: str) -> _RpcFailure:
+    """Evidence recovery needs is missing or unavailable. The payment failure
+    stays STATE_UNAVAILABLE; the message names the check that failed, in the
+    SDK's words, never remote text."""
+    return _labelled("STATE_UNAVAILABLE", sid, check)
+
+
+def _invalid(error: ValidationError, check: str) -> ValidationError:
+    """An invalid signature in recovery evidence. It stays the ValidationError
+    0.1.2 raised, with its code; its message names the check in the form of the
+    other refusals, ``SESSION_NOT_READY: <check>``, with Rust's label (where
+    Rust refuses it INCONSISTENT_STATE)."""
+    return ValidationError(error.code, f"SESSION_NOT_READY: {check}")
+
+
+def _labelled(reason: str, sid: bytes, check: str) -> _RpcFailure:
+    """A SESSION_NOT_READY refusal for ``reason`` whose message names ``check``."""
+    failure = _not_ready(reason, sid)
+    return _RpcFailure(failure.code, failure.reason, failure.payment, check)
+
+
+def _unresolved(operation: _PendingOperation | None) -> bool:
+    """An outcome still to reconcile: pending or unknown with no chain evidence."""
+    return (
+        operation is not None
+        and operation.result.state in (OperationState.PENDING, OperationState.UNKNOWN)
+        and operation.result.observation is None
+    )
+
+
+def _agrees(saved: OperationResult, bound: object) -> bool:
+    """The wallet's record of a saved operation agrees with it: the same
+    reference, the same transaction hash or none on both, the same wallet
+    operation id when one was saved, and any id it names well formed."""
+    return (
+        isinstance(bound, OperationResult)
+        and bound.operation_ref == saved.operation_ref
+        and bound.tx_hash == saved.tx_hash
+        and (
+            saved.wallet_operation_id is None
+            or bound.wallet_operation_id == saved.wallet_operation_id
+        )
+        and (
+            bound.wallet_operation_id is None
+            or (type(bound.wallet_operation_id) is str and bound.wallet_operation_id != "")
+        )
+    )
+
+
+class _Timing:
+    """One payment step's time by part, in seconds (see OperationTiming)."""
+
+    def __init__(self, operation: str, start: float | None = None) -> None:
+        self.operation = operation
+        self.start = time.monotonic() if start is None else start
+        self.parts = {"coverage": 0.0, "chain": 0.0, "wallet": 0.0}
+
+    @contextmanager
+    def part(self, name: str) -> Iterator[None]:
+        """Add the time of this block to ``name``."""
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            self.parts[name] += time.monotonic() - start
+
+    def report(self, state: str | None) -> OperationTiming:
+        # Parts are rounded down and the total to nearest: parts measured
+        # within the step never add up to more than its total.
+        ms = {part: int(seconds * 1000) for part, seconds in self.parts.items()}
+        total = round((time.monotonic() - self.start) * 1000)
+        return OperationTiming(
+            self.operation,
+            state,
+            total,
+            ms["coverage"],
+            ms["chain"],
+            ms["wallet"],
+            max(0, total - sum(ms.values())),
+        )
+
+
+_TIMING: contextvars.ContextVar[_Timing | None] = contextvars.ContextVar(
+    "mppi_provider_timing", default=None
+)
+
+
+@contextmanager
+def _timed(part: str) -> Iterator[None]:
+    """Add the time of this block to the current collection call's ``part``."""
+    timing = _TIMING.get()
+    if timing is None:
+        yield
+    else:
+        with timing.part(part):
+            yield
+
+
+class _TimedWallet:
+    """A wallet whose execute and reconcile call counts as wallet time."""
+
+    def __init__(self, wallet: TransactionWallet) -> None:
+        self._wallet = wallet
+        self._started: float | None = None
+        self._ended: float | None = None
+
+    @property
+    def address(self) -> bytes:
+        return self._wallet.address
+
+    def execute(self, call: WalletCall, *, operation_ref: str) -> OperationResult:
+        self._started = time.monotonic()
+        try:
+            return self._wallet.execute(call, operation_ref=operation_ref)
+        finally:
+            self._ended = time.monotonic()
+
+    def reconcile(self, *, operation_ref: str) -> OperationResult:
+        self._started = time.monotonic()
+        try:
+            return self._wallet.reconcile(operation_ref=operation_ref)
+        finally:
+            self._ended = time.monotonic()
+
+    def spent(self, now: float) -> float:
+        """Its call's time so far: a cancelled caller leaves it running."""
+        if self._started is None:
+            return 0.0
+        return (now if self._ended is None else self._ended) - self._started
+
+
+class _Handoff:
+    """Whether a wallet call handed to a worker thread began (_Sessions._operate).
+
+    Exactly one of ``begin``, in the worker, and ``abandon``, by a cancelled
+    caller, takes effect first; each reports whether it did.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._begun = False
+        self._abandoned = False
+
+    def begin(self) -> bool:
+        with self._lock:
+            self._begun = not self._abandoned
+            return self._begun
+
+    def abandon(self) -> bool:
+        with self._lock:
+            self._abandoned = not self._begun
+            return self._abandoned
 
 
 def _sum_counts(left: TokenCounts, right: TokenCounts) -> TokenCounts:
@@ -197,6 +402,9 @@ class _Run:
     low_credit_marker: tuple[int, int] | None = None
     # Its place among runs waiting for admission, from its first wait.
     queued: _Queued | None = None
+    # This runtime's first refusal of the run's coverage. A host error that then
+    # ends its execution reaches the agent as this typed failure.
+    refusal: PaymentFailure | None = None
 
 
 @dataclass(slots=True)
@@ -233,6 +441,12 @@ class _Session:
     last_collection: float = field(default_factory=time.monotonic)
     # Runs that have waited for admission so far: the next one's position.
     waited: int = 0
+    # When maintenance first found this session final (Mppi._final).
+    final_since: float | None = None
+    # Wakes this session's runs waiting for admission (Mppi._wake). It shares
+    # the runtime's lock: asyncio Condition objects may share one Lock
+    # (https://docs.python.org/3.12/library/asyncio-sync.html#condition).
+    wake: asyncio.Condition = field(kw_only=True)
 
     @property
     def usage_numerator(self) -> int:
@@ -263,6 +477,10 @@ class Mppi:
     the server, wallet credentials, execution integration and durable recovery.
     control_auth_timeout bounds unauthenticated Control setup in seconds; only
     successful signed attachment removes it. It is independent of payment waits.
+    closed_retention is how long, in seconds, a final session stays retained
+    before it retires: one hour to seven days, 24 hours by default. Within it an
+    agent can reattach to read the final state and the host can take a final
+    checkpoint. No count of sessions is limited.
     """
 
     def __init__(
@@ -275,6 +493,7 @@ class Mppi:
         coverage: CoverageProvider,
         execution: ExecutionProvider,
         control_auth_timeout: float = 60.0,
+        closed_retention: float = 86400.0,
         hooks: Hooks | None = None,
     ) -> None:
         if not isinstance(config, ProviderConfig) or not isinstance(contract, ContractCalls):
@@ -306,16 +525,37 @@ class Mppi:
                 ValidationCode.INVALID_VALUE,
                 "Control setup timeout must be positive and at most one hour",
             )
+        if (
+            isinstance(closed_retention, bool)
+            or not isinstance(closed_retention, (int, float))
+            or not 3600 <= closed_retention <= 7 * 86400
+        ):
+            raise ValidationError(
+                ValidationCode.INVALID_VALUE,
+                "closed session retention must be one hour to seven days",
+            )
         if hooks is not None and not isinstance(hooks, Hooks):
             raise TypeError("hooks must be provider Hooks")
+        # The largest calldata the wallet accepts in one call, if it states one.
+        max_call_bytes = getattr(wallet, "max_call_bytes", _MAX_CALL_BYTES)
+        if type(max_call_bytes) is not int or max_call_bytes < _SETTLE_CALL_BYTES:
+            raise ValidationError(
+                ValidationCode.INVALID_VALUE,
+                "wallet max_call_bytes is below one settlement call (452 bytes)",
+            )
+        self._max_call_bytes = max_call_bytes
         self._observers = Observers(hooks)
         self._control_auth_timeout = float(control_auth_timeout)
+        self._closed_retention = float(closed_retention)
         self.config, self.chain, self.contract = config, chain, contract
         self.wallet, self.coverage, self.execution = wallet, coverage, execution
         self.runs = self
         self.sessions = _Sessions(self)
         self._sessions: dict[bytes, _Session] = {}
-        self._condition = asyncio.Condition()
+        # Payment state is read and changed only while holding this lock.
+        self._lock = asyncio.Lock()
+        # The chain follower's readiness at the last maintenance pass.
+        self._readiness: Readiness | None = None
         self._started = False
         self._stopping = False
         self._start_block: int | None = None
@@ -324,6 +564,25 @@ class Mppi:
         self._tasks: set[asyncio.Task[None]] = set()
         self._documents: DiscoveryDocuments | None = None
         self._collecting: set[bytes] = set()
+        # Each operation reference prepared or restored, and for each session it
+        # covers the Unix time from which that session no longer needs it: None
+        # while its checkpoint may still name it; when it retired here; or
+        # closed_retention after a later confirmed collection of it superseded
+        # the reference. References no covered session needs, each with the
+        # time the wallet may forget it from, the latest of those (_forget);
+        # that call while it runs; when maintenance may call again after the
+        # wallet refused; and the wallet's near_capacity at the last pass.
+        self._references: dict[str, dict[bytes, float | None]] = {}
+        self._retirable: list[tuple[str, float]] = []
+        # The record of each reference no wallet answer in this process has
+        # matched (_agrees): restored without a transaction hash, so not looked
+        # up at recovery, or kept against a wallet answer that disagreed with
+        # it. Its hand-over to retire takes recovery's wallet check (_forget);
+        # a matching answer removes it.
+        self._unconfirmed: dict[str, OperationResult] = {}
+        self._retiring: asyncio.Task[None] | None = None
+        self._retire_after: float | None = None
+        self._near_capacity = False
 
     @classmethod
     async def from_config(
@@ -336,7 +595,9 @@ class Mppi:
         profile: DeploymentProfile | None = None,
         rpc_env: str | None = None,
         control_auth_timeout: float = 60.0,
+        closed_retention: float = 86400.0,
         hooks: Hooks | None = None,
+        wallet: TransactionWallet | None = None,
     ) -> Mppi:
         """Compose verified SDK adapters on the host's serving event loop.
 
@@ -345,9 +606,12 @@ class Mppi:
         An explicit ``profile`` is a caller-trusted deployment override.
         Network selection must match both the profile and confirmed TOML config.
         Circle uses the authenticated official CLI and the original native
-        onboarding wallet-operation record beside the config. ``rpc_env`` selects
-        an RPC URL from the provider's environment; otherwise the validated
-        config's RPC URL is used.
+        onboarding wallet-operation record beside the config. ``wallet`` supplies
+        another ``TransactionWallet`` instead, such as one whose operator key an
+        HSM or KMS holds: its address must be the saved operator, and setup
+        cannot verify its account, network or access. ``rpc_env`` selects an RPC
+        URL from the provider's environment; otherwise the validated config's
+        RPC URL is used.
 
         Only configuration and remote reads occur. Call ``start`` explicitly
         from the host lifecycle; the provider owns hosting, execution,
@@ -357,8 +621,8 @@ class Mppi:
         """
         from .setup import _prepare
 
-        config, reader, wallet, contract = await asyncio.to_thread(
-            _prepare, config_path, testnet=testnet, profile=profile, rpc_env=rpc_env
+        config, reader, operator, contract = await asyncio.to_thread(
+            _prepare, config_path, testnet=testnet, profile=profile, rpc_env=rpc_env, wallet=wallet
         )
         return cls(
             config,
@@ -368,10 +632,11 @@ class Mppi:
                 collection_margin_ms=config.payment.collection_margin_ms,
             ),
             contract=contract,
-            wallet=wallet,
+            wallet=operator,
             coverage=coverage,
             execution=execution,
             control_auth_timeout=control_auth_timeout,
+            closed_retention=closed_retention,
             hooks=hooks,
         )
 
@@ -436,10 +701,10 @@ class Mppi:
                 ValidationCode.INVALID_VALUE, "shutdown requires a finite monotonic deadline"
             )
         self._stopping = True
-        async with self._condition:
+        async with self._lock:
             for session in self._sessions.values():
                 self._stop_session(session)
-            self._condition.notify_all()
+            self._wake_all()
         while (
             any(self._active(session) for session in self._sessions.values())
             and asyncio.get_running_loop().time() < deadline
@@ -502,6 +767,153 @@ class Mppi:
             run
             for run in session.runs.values()
             if run.admitted and run.accounting.final_status is None
+        )
+
+    def _final(self, session: _Session) -> bool:
+        """Nothing remains to serve, collect or reconcile.
+
+        The follower shows the session closed, which is terminal on chain (every
+        payment path reverts ``SessionIsClosed``, MPPI.sol ``_existingSession``);
+        no run is active or preparing; every retained operation is resolved, and
+        a confirmed close of ours has its result; and it is not inconsistent,
+        which waits for its operator however long. A close another exit
+        completed (``withdraw``, ``releaseIdle``) is final with no close result.
+        """
+        current = self.chain.current
+        state = current.sessions.get(session.sid) if current is not None else None
+        operation = session.operation
+        awaiting_result = (
+            session.close_result is None
+            and operation is not None
+            and operation.prepared.kind is OperationKind.CLOSE
+            and operation.result.state is OperationState.CONFIRMED
+        )
+        return (
+            state is not None
+            and state.status is SessionStatus.CLOSED
+            and all(
+                run.not_admitted or (run.admitted and run.accounting.final_status is not None)
+                for run in session.runs.values()
+            )
+            and not any(_unresolved(item) for item in (operation, session.baseline))
+            and not awaiting_result
+            and not session.inconsistent
+        )
+
+    def _retire(self) -> None:
+        """Retire each session final for closed_retention that no live attachment owns.
+
+        Its watch is released unless a recovery holds it; the host's checkpoints
+        keep its history. A retired session is never reinstalled: openings and
+        final recovery evidence for a closed session are refused SESSION_CLOSED.
+        A session that retires no longer needs any reference it covers, from
+        the time it retired: retirement counts as no delay (_references).
+        """
+        now = time.monotonic()
+        retired: set[bytes] = set()
+        for session in tuple(self._sessions.values()):
+            if not self._final(session):
+                session.final_since = None
+                continue
+            if session.final_since is None:
+                session.final_since = now
+            owned = session.owner is not None and session.owner.live
+            if owned or now - session.final_since < self._closed_retention:
+                continue
+            del self._sessions[session.sid]
+            retired.add(session.sid)
+            if session.sid not in self.sessions._watching:
+                self.chain.unwatch_session(session.sid)
+            self._observers.emit("on_session_retired", session.sid)
+        if retired:
+            now = time.time()
+            for covered in self._references.values():
+                for sid in covered.keys() & retired:
+                    covered[sid] = now
+            self._hand_over()
+
+    def _supersede(self, confirmed: str, sids: Iterable[bytes]) -> None:
+        """A confirmed collection supersedes, for each session it covers, every
+        other reference that session's checkpoint no longer names (neither its
+        operation nor its baseline): a checkpoint taken before then may still
+        present one, for closed_retention (the age rule, docs/python-runtime.md)."""
+        at = time.time() + self._closed_retention
+        held = [self._sessions[sid] for sid in set(sids) if sid in self._sessions]
+        for reference, covered in self._references.items():
+            if reference == confirmed:
+                continue
+            for session in held:
+                named = (session.operation, session.baseline)
+                if covered.get(session.sid, at) is None and all(
+                    operation is None or operation.reference != reference for operation in named
+                ):
+                    covered[session.sid] = at
+        self._hand_over()
+
+    def _hand_over(self) -> None:
+        """Hand each reference that no covered session needs any longer to
+        retirement, due at the latest of their times, as soon as that is known:
+        the wallet keeps the time durably."""
+        for reference, covered in tuple(self._references.items()):
+            times = [at for at in covered.values() if at is not None]
+            if len(times) == len(covered):
+                del self._references[reference]
+                self._retirable.append((reference, max(times, default=0.0)))
+
+    async def _forget(
+        self, references: list[tuple[str, float]], unconfirmed: dict[str, OperationResult]
+    ) -> None:
+        """Have the wallet forget references no session needs, each from its
+        due time, when it can (an optional ``retire``): one call at a time, for
+        each whole second the references are due in, naming its latest time:
+        for any wallet, never before a reference in it is due and less than a
+        second after (the Circle adapter keeps whole seconds). After a refusal
+        the rest wait for a later pass, at most once per settlement interval, so
+        a wallet that refuses for a while loses none and is not asked every
+        pass.
+
+        A reference in ``unconfirmed``, whose record no wallet answer in this
+        process matched, goes only if the wallet's record of it agrees now, by
+        recovery's check (_agrees); otherwise it is kept. Every other one this
+        process has reconciled already."""
+        retire = getattr(self.wallet, "retire", None)
+        if retire is None:
+            return
+        due: dict[int, list[tuple[str, float]]] = {}
+        for reference, at in references:
+            record = unconfirmed.get(reference)
+            if record is not None:
+                try:
+                    answer = await asyncio.to_thread(self.wallet.reconcile, operation_ref=reference)
+                except Exception:
+                    continue
+                if not _agrees(record, answer):
+                    continue
+            due.setdefault(math.floor(at), []).append((reference, at))
+        refused: list[tuple[str, float]] = []
+        for _, queued in sorted(due.items()):
+            # A recovery since the hand-over may have named a reference again
+            # (_references): a session needs it, so it is not passed. This reads
+            # memory only.
+            group = [
+                (reference, at) for reference, at in queued if reference not in self._references
+            ]
+            if not group:
+                continue
+            if not refused:
+                try:
+                    await asyncio.to_thread(
+                        retire,
+                        operation_refs=tuple(reference for reference, _ in group),
+                        at=max(at for _, at in group),
+                    )
+                    continue
+                except Exception:
+                    pass
+            refused.extend(group)
+        self._retirable.extend(refused)
+        self._retire_after = (
+            time.monotonic() + self.config.settlement.interval_ms / 1000 if refused else None
         )
 
     def _snapshot(self) -> ChainSnapshot:
@@ -577,6 +989,23 @@ class Mppi:
             except _RpcFailure:
                 pass
 
+    @staticmethod
+    def _wake(session: _Session | None) -> None:
+        """Wake the session's runs waiting for admission, holding the lock.
+
+        A waiting run reads only its own session's state and the runtime-wide
+        state, so call this after any change to the session; runtime-wide
+        changes call ``_wake_all``.
+        """
+        if session is not None:
+            session.wake.notify_all()
+
+    def _wake_all(self) -> None:
+        """Wake every waiting run: for shutdown and for a change in chain
+        readiness, which every session's admission reads."""
+        for session in self._sessions.values():
+            session.wake.notify_all()
+
     async def Session(
         self, requests: AsyncIterator[pb.ControlMessage], rpc: ServicerContext[Any, Any]
     ) -> AsyncIterator[pb.ControlMessage]:
@@ -597,9 +1026,9 @@ class Mppi:
         except _RpcFailure as error:
             await self._abort(rpc, error)
         finally:
-            async with self._condition:
+            async with self._lock:
                 self._detach(attachment)
-                self._condition.notify_all()
+                self._wake(attachment.session)
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
 
@@ -623,7 +1052,7 @@ class Mppi:
                     elif kind == "voucher":
                         await self._receive_voucher(attachment, message.voucher)
                     elif kind in ("top_up_notice", "close_request"):
-                        async with self._condition:
+                        async with self._lock:
                             session = self._owner(attachment, getattr(message, kind).session_id)
                             if kind == "close_request":
                                 try:
@@ -646,14 +1075,17 @@ class Mppi:
                                         pb.ControlMessage(close_result=session.close_result),
                                     )
                                     continue
-                                session.close_pending = True
                                 if session.close_reference is None:
                                     session.close_reference = "close:" + secrets.token_hex(32)
-                                self._stop_session(session)
+                                if not session.close_pending:
+                                    # Accepted once: its runs stop and its owner
+                                    # is told once (Drain).
+                                    session.close_pending = True
+                                    self._stop_session(session)
                                 self._schedule_collection(session.sid, close=True)
                             # TopUpNotice is only a hint. The follower is the source
                             # of D; no credit or voucher acknowledgement is added.
-                            self._condition.notify_all()
+                            self._wake(session)
                     else:
                         raise _RpcFailure(
                             grpc.StatusCode.INVALID_ARGUMENT, "invalid Control direction"
@@ -681,9 +1113,9 @@ class Mppi:
             self._observers.emit("on_error", HookError("control", "FAILED_PRECONDITION"))
             attachment.queue.close(_not_ready("STATE_UNAVAILABLE"))
         finally:
-            async with self._condition:
+            async with self._lock:
                 self._detach(attachment)
-                self._condition.notify_all()
+                self._wake(attachment.session)
             attachment.queue.close()
 
     @staticmethod
@@ -773,28 +1205,37 @@ class Mppi:
                 raise _RpcFailure(
                     grpc.StatusCode.UNAUTHENTICATED, "agent identity differs from funding wallet"
                 )
-        await self.chain.watch_session(notice.session_id)
-        async with self._condition:
-            existing = self._sessions.get(notice.session_id)
-            if existing is not None:
-                if (
-                    existing.opening.descriptor != descriptor
-                    or existing.opening.tx_hash != evidence.tx_hash
-                ):
-                    raise _not_ready("INCONSISTENT_STATE", notice.session_id)
-                return
-            if attachment.session is not None:
-                raise _RpcFailure(
-                    grpc.StatusCode.INVALID_ARGUMENT, "Control already bound to a session"
+        # A refused opening releases the watch it took, unless the session is
+        # held or another opening or recovery still holds it (_Sessions._watched).
+        with self.sessions._watched(notice.session_id):
+            state = await self.chain.watch_session(notice.session_id)
+            async with self._lock:
+                existing = self._sessions.get(notice.session_id)
+                if existing is not None:
+                    if (
+                        existing.opening.descriptor != descriptor
+                        or existing.opening.tx_hash != evidence.tx_hash
+                    ):
+                        raise _not_ready("INCONSISTENT_STATE", notice.session_id)
+                    return
+                if state.status is SessionStatus.CLOSED:
+                    # Nothing about a closed session can be served or collected.
+                    # Installing one again (it may have retired) would be a
+                    # fresh session with no runs.
+                    raise _not_ready("SESSION_CLOSED", notice.session_id)
+                if attachment.session is not None:
+                    raise _RpcFailure(
+                        grpc.StatusCode.INVALID_ARGUMENT, "Control already bound to a session"
+                    )
+                initial = evidence.initial_catalog
+                self._sessions[notice.session_id] = _Session(
+                    notice.session_id,
+                    evidence,
+                    {initial.rate_card_hash: initial},
+                    history_available=self._start_block is not None
+                    and evidence.observation.block_number > self._start_block,
+                    wake=asyncio.Condition(self._lock),
                 )
-            initial = evidence.initial_catalog
-            self._sessions[notice.session_id] = _Session(
-                notice.session_id,
-                evidence,
-                {initial.rate_card_hash: initial},
-                history_available=self._start_block is not None
-                and evidence.observation.block_number > self._start_block,
-            )
 
         self._observers.emit("on_session_open", notice)
 
@@ -811,11 +1252,11 @@ class Mppi:
         return session
 
     async def _receive_voucher(self, attachment: _Attachment, voucher: pb.Voucher) -> None:
-        async with self._condition:
+        async with self._lock:
             session = self._owner(attachment, voucher.session_id)
             if voucher.cumulative <= self._snapshot().sessions[session.sid].deposit:
                 self._voucher(session, voucher)
-                self._condition.notify_all()
+                self._wake(session)
                 return
             # A confirmed top-up can reach the agent before our periodic follower.
             # Authenticate before spending an RPC; neither a notice nor this proof
@@ -829,11 +1270,11 @@ class Mppi:
         async with asyncio.timeout(self.config.chain.max_age_ms / 1000):
             await self.chain.refresh()
 
-        async with self._condition:
+        async with self._lock:
             session = self._owner(attachment, voucher.session_id)
             self._gate(session)
             self._voucher(session, voucher)
-            self._condition.notify_all()
+            self._wake(session)
 
     def _verify_voucher(self, session: _Session, voucher: pb.Voucher) -> None:
         if voucher.session_id != session.sid:
@@ -863,7 +1304,7 @@ class Mppi:
                 self._observers.emit("on_voucher", voucher)
 
     async def _attach(self, attachment: _Attachment, request: pb.ReconnectRequest) -> None:
-        async with self._condition:
+        async with self._lock:
             self._require_setup_time(attachment)
             session = self._sessions.get(request.session_id)
             if session is None:
@@ -932,7 +1373,7 @@ class Mppi:
             attachment.setup_deadline = None
             if advanced and session.voucher is not None:
                 self._observers.emit("on_voucher", session.voucher)
-            self._condition.notify_all()
+            self._wake(session)
 
     def _session_state(
         self, session: _Session, request: pb.ReconnectRequest, *, private: bool = False
@@ -1038,6 +1479,7 @@ class Mppi:
     async def Completions(
         self, request: pb.CompleteRequest, rpc: ServicerContext[Any, Any]
     ) -> AsyncIterator[pb.ChatChunk]:
+        arrived = time.monotonic()
         run: _Run | None = None
         try:
             validate_message(request)
@@ -1049,7 +1491,7 @@ class Mppi:
                 request.model,
                 request.rate_card_hash,
             )
-            async with self._condition:
+            async with self._lock:
                 session = self._sessions.get(context.session_id)
                 if session is None:
                     raise _RpcFailure(
@@ -1096,16 +1538,30 @@ class Mppi:
                 session.publications[context.rate_card_hash] = snapshot.identities[
                     self.config.identity.provider_id
                 ].observation
-            bound = await self.coverage(run.request, context)
-            if (
-                not isinstance(bound, TokenCounts)
-                or bound.output_tokens < self.config.payment.output_buffer_tokens
-            ):
-                raise ValidationError(
-                    ValidationCode.INVALID_VALUE,
-                    "provider must supply prefill and configured output coverage",
+            admission = _Timing("admission", arrived)
+            try:
+                with admission.part("coverage"):
+                    try:
+                        bound = await self.coverage(run.request, context)
+                    except UpstreamFailure:
+                        raise
+                    except Exception:
+                        # A host error never reaches the agent as text, as in
+                        # the Rust runtime (services.rs coverage).
+                        raise _not_ready("STATE_UNAVAILABLE", session.sid, context.run_id) from None
+                if (
+                    not isinstance(bound, TokenCounts)
+                    or bound.output_tokens < self.config.payment.output_buffer_tokens
+                ):
+                    raise ValidationError(
+                        ValidationCode.INVALID_VALUE,
+                        "provider must supply prefill and configured output coverage",
+                    )
+                await self._admit(session, run, bound)
+            finally:
+                self._observers.emit(
+                    "on_timing", admission.report("admitted" if run.admitted else None)
                 )
-            await self._admit(session, run, bound)
             run.output = ByteQueue(wait_ms=self.config.payment.authorization_wait_ms)
             run.task = self._spawn(self._execute(run))
             while True:
@@ -1127,13 +1583,13 @@ class Mppi:
             )
         finally:
             if run is not None:
-                async with self._condition:
+                async with self._lock:
                     if not run.admitted:
                         run.not_admitted = True
                         run.request = PreparedRequest(b"", run.request.stream)
                     elif run.accounting.final_status is None:
                         run.stop.set()
-                    self._condition.notify_all()
+                    self._wake(session)
 
     def _prices(self, session: _Session, context: RunContext, snapshot: ChainSnapshot) -> Rates:
         identity = snapshot.identities.get(self.config.identity.provider_id)
@@ -1318,7 +1774,7 @@ class Mppi:
 
     async def _admit(self, session: _Session, run: _Run, bound: TokenCounts) -> None:
         expires: float | None = None
-        async with self._condition:
+        async with self._lock:
             while True:
                 snapshot = self._gate(session, run.context)
                 self._prices(session, run.context, snapshot)
@@ -1365,7 +1821,7 @@ class Mppi:
                     run.covered_counts = bound
                     run.accounting = RunAccounting(_ZERO, priced_numerator(bound, run.rates))
                     run.admitted = True
-                    self._condition.notify_all()  # The next waiting run may now be covered.
+                    self._wake(session)  # The next waiting run may now be covered.
                     return
                 if run.queued is None:
                     run.queued = _Queued(session.waited, now)
@@ -1388,9 +1844,12 @@ class Mppi:
                         run.queued.sent = (encoded, now, voucher)
                         assert session.owner is not None
                         self._send(session.owner, guidance)
+                # Its session's changes, shutdown and a change in chain readiness
+                # wake it. The re-check covers what no event marks, such as a
+                # turn ending or a new block.
                 try:
                     timeout = 0.05 if expires is None else min(expires - now, 0.05)
-                    await asyncio.wait_for(self._condition.wait(), timeout)
+                    await asyncio.wait_for(session.wake.wait(), timeout)
                 except TimeoutError:
                     pass
 
@@ -1409,7 +1868,7 @@ class Mppi:
             # Dispatch is a separate scheduling boundary after admission. A
             # detached Control, cancellation or changed chain readiness may
             # have invalidated the grant before this task first runs.
-            async with self._condition:
+            async with self._lock:
                 session, _ = self._run(run.context)
                 self._gate(session, run.context)
                 if run.stop.is_set():
@@ -1451,7 +1910,13 @@ class Mppi:
             error = _not_ready("STATE_UNAVAILABLE", run.context.session_id, run.context.run_id)
         except Exception:
             run.stop.set()
-            error = _not_ready("STATE_UNAVAILABLE", run.context.session_id, run.context.run_id)
+            # A host error after this runtime refused the run's coverage reaches
+            # the agent as that refusal; arbitrary host errors stay sanitized.
+            error = (
+                _payment(run.refusal)
+                if run.refusal is not None
+                else _not_ready("STATE_UNAVAILABLE", run.context.session_id, run.context.run_id)
+            )
         finally:
             if run.terminal is not None and error is None:
                 try:
@@ -1461,12 +1926,12 @@ class Mppi:
             elif error is None:
                 run.stop.set()
                 error = _not_ready("STATE_UNAVAILABLE", run.context.session_id, run.context.run_id)
-            async with self._condition:
+            async with self._lock:
                 if run.accounting.final_status is None:
                     run.unresolved = True
                     run.stop.set()
                 run.request = PreparedRequest(b"", run.request.stream)
-                self._condition.notify_all()
+                self._wake(self._sessions.get(run.context.session_id))
             run.output.close(error)
 
     def _run(self, context: RunContext) -> tuple[_Session, _Run]:
@@ -1482,7 +1947,7 @@ class Mppi:
         self, context: RunContext, remaining_tokens: TokenCounts
     ) -> CoverageResult:
         """Request a full remaining bound; existing reserved cost cannot shrink."""
-        async with self._condition:
+        async with self._lock:
             session, run = self._run(context)
             try:
                 snapshot = self._gate(session, context)
@@ -1542,6 +2007,8 @@ class Mppi:
                 failure = error.payment or PaymentFailure(
                     PaymentCode.SESSION_NOT_READY, "CONTROL_NOT_READY", session.sid, context.run_id
                 )
+                if run.refusal is None:
+                    run.refusal = failure
                 return CoverageResult(
                     False,
                     required_coverage(
@@ -1557,16 +2024,15 @@ class Mppi:
                 )
 
     async def report_usage(self, context: RunContext, counts: TokenCounts) -> AccountingResult:
-        async with self._condition:
+        async with self._lock:
             result, _ = self._report(context, counts, None)
             return result
 
     async def report_terminal(
         self, context: RunContext, counts: TokenCounts, status: RunStatus
     ) -> FinalAccountingResult:
-        async with self._condition:
+        async with self._lock:
             result, _ = self._report(context, counts, status)
-            self._condition.notify_all()
             return FinalAccountingResult(result, status)
 
     def _report(
@@ -1648,7 +2114,7 @@ class Mppi:
             except _RpcFailure:
                 # Accounting is retained even if final delivery becomes lost.
                 pass
-        self._condition.notify_all()
+        self._wake(session)
         return AccountingResult(context, counts, sequence, usage, False), run
 
     async def _maintain(self) -> None:
@@ -1665,17 +2131,62 @@ class Mppi:
                     self._initialize()
                 except (ChainEvidenceError, ValidationError):
                     continue
-            async with self._condition:
+            async with self._lock:
                 for session in self._sessions.values():
                     try:
                         self._gate(session)
                     except _RpcFailure:
                         if any(not run.stop.is_set() for run in self._active(session)):
                             self._stop_session(session)
-                self._condition.notify_all()
+                            self._wake(session)
+                self._retire()
+                if (
+                    self._retirable
+                    and (self._retiring is None or self._retiring.done())
+                    and (self._retire_after is None or time.monotonic() >= self._retire_after)
+                ):
+                    unconfirmed = {
+                        reference: self._unconfirmed.pop(reference)
+                        for reference, _ in self._retirable
+                        if reference in self._unconfirmed
+                    }
+                    self._retiring = self._spawn(self._forget(self._retirable, unconfirmed))
+                    self._retirable = []
+                near_capacity = getattr(self.wallet, "near_capacity", False) is True
+                if near_capacity and not self._near_capacity:
+                    self._observers.emit(
+                        "on_error",
+                        HookError(
+                            "wallet",
+                            "RESOURCE_EXHAUSTED",
+                            detail="wallet: operation records near capacity",
+                        ),
+                    )
+                self._near_capacity = near_capacity
+                # Every session's admission reads chain readiness: a change can
+                # end every wait at once.
+                readiness = self.chain.readiness()
+                if readiness != self._readiness:
+                    self._readiness = readiness
+                    self._wake_all()
             due_sessions: list[bytes] = []
             for session in tuple(self._sessions.values()):
+                if self._final(session):
+                    continue
                 if session.close_pending:
+                    # A close waits for its runs to end; one the wallet refused
+                    # is prepared again at most once per settlement interval.
+                    # Otherwise it continues on every pass, so a submitted
+                    # close is reconciled promptly.
+                    operation = session.operation
+                    if self._active(session) or (
+                        operation is not None
+                        and operation.prepared.kind is OperationKind.CLOSE
+                        and operation.result.state is OperationState.FAILED
+                        and time.monotonic() - session.last_collection
+                        < self.config.settlement.interval_ms / 1000
+                    ):
+                        continue
                     self._schedule_collection(session.sid, close=True)
                     continue
                 try:
@@ -1686,6 +2197,9 @@ class Mppi:
                         time.monotonic() - session.last_collection
                         >= self.config.settlement.interval_ms / 1000
                     )
+                    # A capture whose outcome is unknown is reconciled whatever
+                    # the session's state: an exit may have closed it since.
+                    reconcile = due and _unresolved(session.operation)
                     due |= (
                         self.config.settlement.amount is not None
                         and amount >= self.config.settlement.amount
@@ -1703,7 +2217,7 @@ class Mppi:
                         deadline - self.chain.estimated_timestamp()
                         <= 2 * self.config.payment.collection_margin_ms / 1000
                     )
-                    if amount and due and state.status is SessionStatus.OPEN:
+                    if reconcile or (amount and due and state.status is SessionStatus.OPEN):
                         if session.sid not in self._collecting:
                             due_sessions.append(session.sid)
                 except (ChainEvidenceError, _RpcFailure, ValidationError):
@@ -1731,7 +2245,11 @@ class Mppi:
 
         async def collect() -> None:
             try:
-                await group(ids)
+                # Each batch's calldata fits the wallet's call bound; the rest of
+                # the due sessions follow in further batches of this pass.
+                size = _batch_sessions(self._max_call_bytes)
+                for start in range(0, len(ids), size):
+                    await group(ids[start : start + size])
             finally:
                 self._collecting.difference_update(ids)
 
@@ -1768,11 +2286,15 @@ class _Sessions:
         self._provider = provider
         self._operations = asyncio.Lock()
         self._empty_batch: _PendingOperation | None = None
+        # Sessions whose chain watch an opening or a recovery holds, counted:
+        # each holds it until it installs or is refused, and they run
+        # concurrently (_watched).
+        self._watching: dict[bytes, int] = {}
 
     async def get(self, sid: bytes) -> SessionView:
         fixed_bytes(sid, 32, field="session_id")
         provider = self._provider
-        async with provider._condition:
+        async with provider._lock:
             session = provider._sessions.get(sid)
             if session is None:
                 raise _not_ready("STATE_UNAVAILABLE", sid)
@@ -1836,12 +2358,14 @@ class _Sessions:
         """Copy live protocol facts; callers retain them using their own infrastructure."""
         fixed_bytes(sid, 32, field="session_id")
         provider = self._provider
-        async with self._operations, provider._condition:
+        async with self._operations, provider._lock:
             session = provider._sessions.get(sid)
-            if session is None or not session.history_available:
-                raise _not_ready("STATE_UNAVAILABLE", sid)
+            if session is None:
+                raise _missing(sid, "the session is not held")
+            if not session.history_available:
+                raise _missing(sid, "the session's history is unavailable")
             if any(not run.admitted and not run.not_admitted for run in session.runs.values()):
-                raise _not_ready("STATE_UNAVAILABLE", sid)
+                raise _missing(sid, "a run is still preparing")
             snapshot = provider._session_state(
                 session, pb.ReconnectRequest(nonce=bytes(32)), private=True
             )
@@ -1875,6 +2399,17 @@ class _Sessions:
                 session.inconsistent,
             )
 
+    def _collects(self, prepared: PreparedOperation, sid: bytes) -> bool:
+        """A collection of this deployment's contract that covers ``sid``, the
+        first check of any supplied operation."""
+        domain = self._provider.contract.domain
+        return (
+            prepared.kind in (OperationKind.SETTLE, OperationKind.SETTLE_BATCH, OperationKind.CLOSE)
+            and prepared.call.chain_id == domain.chain_id
+            and prepared.call.to == domain.verifying_contract
+            and sid in prepared.session_ids
+        )
+
     def _restore_operation(
         self, evidence: RecoveryOperation | None, sid: bytes
     ) -> _PendingOperation | None:
@@ -1883,16 +2418,15 @@ class _Sessions:
         provider = self._provider
         prepared, result = evidence.prepared, evidence.result
         if (
-            prepared.kind
-            not in (OperationKind.SETTLE, OperationKind.SETTLE_BATCH, OperationKind.CLOSE)
-            or prepared.call.chain_id != provider.contract.domain.chain_id
-            or prepared.call.to != provider.contract.domain.verifying_contract
-            or sid not in prepared.session_ids
+            not self._collects(prepared, sid)
             or len(dict(evidence.units)) != len(evidence.units)
             or set(dict(evidence.units)) != set(prepared.session_ids)
             or any(type(value) is not int or value < 0 for _, value in evidence.units)
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(
+                sid,
+                "a saved operation does not collect this session or misstates its units",
+            )
         # Reconstructing rechecks exact ABI/descriptor/target consistency.
         prepared = PreparedOperation(
             prepared.kind,
@@ -1904,30 +2438,38 @@ class _Sessions:
         verified = OperationResult(
             result.operation_ref, OperationState.UNKNOWN, result.wallet_operation_id, result.tx_hash
         )
+        if (
+            result.state is OperationState.FAILED
+            and result.tx_hash is None
+            and result.wallet_operation_id is None
+            and result.observation is None
+            and not result.sessions
+        ):
+            # A FAILED result with no handle at all is the wallet's attestation
+            # that submission never began (NotSubmittedError): no call is bound
+            # to its reference and there is nothing to read. It stays FAILED, so
+            # the live rules apply again: a settlement is replaced by a new
+            # reference, and a close continues under its own. Neither can pay
+            # twice: captures are cumulative on chain, and the wallet checks a
+            # reused close reference against the call bound to it.
+            verified = OperationResult(
+                result.operation_ref, OperationState.FAILED, cause=result.cause
+            )
         if result.tx_hash is not None:
             # A saved hash is caller-supplied history. Bind it to the original
             # wallet intent before canonical receipts can establish failure
             # (including when a currently pending receipt later reverts).
             try:
                 bound = provider.wallet.reconcile(operation_ref=result.operation_ref)
-            except Exception:
-                raise _not_ready("STATE_UNAVAILABLE", sid) from None
-            if (
-                not isinstance(bound, OperationResult)
-                or bound.operation_ref != result.operation_ref
-                or bound.tx_hash != result.tx_hash
-                or (
-                    result.wallet_operation_id is not None
-                    and bound.wallet_operation_id != result.wallet_operation_id
+            except Exception as error:
+                raise _missing(
+                    sid,
+                    f"the wallet could not look up a saved transaction ({type(error).__name__})",
+                ) from None
+            if not _agrees(result, bound):
+                raise _inconsistent(
+                    sid, "the wallet's record of a saved transaction differs from the evidence"
                 )
-                or (
-                    bound.wallet_operation_id is not None
-                    and (
-                        type(bound.wallet_operation_id) is not str or not bound.wallet_operation_id
-                    )
-                )
-            ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
             verified = provider.chain.reader.reconcile(
                 prepared,
                 operation_ref=result.operation_ref,
@@ -1939,7 +2481,9 @@ class _Sessions:
                 or verified.tx_hash != result.tx_hash
                 or verified.wallet_operation_id != bound.wallet_operation_id
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(
+                    sid, "the chain's record of a saved transaction differs from the evidence"
+                )
         return _PendingOperation(prepared, result.operation_ref, verified, dict(evidence.units))
 
     def _restore(self, evidence: RecoveryEvidence) -> _Session:
@@ -1951,7 +2495,7 @@ class _Sessions:
         if record.control_generation == 0 and (
             evidence.runs or evidence.reservations or evidence.confirmed_units != 0
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "an unattached checkpoint has private accounting history")
         fixed_bytes(evidence.opening_tx, 32, field="opening_tx")
         descriptor = descriptor_from_wire(record.descriptor)
         if (
@@ -1961,20 +2505,24 @@ class _Sessions:
             or (record.close_pending != (evidence.close_reference is not None))
             or (evidence.close_reference is not None and not evidence.close_reference)
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(
+                sid, "the descriptor is not this provider's, or the close state is malformed"
+            )
         catalogs = {item.rate_card_hash: parse_catalog(item.catalog) for item in record.catalogs}
         if any(key != value.rate_card_hash for key, value in catalogs.items()):
-            raise _not_ready("INCONSISTENT_STATE", sid)
-        if record.initial_rate_card_hash not in catalogs or (
+            raise _inconsistent(sid, "a catalog does not match its hash or repeats")
+        if record.initial_rate_card_hash not in catalogs:
+            raise _missing(sid, "the evidence lacks the initial catalog")
+        if (
             record.HasField("current_rate_card_hash")
             and record.current_rate_card_hash not in catalogs
         ):
-            raise _not_ready("STATE_UNAVAILABLE", sid)
+            raise _missing(sid, "the evidence lacks the current catalog")
         opening = reader.opening(
             evidence.opening_tx, sid, accepted_catalog=catalogs[record.initial_rate_card_hash]
         )
         if opening.descriptor != descriptor:
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the opening transaction shows another descriptor")
         block = reader.block(evidence.observation.block_number)
         if (
             block.observation != evidence.observation
@@ -1982,7 +2530,7 @@ class _Sessions:
             or record.chain_block_hash != block.observation.block_hash
             or block.observation.block_number < opening.observation.block_number
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the checkpoint block contradicts the chain or the opening")
         chain_state = reader.session(sid, block)
         if (
             not chain_state.exists
@@ -1991,7 +2539,9 @@ class _Sessions:
             or _SESSION_STATUS[chain_state.status] != record.status
             or chain_state.initial_rate_card_hash != record.initial_rate_card_hash
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(
+                sid, "the session's chain state at the checkpoint block differs from the evidence"
+            )
         current_identity = reader.identity(
             descriptor.provider_id, block, allow_unavailable_catalog=True
         )
@@ -2001,24 +2551,28 @@ class _Sessions:
             or current_catalog is not None
             and record.current_rate_card_hash != current_catalog.rate_card_hash
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(
+                sid, "the current catalog differs from the provider's at the checkpoint block"
+            )
         publications = dict(evidence.publications)
         if len(publications) != len(evidence.publications) or not set(publications) <= set(
             catalogs
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "a publication names no catalog of the evidence or repeats")
         for key, catalog in catalogs.items():
             if key == record.initial_rate_card_hash:
                 continue
             observation = publications.get(key)
-            if observation is None or observation.block_number > block.observation.block_number:
-                raise _not_ready("STATE_UNAVAILABLE", sid)
+            if observation is None:
+                raise _missing(sid, "a catalog has no publication evidence")
+            if observation.block_number > block.observation.block_number:
+                raise _missing(sid, "a catalog was published after the checkpoint block")
             published_block = reader.block(observation.block_number)
             if published_block.observation != observation:
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(sid, "a catalog's publication differs from the chain")
             identity = reader.identity(descriptor.provider_id, published_block)
             if identity.catalog != catalog:
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(sid, "a catalog's publication differs from the chain")
         session = _Session(
             sid,
             opening,
@@ -2029,6 +2583,7 @@ class _Sessions:
             close_pending=record.close_pending,
             close_reference=evidence.close_reference,
             inconsistent=evidence.inconsistent,
+            wake=asyncio.Condition(provider._lock),
         )
         totals: dict[tuple[str, bytes], TokenCounts] = {}
         cursors: set[int] = set()
@@ -2043,12 +2598,22 @@ class _Sessions:
                 or type(item.not_admitted) is not bool
                 or item.admitted == item.not_admitted
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
-            verify_run_auth(provider.contract.domain, descriptor, context, item.signature)
-            rates = catalogs[context.rate_card_hash].rates_for(context.model)
+                raise _inconsistent(
+                    sid, "a run's context, admission or meter sequence contradicts the evidence"
+                )
+            try:
+                verify_run_auth(provider.contract.domain, descriptor, context, item.signature)
+            except ValidationError as error:
+                raise _invalid(error, "a run's acceptance signature is invalid") from None
+            try:
+                rates = catalogs[context.rate_card_hash].rates_for(context.model)
+            except KeyError:
+                raise _missing(sid, "a run's model has no rates in its catalog") from None
             uint64(item.meter_seq, field="meter sequence")
             if item.meter_seq > record.meter_seq or (item.meter_seq and item.meter_seq in cursors):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(
+                    sid, "a run's context, admission or meter sequence contradicts the evidence"
+                )
             if item.meter_seq:
                 cursors.add(item.meter_seq)
             accounting = item.accounting
@@ -2064,7 +2629,10 @@ class _Sessions:
                     or (accounting.counts != _ZERO and item.meter_seq == 0)
                     or (accounting.final_status is not None and item.meter_seq == 0)
                 ):
-                    raise _not_ready("INCONSISTENT_STATE", sid)
+                    raise _inconsistent(
+                        sid,
+                        "an admitted run's accounting contradicts its coverage or meter sequence",
+                    )
                 key = (context.model, context.rate_card_hash)
                 totals[key] = _sum_counts(totals.get(key, _ZERO), accounting.counts)
             elif (
@@ -2072,7 +2640,7 @@ class _Sessions:
                 or item.covered_counts != _ZERO
                 or item.meter_seq
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(sid, "a run that was not admitted has accounting")
             run = _Run(
                 context,
                 item.signature,
@@ -2088,14 +2656,14 @@ class _Sessions:
             run.stop.set()
             session.runs[context.run_id] = run
         if record.meter_seq != max(cursors, default=0):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the session's meter sequence is not its runs' last")
         actual_reservations = tuple(
             (run.context, run.accounting) for run in provider._active(session)
         )
         if dict(evidence.reservations) != dict(actual_reservations) or len(
             evidence.reservations
         ) != len(actual_reservations):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the reservations differ from the active runs")
         stated_totals: dict[tuple[str, bytes], TokenCounts] = {}
         for row in record.usage_by_price:
             key = (row.model, row.rate_card_hash)
@@ -2113,22 +2681,22 @@ class _Sessions:
                 )
                 or representative.signature != row.acceptance_signature
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(sid, "a priced usage row differs from its run")
             stated_totals[key] = TokenCounts(row.input_tokens, row.cache_tokens, row.output_tokens)
         if totals != stated_totals:
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the priced usage differs from the runs' totals")
         finals = {row.run_id: row for row in record.run_states}
         for run in session.runs.values():
             final = finals.pop(run.context.run_id, None)
             if run.accounting.final_status is None and run.admitted:
                 if final is not None:
-                    raise _not_ready("INCONSISTENT_STATE", sid)
+                    raise _inconsistent(sid, "an unfinished run has a final state")
                 continue
             if final is None:
-                raise _not_ready("STATE_UNAVAILABLE", sid)
+                raise _missing(sid, "a finished run has no final state")
             if run.not_admitted:
                 if final.status != pb.RUN_STATUS_NOT_ADMITTED:
-                    raise _not_ready("INCONSISTENT_STATE", sid)
+                    raise _inconsistent(sid, "a run that was not admitted has another final status")
             elif (
                 final.status
                 != _RUN_STATUS.get(run.accounting.final_status or RunStatus.NOT_ADMITTED)
@@ -2139,9 +2707,9 @@ class _Sessions:
                 or TokenCounts(final.input_tokens, final.cache_tokens, final.output_tokens)
                 != run.accounting.counts
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(sid, "a final state differs from its run")
         if finals:
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "a final state names no run of the evidence")
         required = required_coverage(
             (
                 session.usage_numerator,
@@ -2150,16 +2718,21 @@ class _Sessions:
         )
         if record.HasField("accepted_voucher"):
             voucher = record.accepted_voucher
-            verify_voucher(
-                provider.contract.domain, descriptor, voucher.cumulative, voucher.signature
-            )
+            try:
+                verify_voucher(
+                    provider.contract.domain, descriptor, voucher.cumulative, voucher.signature
+                )
+            except ValidationError as error:
+                raise _invalid(error, "the accepted voucher's signature is invalid") from None
             if voucher.session_id != sid or not required <= voucher.cumulative <= record.deposit:
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(
+                    sid, "the accepted voucher does not cover the usage or exceeds the deposit"
+                )
             session.voucher = pb.Voucher.FromString(voucher.SerializeToString())
         elif any(run.admitted for run in session.runs.values()) or record.settled_cumulative:
-            raise _not_ready("STATE_UNAVAILABLE", sid)
+            raise _missing(sid, "admitted usage has no accepted voucher")
         if session.usage < record.settled_cumulative:
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the usage is below the settled amount")
         session.operation = self._restore_operation(evidence.operation, sid)
         session.baseline = self._restore_operation(evidence.baseline, sid)
         for operation in (session.operation, session.baseline):
@@ -2175,10 +2748,14 @@ class _Sessions:
                 )
                 if operation_sid == sid
             ):
-                raise _not_ready("INCONSISTENT_STATE", sid)
+                raise _inconsistent(
+                    sid, "a saved operation exceeds the session's usage or names another descriptor"
+                )
             if operation.prepared.kind is OperationKind.CLOSE:
                 if not session.close_pending or session.close_reference != operation.reference:
-                    raise _not_ready("INCONSISTENT_STATE", sid)
+                    raise _inconsistent(
+                        sid, "a saved close does not match the session's close intent"
+                    )
                 if (
                     operation.result.state is OperationState.CONFIRMED
                     and operation.result.tx_hash is not None
@@ -2194,7 +2771,7 @@ class _Sessions:
             type(evidence.confirmed_units) is not int
             or not 0 <= evidence.confirmed_units <= session.units
         ):
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the confirmed units exceed the session's units")
         if evidence.confirmed_units:
             baseline = session.baseline
             if (
@@ -2205,11 +2782,11 @@ class _Sessions:
                     for outcome in baseline.result.sessions
                 )
             ):
-                raise _not_ready("STATE_UNAVAILABLE", sid)
+                raise _missing(sid, "confirmed units have no covered baseline")
         session.confirmed_units = evidence.confirmed_units
         # Every independently observed historical block remains canonical.
         if reader.block(block.observation.block_number) != block:
-            raise _not_ready("INCONSISTENT_STATE", sid)
+            raise _inconsistent(sid, "the checkpoint block is no longer canonical")
         return session
 
     async def recover(self, evidence: RecoveryEvidence) -> SessionView:
@@ -2253,11 +2830,57 @@ class _Sessions:
             evidence, snapshot=pb.SessionState.FromString(evidence.snapshot.SerializeToString())
         )
         sid = evidence.snapshot.session_id
-        async with self._operations:
+        # Every read comes first, holding only this session's watch, so sessions
+        # recover concurrently while collections go on. Every check against held
+        # state (the follower's snapshot, a session already held, other sessions'
+        # operations) runs below against what was read, under the operation and
+        # state locks with no read under them, and the candidate is installed
+        # under the same locks.
+        with self._watched(sid):
+            # Nothing remains to serve or collect for final evidence of a closed
+            # session: it is never reinstalled, whether or not it retired here.
+            if evidence.is_final():
+                state = await provider.chain.watch_session(sid)
+                if state.status is SessionStatus.CLOSED:
+                    # Hosts pass such records at startup: the session no longer
+                    # needs the references it names, from now, as if it retired
+                    # here. One only it covers goes at once; a batch waits for
+                    # the rest. A reference goes only if the wallet's own record
+                    # of it agrees with the record, as _restore_operation
+                    # corroborates a saved hash: both name the same transaction,
+                    # or neither names one. A mixed-up or corrupt record could
+                    # pair this session's call with another session's reference,
+                    # and a wallet record with a transaction the record lacks is
+                    # traceable, so it stays for the wallet's own reconciliation.
+                    # Keeping one is always safe.
+                    bound = []
+                    for named in (evidence.operation, evidence.baseline):
+                        if named is None or not self._collects(named.prepared, sid):
+                            continue
+                        try:
+                            answer = await asyncio.to_thread(
+                                provider.wallet.reconcile, operation_ref=named.result.operation_ref
+                            )
+                        except Exception:
+                            continue
+                        if _agrees(named.result, answer):
+                            bound.append(named)
+                    async with provider._lock:
+                        if sid not in provider._sessions:
+                            now = time.time()
+                            for named in bound:
+                                covered = provider._references.setdefault(
+                                    named.result.operation_ref,
+                                    dict.fromkeys(named.prepared.session_ids),
+                                )
+                                if covered.get(sid) is None:
+                                    covered[sid] = now
+                            provider._hand_over()
+                    raise _not_ready("SESSION_CLOSED", sid)
             candidate = await asyncio.to_thread(self._restore, evidence)
             candidate.admissions_known = history_current
             await provider.chain.watch_session(sid)
-            async with provider._condition:
+            async with self._operations, provider._lock:
                 current = provider.chain.snapshot().sessions[sid]
                 provider._history_fits(candidate)
                 if (
@@ -2267,7 +2890,7 @@ class _Sessions:
                     != candidate.opening.initial_catalog.rate_card_hash
                     or _SESSION_STATUS[current.status] < evidence.snapshot.status
                 ):
-                    raise _not_ready("INCONSISTENT_STATE", sid)
+                    raise _inconsistent(sid, "the chain follower's view contradicts the evidence")
                 previous = provider._sessions.get(sid)
                 if previous is not None:
                     if (previous.owner is not None and previous.owner.live) or provider._active(
@@ -2294,7 +2917,9 @@ class _Sessions:
                             or previous.voucher.cumulative > candidate.voucher.cumulative
                         )
                     ):
-                        raise _not_ready("INCONSISTENT_STATE", sid)
+                        raise _inconsistent(
+                            sid, "the evidence is older than the held session or contradicts it"
+                        )
                     if (
                         previous.operation is not None
                         and (
@@ -2308,7 +2933,10 @@ class _Sessions:
                             or candidate.operation.prepared != previous.operation.prepared
                         )
                     ):
-                        raise _not_ready("STATE_UNAVAILABLE", sid)
+                        raise _missing(
+                            sid,
+                            "the evidence lacks the held session's unresolved or close operation",
+                        )
                     for rid, run in previous.runs.items():
                         incoming = candidate.runs[rid]
                         if (
@@ -2316,7 +2944,7 @@ class _Sessions:
                             or run.signature != incoming.signature
                             or run.admitted != incoming.admitted
                         ):
-                            raise _not_ready("INCONSISTENT_STATE", sid)
+                            raise _inconsistent(sid, "a run differs from the held session's")
                         report_transition(
                             run.accounting,
                             incoming.accounting.counts,
@@ -2325,6 +2953,7 @@ class _Sessions:
                         )
                 # A recovered batch shares one retained operation object across
                 # all members, so overlapping operations cannot resubmit it.
+                read = candidate.operation
                 if candidate.operation is not None:
                     for other in provider._sessions.values():
                         operation = other.operation
@@ -2336,17 +2965,126 @@ class _Sessions:
                                 operation.prepared != candidate.operation.prepared
                                 or operation.units != candidate.operation.units
                             ):
-                                raise _not_ready("INCONSISTENT_STATE", sid)
+                                raise _inconsistent(
+                                    sid,
+                                    "another held session holds this reference for a different operation",
+                                )
                             candidate.operation = operation
+                # A restored reference covers sessions this process may not hold
+                # yet; each needs it until it retires here or a later confirmed
+                # collection supersedes it. The installed session names it again,
+                # so it leaves the retirement queue; a retire call already under
+                # way checks again before it is made (_forget). Its wallet check
+                # (_unconfirmed) is cleared only when the record restored here
+                # was looked up in the wallet, having a transaction hash, and
+                # agrees with the record kept, which may be a held one adopted
+                # above. A record kept against that lookup is checked at its
+                # hand-over, as is one restored without a hash; a held record
+                # adopted for one keeps the check it had.
+                for restored, looked_up in (
+                    (candidate.operation, read),
+                    (candidate.baseline, candidate.baseline),
+                ):
+                    if restored is not None and looked_up is not None:
+                        provider._references.setdefault(
+                            restored.reference, dict.fromkeys(restored.prepared.session_ids)
+                        )[sid] = None
+                        provider._retirable = [
+                            (queued, at)
+                            for queued, at in provider._retirable
+                            if queued != restored.reference
+                        ]
+                        checked = looked_up.result.tx_hash is not None
+                        if checked and _agrees(restored.result, looked_up.result):
+                            provider._unconfirmed.pop(restored.reference, None)
+                        elif checked or restored is looked_up:
+                            provider._unconfirmed[restored.reference] = restored.result
                 provider._sessions[sid] = candidate
-                provider._condition.notify_all()
+                # A run still waiting on the replaced record now fails at once.
+                provider._wake(previous)
         return await self.get(sid)
 
+    @contextmanager
+    def _watched(self, sid: bytes) -> Iterator[None]:
+        """Hold the chain watch of a session an opening or a recovery reads.
+
+        The last one out releases the watch of a session not held, as Rust's
+        PendingWatch does: a refused opening or recovery leaves none behind.
+        """
+        self._watching[sid] = self._watching.get(sid, 0) + 1
+        try:
+            yield
+        finally:
+            self._watching[sid] -= 1
+            if not self._watching[sid]:
+                del self._watching[sid]
+                if sid not in self._provider._sessions:
+                    self._provider.chain.unwatch_session(sid)
+
+    async def _measured(
+        self, operation: str, work: Coroutine[Any, Any, OperationResult]
+    ) -> OperationResult:
+        """Run one collection call, then report where its time went (on_timing)."""
+        timing = _Timing(operation)
+        token = _TIMING.set(timing)
+        state: str | None = None
+        try:
+            result = await work
+            state = result.state.value
+            return result
+        finally:
+            _TIMING.reset(token)
+            self._provider._observers.emit("on_timing", timing.report(state))
+
+    async def _operate(
+        self,
+        helper: Callable[..., OperationResult],
+        prepared: PreparedOperation,
+        reference: str,
+        *,
+        unsent: Callable[[], None] | None = None,
+    ) -> OperationResult:
+        """One submit or reconcile helper call: the wallet's own call is wallet
+        time, and the receipt proof after it chain time.
+
+        The call runs in a worker thread, and a caller cancelled while it waits
+        for one would leave it queued. The worker marks the call begun under a
+        lock before anything reaches the wallet; a caller cancelled first marks
+        it abandoned, so it never begins, and ``unsent`` then removes the intent
+        the wallet never saw, as a failed simulation does.
+        """
+        provider = self._provider
+        wallet = _TimedWallet(provider.wallet)
+        handoff = _Handoff()
+
+        def call() -> OperationResult:
+            if not handoff.begin():
+                raise asyncio.CancelledError
+            return helper(wallet, prepared, operation_ref=reference, chain=provider.chain.reader)
+
+        started = time.monotonic()
+        try:
+            return await asyncio.to_thread(call)
+        except asyncio.CancelledError:
+            if handoff.abandon() and unsent is not None:
+                unsent()
+            raise
+        finally:
+            timing = _TIMING.get()
+            if timing is not None:
+                now = time.monotonic()
+                spent = wallet.spent(now)
+                timing.parts["wallet"] += spent
+                timing.parts["chain"] += now - started - spent
+
     async def settle(self, sid: bytes) -> OperationResult:
-        return await self._collect((sid,), close=False)
+        return await self._measured("settle", self._collect((sid,), close=False))
 
     async def settleBatch(self, session_ids: tuple[bytes, ...]) -> OperationResult:
         """One exact ordered batch; repeated ids preserve contract item semantics."""
+        return await self._measured("settleBatch", self._settle_batch(session_ids))
+
+    async def _settle_batch(self, session_ids: tuple[bytes, ...]) -> OperationResult:
         if type(session_ids) is not tuple:
             raise ValidationError(ValidationCode.INVALID_VALUE, "batch ids must be a tuple")
         if len(session_ids) > MAX_MESSAGE_BYTES // 512:
@@ -2359,9 +3097,10 @@ class _Sessions:
                     return pending.result
                 if pending is None:
                     prepared = provider.contract.settle_batch(())
-                    await asyncio.to_thread(
-                        provider.chain.reader.simulate, prepared, sender=provider.wallet.address
-                    )
+                    with _timed("chain"):
+                        await asyncio.to_thread(
+                            provider.chain.reader.simulate, prepared, sender=provider.wallet.address
+                        )
                     reference = "settleBatch:" + secrets.token_hex(32)
                     pending = _PendingOperation(
                         prepared, reference, OperationResult(reference, OperationState.UNKNOWN), {}
@@ -2370,12 +3109,16 @@ class _Sessions:
                     helper = submit_operation
                 else:
                     helper = reconcile_operation
-                result = await asyncio.to_thread(
+
+                def unsent() -> None:
+                    if self._empty_batch is pending:
+                        self._empty_batch = None
+
+                result = await self._operate(
                     helper,
-                    provider.wallet,
                     pending.prepared,
-                    operation_ref=pending.reference,
-                    chain=provider.chain.reader,
+                    pending.reference,
+                    unsent=unsent if helper is submit_operation else None,
                 )
                 known = pending.result
                 conflict = (
@@ -2395,13 +3138,14 @@ class _Sessions:
                         known.tx_hash,
                     )
                     try:
-                        observed = await asyncio.to_thread(
-                            provider.chain.reader.reconcile,
-                            pending.prepared,
-                            operation_ref=pending.reference,
-                            tx_hash=known.tx_hash,
-                            wallet_operation_id=known.wallet_operation_id,
-                        )
+                        with _timed("chain"):
+                            observed = await asyncio.to_thread(
+                                provider.chain.reader.reconcile,
+                                pending.prepared,
+                                operation_ref=pending.reference,
+                                tx_hash=known.tx_hash,
+                                wallet_operation_id=known.wallet_operation_id,
+                            )
                         if (
                             observed.operation_ref == pending.reference
                             and observed.tx_hash == known.tx_hash
@@ -2419,145 +3163,223 @@ class _Sessions:
         return await self._collect(session_ids, close=False, batch=True)
 
     async def close(self, sid: bytes) -> OperationResult:
-        return await self._collect((sid,), close=True)
+        return await self._measured("close", self._collect((sid,), close=True))
 
     async def _collect(
         self, ids: tuple[bytes, ...], *, close: bool, batch: bool = False
     ) -> OperationResult:
         provider = self._provider
         async with self._operations:
-            async with provider._condition:
-                sessions: list[_Session] = []
-                for sid in ids:
-                    fixed_bytes(sid, 32, field="session_id")
-                    if sid not in provider._sessions:
-                        raise _not_ready("STATE_UNAVAILABLE", sid)
-                    sessions.append(provider._sessions[sid])
-                if close:
-                    completed = sessions[0]
-                    if completed.close_result is not None and completed.operation is not None:
-                        return completed.operation.result
-                    sessions[0].close_pending = True
-                    if sessions[0].close_reference is None:
-                        sessions[0].close_reference = "close:" + secrets.token_hex(32)
-                    provider._stop_session(sessions[0])
-                    provider._condition.notify_all()
-                unresolved = [
-                    session.operation
-                    for session in sessions
-                    if session.operation is not None
-                    and session.operation.result.state
-                    in (OperationState.PENDING, OperationState.UNKNOWN)
-                    and session.operation.result.observation is None
-                ]
-                # Reconcile one original intersecting intent before any new
-                # submission. Distinct completed captures may be superseded
-                # together; distinct unresolved calls retain their identities.
-                pending = unresolved[0] if unresolved else sessions[0].operation
-                covered = (
-                    pending is not None
-                    and pending.result.observation is not None
-                    and bool(pending.result.sessions)
-                    and all(item.target_covered is True for item in pending.result.sessions)
-                )
-                if (
-                    pending is not None
-                    and pending.result.state in (OperationState.PENDING, OperationState.UNKNOWN)
-                    and not covered
-                    and pending.result.observation is None
-                ):
-                    prepared, reference = pending.prepared, pending.reference
-                    submit = False
-                else:
-                    snapshot = provider.chain.snapshot()
-                    if snapshot.pause_level is not PauseLevel.NONE:
-                        raise _payment(
-                            PaymentFailure(
-                                PaymentCode.SESSION_NOT_READY,
-                                "CONTRACT_PAUSED",
-                                ids[0],
-                                pause_level=snapshot.pause_level,
-                            )
-                        )
-                    items = []
-                    for session in sessions:
-                        state = snapshot.sessions[session.sid]
-                        if session.inconsistent or not session.history_available:
-                            raise _not_ready("INCONSISTENT_STATE", session.sid)
-                        if close and provider._active(session):
-                            assert session.close_reference is not None
-                            return OperationResult(session.close_reference, OperationState.UNKNOWN)
-                        if state.status is SessionStatus.CLOSED:
-                            if (
-                                close
-                                and session.close_result is not None
-                                and session.operation is not None
-                            ):
-                                return session.operation.result
-                            raise _not_ready("SESSION_CLOSED", session.sid)
-                        deadline = (
-                            state.last_activity + 86400
-                            if state.status is SessionStatus.OPEN
-                            else state.close_requested_at + 3600
-                        )
-                        expired = provider.chain.estimated_timestamp() >= deadline
-                        if not close and (expired or state.status is not SessionStatus.OPEN):
-                            raise _not_ready("CLAIM_DEADLINE", session.sid)
-                        capture = (
-                            state.settled_cumulative
-                            if close and expired
-                            else max(session.usage, state.settled_cumulative)
-                        )
-                        voucher = session.voucher
-                        if capture > state.settled_cumulative or not close:
-                            if (
-                                voucher is None
-                                or capture > voucher.cumulative
-                                or capture > state.deposit
-                            ):
-                                raise _not_ready("AUTHORIZATION_REQUIRED", session.sid)
-                            cumulative, signature = voucher.cumulative, voucher.signature
-                        else:
-                            cumulative, signature = capture, b""
-                        items.append((session.opening.descriptor, cumulative, capture, signature))
-                    if (
-                        not close
+            # The call a reverted close's successor last simulated, below.
+            simulated: WalletCall | None = None
+            while True:
+                next_close: PreparedOperation | None = None
+                async with provider._lock:
+                    sessions: list[_Session] = []
+                    for sid in ids:
+                        fixed_bytes(sid, 32, field="session_id")
+                        if sid not in provider._sessions:
+                            raise _not_ready("STATE_UNAVAILABLE", sid)
+                        sessions.append(provider._sessions[sid])
+                    if close:
+                        completed = sessions[0]
+                        if completed.close_result is not None and completed.operation is not None:
+                            return completed.operation.result
+                        if completed.close_reference is None:
+                            completed.close_reference = "close:" + secrets.token_hex(32)
+                        if not completed.close_pending:
+                            # Close intent is accepted once: its runs stop and its
+                            # owner is told once (Drain). A later call, the agent's
+                            # or maintenance's, only continues the close.
+                            completed.close_pending = True
+                            provider._stop_session(completed)
+                            provider._wake(completed)
+                    unresolved = [
+                        session.operation
+                        for session in sessions
+                        if session.operation is not None
+                        and session.operation.result.state
+                        in (OperationState.PENDING, OperationState.UNKNOWN)
+                        and session.operation.result.observation is None
+                    ]
+                    # Reconcile one original intersecting intent before any new
+                    # submission. Distinct completed captures may be superseded
+                    # together; distinct unresolved calls retain their identities.
+                    pending = unresolved[0] if unresolved else sessions[0].operation
+                    covered = (
+                        pending is not None
+                        and pending.result.observation is not None
+                        and bool(pending.result.sessions)
+                        and all(item.target_covered is True for item in pending.result.sessions)
+                    )
+                    # A close mined and reverted changed no state; it is prepared
+                    # again under its successor reference, at most once per
+                    # settlement interval, since each attempt is a transaction.
+                    retry = (
+                        close
                         and pending is not None
-                        and (pending.result.state is OperationState.CONFIRMED or covered)
-                        and pending.prepared.session_ids == ids
-                        and pending.prepared.amounts == tuple(item[2] for item in items)
+                        and pending.prepared.kind is OperationKind.CLOSE
+                        and pending.result.state is OperationState.FAILED
+                        and pending.result.tx_hash is not None
+                    )
+                    if (
+                        retry
+                        and pending is not None
+                        and time.monotonic() - sessions[0].last_collection
+                        < provider.config.settlement.interval_ms / 1000
                     ):
                         return pending.result
-                    prepared = (
-                        provider.contract.close(*items[0])
-                        if close
-                        else provider.contract.settle_batch(items)
-                        if batch
-                        else provider.contract.settle(*items[0])
-                    )
-                    if len(prepared.call.data) > MAX_MESSAGE_BYTES:
-                        raise ValidationError(
-                            ValidationCode.INVALID_VALUE, "batch calldata exceeds resource limit"
+                    if (
+                        close
+                        and pending is not None
+                        and pending.prepared.kind is OperationKind.CLOSE
+                        and pending.result.state is OperationState.CONFIRMED
+                    ):
+                        # Confirmed, but its closing evidence was never read: read it
+                        # again, with no wallet call and never a second close.
+                        prepared, reference = pending.prepared, pending.reference
+                        submit = False
+                    elif (
+                        pending is not None
+                        and pending.result.state in (OperationState.PENDING, OperationState.UNKNOWN)
+                        and not covered
+                        and pending.result.observation is None
+                    ):
+                        prepared, reference = pending.prepared, pending.reference
+                        submit = False
+                    else:
+                        snapshot = provider.chain.snapshot()
+                        if snapshot.pause_level is not PauseLevel.NONE:
+                            raise _payment(
+                                PaymentFailure(
+                                    PaymentCode.SESSION_NOT_READY,
+                                    "CONTRACT_PAUSED",
+                                    ids[0],
+                                    pause_level=snapshot.pause_level,
+                                )
+                            )
+                        items = []
+                        for session in sessions:
+                            state = snapshot.sessions[session.sid]
+                            if session.inconsistent or not session.history_available:
+                                raise _not_ready("INCONSISTENT_STATE", session.sid)
+                            if close and provider._active(session):
+                                assert session.close_reference is not None
+                                return OperationResult(
+                                    session.close_reference, OperationState.UNKNOWN
+                                )
+                            if state.status is SessionStatus.CLOSED:
+                                if (
+                                    close
+                                    and session.close_result is not None
+                                    and session.operation is not None
+                                ):
+                                    return session.operation.result
+                                raise _not_ready("SESSION_CLOSED", session.sid)
+                            deadline = (
+                                state.last_activity + 86400
+                                if state.status is SessionStatus.OPEN
+                                else state.close_requested_at + 3600
+                            )
+                            expired = provider.chain.estimated_timestamp() >= deadline
+                            if not close and (expired or state.status is not SessionStatus.OPEN):
+                                raise _not_ready("CLAIM_DEADLINE", session.sid)
+                            capture = (
+                                state.settled_cumulative
+                                if close and expired
+                                else max(session.usage, state.settled_cumulative)
+                            )
+                            voucher = session.voucher
+                            if capture > state.settled_cumulative or not close:
+                                if (
+                                    voucher is None
+                                    or capture > voucher.cumulative
+                                    or capture > state.deposit
+                                ):
+                                    raise _not_ready("AUTHORIZATION_REQUIRED", session.sid)
+                                cumulative, signature = voucher.cumulative, voucher.signature
+                            else:
+                                cumulative, signature = capture, b""
+                            items.append(
+                                (session.opening.descriptor, cumulative, capture, signature)
+                            )
+                        if (
+                            not close
+                            and pending is not None
+                            and (pending.result.state is OperationState.CONFIRMED or covered)
+                            and pending.prepared.session_ids == ids
+                            and pending.prepared.amounts == tuple(item[2] for item in items)
+                        ):
+                            return pending.result
+                        prepared = (
+                            provider.contract.close(*items[0])
+                            if close
+                            else provider.contract.settle_batch(items)
+                            if batch
+                            else provider.contract.settle(*items[0])
                         )
-                    next_reference = (
-                        sessions[0].close_reference if close else "settle:" + secrets.token_hex(32)
-                    )
-                    assert next_reference is not None
-                    reference = next_reference
-                    pending = _PendingOperation(
-                        prepared,
-                        reference,
-                        OperationResult(reference, OperationState.UNKNOWN),
-                        {session.sid: session.units for session in sessions},
-                    )
-                    for session in sessions:
-                        session.operation = pending
-                    submit = True
+                        # A call the wallet would refuse records no intent.
+                        if len(prepared.call.data) > min(
+                            MAX_MESSAGE_BYTES, provider._max_call_bytes
+                        ):
+                            raise ValidationError(
+                                ValidationCode.INVALID_VALUE,
+                                "batch calldata exceeds resource limit",
+                            )
+                        if retry and simulated != prepared.call:
+                            # A reverted close's successor is recorded and sent
+                            # only as the call last simulated, below.
+                            next_close = prepared
+                        else:
+                            next_reference: str | None
+                            if not close:
+                                next_reference = "settle:" + secrets.token_hex(32)
+                            elif retry and pending is not None:
+                                next_reference = _successor(pending.reference)
+                            else:
+                                next_reference = sessions[0].close_reference
+                            assert next_reference is not None
+                            reference = next_reference
+                            pending = _PendingOperation(
+                                prepared,
+                                reference,
+                                OperationResult(reference, OperationState.UNKNOWN),
+                                {session.sid: session.units for session in sessions},
+                            )
+                            provider._references.setdefault(
+                                reference, dict.fromkeys(session.sid for session in sessions)
+                            )
+                            for session in sessions:
+                                session.operation = pending
+                                session.last_collection = time.monotonic()
+                            if close:
+                                # The close intent names its current reference.
+                                sessions[0].close_reference = reference
+                            submit = True
+                if next_close is None:
+                    break
+                # Simulated outside the lock, as a batch is. One that fails
+                # records no intent and sends nothing; the attempt counts toward
+                # the interval. One that passes is prepared again under the
+                # lock, with every check, and recorded only if it is still the
+                # simulated call.
+                try:
+                    with _timed("chain"):
+                        await asyncio.to_thread(
+                            provider.chain.reader.simulate,
+                            next_close,
+                            sender=provider.wallet.address,
+                        )
+                except Exception:
+                    sessions[0].last_collection = time.monotonic()
+                    raise
+                simulated = next_close.call
             if submit and prepared.kind is OperationKind.SETTLE_BATCH:
                 try:
-                    await asyncio.to_thread(
-                        provider.chain.reader.simulate, prepared, sender=provider.wallet.address
-                    )
+                    with _timed("chain"):
+                        await asyncio.to_thread(
+                            provider.chain.reader.simulate, prepared, sender=provider.wallet.address
+                        )
                 except BaseException:
                     # No wallet call happened. Do not export a hashless failed
                     # intent that recovery would correctly treat as uncertain.
@@ -2566,17 +3388,25 @@ class _Sessions:
                         if session.operation is pending:
                             session.operation = None
                     raise
-            helper = submit_operation if submit else reconcile_operation
-            result = await asyncio.to_thread(
-                helper,
-                provider.wallet,
-                prepared,
-                operation_ref=reference,
-                chain=provider.chain.reader,
-            )
+            assert pending is not None
+
+            def unsent() -> None:
+                for session in sessions:
+                    if session.operation is pending:
+                        session.operation = None
+
+            answer: OperationResult | None = None
+            if pending.result.state is OperationState.CONFIRMED:
+                result = pending.result
+            else:
+                result = answer = await self._operate(
+                    submit_operation if submit else reconcile_operation,
+                    prepared,
+                    reference,
+                    unsent=unsent if submit else None,
+                )
             # Preserve identifiers immediately. A later failed refresh cannot
             # turn a known submitted transaction back into a hashless intent.
-            assert pending is not None
             if not submit:
                 known = pending.result
                 conflict = (
@@ -2597,13 +3427,14 @@ class _Sessions:
                     )
                     if known.tx_hash is not None:
                         try:
-                            observed = await asyncio.to_thread(
-                                provider.chain.reader.reconcile,
-                                prepared,
-                                operation_ref=reference,
-                                tx_hash=known.tx_hash,
-                                wallet_operation_id=known.wallet_operation_id,
-                            )
+                            with _timed("chain"):
+                                observed = await asyncio.to_thread(
+                                    provider.chain.reader.reconcile,
+                                    prepared,
+                                    operation_ref=reference,
+                                    tx_hash=known.tx_hash,
+                                    wallet_operation_id=known.wallet_operation_id,
+                                )
                             if (
                                 observed.operation_ref == reference
                                 and observed.tx_hash == known.tx_hash
@@ -2615,13 +3446,22 @@ class _Sessions:
                 elif result.wallet_operation_id is None and known.wallet_operation_id is not None:
                     result = replace(result, wallet_operation_id=known.wallet_operation_id)
             pending.result = result
+            if answer is not None:
+                # A record kept against an answer that disagrees with it is
+                # handed to retire only through the wallet check (_unconfirmed);
+                # an answer that matches clears it.
+                if _agrees(result, answer):
+                    provider._unconfirmed.pop(reference, None)
+                elif reference in provider._references:
+                    provider._unconfirmed[reference] = result
             if result.state is OperationState.CONFIRMED and prepared.kind in (
                 OperationKind.SETTLE,
                 OperationKind.SETTLE_BATCH,
             ):
                 provider._observers.emit("on_settle", result)
             try:
-                await provider.chain.refresh()
+                with _timed("chain"):
+                    await provider.chain.refresh()
             except ChainEvidenceError:
                 if close and prepared.kind.value != "close":
                     assert sessions[0].close_reference is not None
@@ -2633,10 +3473,11 @@ class _Sessions:
                 and result.state is OperationState.CONFIRMED
                 and result.tx_hash is not None
             ):
-                closing = await asyncio.to_thread(
-                    provider.chain.reader.closing, result.tx_hash, prepared.session_ids[0]
-                )
-            async with provider._condition:
+                with _timed("chain"):
+                    closing = await asyncio.to_thread(
+                        provider.chain.reader.closing, result.tx_hash, prepared.session_ids[0]
+                    )
+            async with provider._lock:
                 assert pending is not None
                 pending.result = result
                 affected = [
@@ -2692,7 +3533,8 @@ class _Sessions:
                             provider._send(
                                 session.owner, pb.ControlMessage(close_result=session.close_result)
                             )
-                provider._condition.notify_all()
+                if result.state is OperationState.CONFIRMED:
+                    provider._supersede(reference, (session.sid for session in affected))
             if close and prepared.kind.value != "close":
                 # A reconciled capture is not evidence that the requested
                 # cooperative close happened. Keep its separate stable intent.

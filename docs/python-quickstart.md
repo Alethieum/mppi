@@ -9,14 +9,14 @@ Install the role your application uses:
 
 ```sh
 # Provider environment
-uv pip install 'mppi-provider==0.1.2'
+uv pip install 'mppi-provider==0.2.0'
 
 # Separate agent environment
-uv pip install 'mppi-agent==0.1.5'
+uv pip install 'mppi-agent==0.1.6'
 ```
 
-Each role installs its required protocol dependency: the agent
-`mppi-protocol==0.1.3`, the provider `mppi-protocol==0.1.1`. The applications
+Each role installs its required protocol dependency, `mppi-protocol==0.1.4`
+for both. The applications
 communicate through the provider's HTTPS origin; neither needs the other role's
 package. Source development uses the [local build guide](build.md).
 
@@ -224,6 +224,7 @@ and [lifecycle observers](lifecycle-hooks.md) for callback behavior and bounds.
 | `CONFIRMED` operation | Matching canonical chain evidence is available; retain its original reference. |
 | `PENDING` / `UNKNOWN` | Reconcile the original wallet operation with `sessions.reconcile(operation_ref)`; for cooperative close, repeat `sessions.close(session_id)` to inspect that same close. Do not replace funding or replay inference. |
 | `FAILED` | Inspect failure evidence before authorizing a distinct attempt; never infer failure from a timeout. A `cause` beginning `NotSubmittedError` means the wallet adapter's own record proves nothing reached its service, so it is safe to try again: for an opening, calling `sessions.open` again sends the same intent under a new reference while its authorization is valid. An opening whose authorization expired is forgotten, and the next `sessions.open` starts a fresh one. A failed top-up retried while its authorization is valid sends that same authorization, unless USDC already holds it as used: then the earlier top-up took effect, nothing is sent, and `ClientError` says so for every top-up until that authorization expires, so retrying the error never funds twice. |
+| Uncertain opening with no transaction hash | When the wallet names no transaction, `sessions.reconcile(operation_ref)` (as the next `sessions.open` does) reads whether the session is funded. If it is, its `SessionOpened` log, searched from the block the intent was made at over at most 9,999 blocks, names the transaction, and its receipt confirms the opening: `CONFIRMED` with that `tx_hash`. An RPC that cannot serve that search, such as a free plan's smaller block range or pruned history, leaves it `PENDING` or `UNKNOWN`, as the wallet reported it. |
 | Uncertain opening, authorization expired | `sessions.reconcile(operation_ref)` returns `FAILED` with cause `authorization expired before any opening` once a canonical block at or after its `valid_before` shows no deposit: the opening never happened and never can. |
 | Uncertain top-up, authorization expired | An uncertain top-up refuses later top-ups until it is reconciled. `sessions.reconcile(operation_ref)` returns `FAILED` with cause `authorization expired before any top-up` once a canonical block at or after its `valid_before` shows USDC holding its authorization unused: the top-up never happened and never can. |
 | Missing final inference accounting | Retain the original run and reservation; do not invent token usage or replay inference. |

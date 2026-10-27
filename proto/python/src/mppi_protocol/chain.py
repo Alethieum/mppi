@@ -8,11 +8,11 @@ provider storage, transaction resubmission or session readiness by itself.
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 from uuid import uuid4
 
@@ -32,7 +32,14 @@ from .contract import (
     error_name,
     event_topic,
 )
-from .discovery import ProviderIdentity, _parse_document, _parse_json, address_hex, parse_address
+from .discovery import (
+    MAX_DOCUMENT_BYTES,
+    ProviderIdentity,
+    _parse_document,
+    _parse_json,
+    address_hex,
+    parse_address,
+)
 from .errors import ValidationCode, ValidationError
 from .http import MAX_RPC_RESPONSE_BYTES, HttpTransport, TransportError
 from .signing import funding_digest, funding_signer, voucher_digest
@@ -69,6 +76,15 @@ _HEAD_CALLS = tuple(
     _hash(name)[:4]
     for name in (b"getBlockNumber()", b"getCurrentBlockTimestamp()", b"getLastBlockHash()")
 )
+# The most views one snapshot aggregate3 holds besides its three head views.
+# Arc's node runs an eth_call without a gas field at its --rpc.gascap,
+# 30,000,000 by default (circlefin/arc-node v0.8.1 crates/node/src/args.rs;
+# Reth v2.2.0 prepare_call_env). Measured on a local revm node (anvil 1.5.1,
+# Osaka rules), 512 getSession views with the other snapshot views took
+# 6,167,605 gas, about a fifth of that cap, where one call of 2,249 exceeded
+# it; their calldata is 231,562 characters of hex, under a quarter of the
+# 1 MiB request bound.
+_SNAPSHOT_VIEWS = 512
 # Arc commits each block with BFT finality: "Every transaction in a committed
 # block is immediately and irreversibly settled", with "no reorganization
 # risk" (docs.arc.io/arc/concepts/deterministic-finality, read October 2026).
@@ -121,32 +137,55 @@ class ChainLagError(ChainEvidenceError):
 
 
 class _RateLimited(ChainEvidenceError):
-    """A JSON-RPC rate-limit or not-yet-imported error; a later read may succeed."""
+    """A JSON-RPC rate-limit or not-yet-imported error, by its ``code``; a
+    later read may succeed."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__("RPC request was rate limited")
+        self.code = code
 
 
-# A transient read failure is repeated up to twice, 250 ms and then 1 s later:
-# rate limits, dropped connections and slow backends are routine on shared RPC
-# plans. Repeats start within one transport timeout plus those delays of the
-# first attempt, so a timed-out attempt is repeated once.
+# A transient read failure is repeated up to twice: rate limits, dropped
+# connections and slow backends are routine on shared RPC plans. Each repeat
+# waits a uniformly random share of its ceiling, 250 ms and then 1 s ("full
+# jitter", the AWS SDKs' retry backoff:
+# https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html),
+# so clients refused together do not repeat together; a refusal's Retry-After
+# (RFC 9110 section 10.2.3) is waited first. A repeat starts only within one
+# transport timeout plus the two ceilings of the first attempt: a wait that
+# would end later is not begun, and the read fails at once.
 _READ_RETRY_DELAYS = (0.25, 1.0)
+_jitter = random.random
 # Each attempt is bounded at 5 s by default. A client allows each step 10 s by
-# default, so after a timed-out attempt and the 250 ms delay its repeat has
-# 4.75 s left.
+# default, so after a timed-out attempt and a delay of at most 250 ms its repeat
+# has at least 4.75 s left; a second timed-out attempt could not start by 6.25 s.
 _ATTEMPT_MS = 5_000
 # EIP-1474 -32005 "Limit exceeded" (https://eips.ethereum.org/EIPS/eip-1474);
 # QuickNode's -32007 per-second request limit on EVM endpoints
 # (https://www.quicknode.com/docs/berachain/error-references); Arc's -32014 from
 # a load-balanced backend that "hasn't yet imported that block", which Arc says
 # can be retried after a brief backoff (docs.arc.io/arc/references/rpc-endpoints).
-_RATE_LIMIT_CODES = frozenset({-32005, -32007, -32014})
+# A -32014 that outlasts the repeats is lag (ChainLagError).
+_NOT_IMPORTED = -32014
+_RATE_LIMIT_CODES = frozenset({-32005, -32007, _NOT_IMPORTED})
 # At most this many calls go in one JSON-RPC batch: some plans count each call
 # in a batch against a per-second request limit and refuse entries beyond it.
 _BATCH_CALLS = 32
+# Each request's id is a UUID in its 36-character text form.
+_ID = "0" * 36
+_UNANSWERED = object()
+# The most blocks one eth_getLogs spans. Arc's endpoints refuse a range over
+# 10,000 blocks (-32012): "Log-driven clients must page through history in
+# <=9,999-block chunks" (docs.arc.io/arc/references/rpc-endpoints, Supported
+# methods); QuickNode's paid plans allow 10,000 (support.quicknode.com,
+# "Understanding the 10,000 Block Range Limit").
+_LOG_SPAN = 9_999
 _READ_ONLY = frozenset(
     {
         "eth_chainId",
         "eth_getBlockByNumber",
         "eth_getTransactionReceipt",
+        "eth_getLogs",
         "eth_getCode",
         "eth_getStorageAt",
         "eth_call",
@@ -162,7 +201,8 @@ class Rpc(Protocol):
     An adapter that raises for a reverted call stays correct; funding checks
     through it then report missing evidence rather than a refused signature.
     Without ``call_many`` a step's reads go one call at a time; a snapshot
-    then anchors to the block its views ran at."""
+    then reads views that ran at another block than its header again, pinned
+    to the header's block."""
 
     def call(self, method: str, params: list[object]) -> object: ...
 
@@ -186,40 +226,64 @@ class HttpJsonRpc:
         # This adapter only reads. It cannot turn reconciliation into a submit,
         # so repeating a read after a transient failure never submits anything.
         _read_only(method)
-        return self._retried(lambda: self._once(method, params))
+        return self._read([(method, params)])[0]
 
     def call_many(self, calls: Sequence[tuple[str, list[object]]]) -> list[object]:
-        """Results of read-only calls, in order, sent as JSON-RPC batches.
+        """Results of read-only calls, in order, sent as JSON-RPC batches of
+        at most 32 calls and 1 MiB each, one exchange after another.
 
         A batch's responses may arrive in any order and are matched by id
         (JSON-RPC 2.0 section 6); each call must be answered exactly once.
+        A repeat sends only the calls not yet answered.
         """
         for method, _ in calls:
             _read_only(method)
         results: list[object] = []
-        for start in range(0, len(calls), _BATCH_CALLS):
-            results.extend(
-                self._retried(partial(self._batch, list(calls[start : start + _BATCH_CALLS])))
-            )
+        for batch in _batches(calls):
+            results.extend(self._read(batch))
         return results
 
     def close(self) -> None:
         """Close idle kept-alive connections; later reads open new ones."""
         self.transport.close()
 
+    def _read(self, calls: list[tuple[str, list[object]]]) -> list[object]:
+        """Results of ``calls``, in order. Answers are kept across repeats, so
+        a repeat sends only the calls a refusal left unanswered."""
+        results: list[object] = [_UNANSWERED] * len(calls)
+
+        def read() -> list[object]:
+            self._fill(calls, results)
+            return results
+
+        return self._retried(read)
+
     def _retried(self, read: Callable[[], _T]) -> _T:
+        try:
+            return self._repeated(read)
+        except _RateLimited as error:
+            if error.code != _NOT_IMPORTED:
+                raise
+            # Still behind once the repeats are spent: lag, which keeps
+            # accepted evidence, not a failure.
+            raise ChainLagError("RPC backend has not imported that block yet") from None
+
+    def _repeated(self, read: Callable[[], _T]) -> _T:
         budget = (
             time.monotonic()
             + getattr(self.transport, "timeout_ms", _ATTEMPT_MS) / 1000
             + sum(_READ_RETRY_DELAYS)
         )
-        for delay in _READ_RETRY_DELAYS:
+        for ceiling in _READ_RETRY_DELAYS:
             try:
                 return read()
-            except TransportError as error:
-                if not error.transient or time.monotonic() + delay >= budget:
-                    raise
-            except _RateLimited:
+            except (TransportError, _RateLimited) as error:
+                asked = None
+                if isinstance(error, TransportError):
+                    if not error.transient:
+                        raise
+                    asked = error.retry_after
+                delay = (asked or 0.0) + ceiling * _jitter()
                 if time.monotonic() + delay >= budget:
                     raise
             time.sleep(delay)
@@ -227,55 +291,150 @@ class HttpJsonRpc:
 
     def _once(self, method: str, params: list[object]) -> object:
         request_id = str(uuid4())
-        payload = json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-            separators=(",", ":"),
-        ).encode()
+        payload = _encoded(_request(request_id, method, params))
         response = _parse_document(
             self.transport.request(self.endpoint, body=payload), max_bytes=MAX_RPC_RESPONSE_BYTES
         )
         return _answer(response, request_id, method)
 
-    def _batch(self, calls: list[tuple[str, list[object]]]) -> list[object]:
-        if not self._batches or len(calls) == 1:
-            return [self._once(method, params) for method, params in calls]
-        ids = [str(uuid4()) for _ in calls]
-        payload = json.dumps(
-            [
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-                for request_id, (method, params) in zip(ids, calls, strict=True)
-            ],
-            separators=(",", ":"),
-        ).encode()
+    def _fill(self, calls: list[tuple[str, list[object]]], results: list[object]) -> None:
+        """Fill each unanswered entry of ``results`` with its call's answer: in
+        one batch, or one call at a time. Answers are kept as they arrive; a
+        refusal is raised after them, a definite failure at once."""
+        pending = [index for index, result in enumerate(results) if result is _UNANSWERED]
+        if not self._batches or len(pending) == 1:
+            for index in pending:
+                results[index] = self._once(*calls[index])
+            return
+        ids = {str(uuid4()): index for index in pending}
+        payload = _encoded([_request(key, *calls[i]) for key, i in ids.items()])
         try:
             raw = self.transport.request(self.endpoint, body=payload)
         except TransportError as refused:
             if refused.transient:
                 raise
             # A refused single call raises its own error and keeps batches on.
-            first = self._once(*calls[0])
+            results[pending[0]] = self._once(*calls[pending[0]])
             object.__setattr__(self, "_batches", False)
-            return [first] + [self._once(method, params) for method, params in calls[1:]]
+            for index in pending[1:]:
+                results[index] = self._once(*calls[index])
+            return
         response = _parse_json(raw, max_bytes=MAX_RPC_RESPONSE_BYTES)
         if isinstance(response, dict):
             error = response.get("error")
             if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
-                raise _RateLimited("RPC request was rate limited")
+                raise _RateLimited(error["code"])
             object.__setattr__(self, "_batches", False)
-            return [self._once(method, params) for method, params in calls]
-        if not isinstance(response, list) or len(response) != len(calls):
+            for index in pending:
+                results[index] = self._once(*calls[index])
+            return
+        if not isinstance(response, list) or len(response) != len(ids):
             raise ChainEvidenceError("RPC batch response count mismatch")
         rows: dict[str, dict[str, Any]] = {}
         for row in response:
             if not isinstance(row, dict) or type(row.get("id")) is not str or row["id"] in rows:
                 raise ChainEvidenceError("RPC response identity mismatch")
             rows[row["id"]] = row
-        if rows.keys() != set(ids):
+        if rows.keys() != ids.keys():
             raise ChainEvidenceError("RPC response identity mismatch")
-        return [
-            _answer(rows[request_id], request_id, method)
-            for request_id, (method, _) in zip(ids, calls, strict=True)
-        ]
+        limited: int | None = None  # The first refusal's code.
+        for request_id, index in ids.items():
+            try:
+                results[index] = _answer(rows[request_id], request_id, calls[index][0])
+            except _RateLimited as error:
+                # Left unanswered: only such entries are sent again.
+                limited = error.code if limited is None else limited
+        if limited is not None:
+            raise _RateLimited(limited)
+
+
+def _request(request_id: str, method: str, params: list[object]) -> dict[str, object]:
+    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+
+
+def _encoded(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def _batches(
+    calls: Sequence[tuple[str, list[object]]],
+) -> list[list[tuple[str, list[object]]]]:
+    """``calls`` as consecutive JSON-RPC batches, each of at most _BATCH_CALLS
+    calls and a body of at most MAX_DOCUMENT_BYTES, the bound HttpTransport
+    enforces. A call that cannot fit one body alone is refused before anything
+    is sent."""
+    batches: list[list[tuple[str, list[object]]]] = []
+    batch: list[tuple[str, list[object]]] = []
+    size = 0
+    for method, params in calls:
+        entry = len(_encoded(_request(_ID, method, params)))
+        # A batch is "[", its entries separated by commas, then "]".
+        if entry + 2 > MAX_DOCUMENT_BYTES:
+            raise TransportError("JSON-RPC request exceeds 1 MiB")
+        if batch and (len(batch) == _BATCH_CALLS or size + 1 + entry > MAX_DOCUMENT_BYTES):
+            batches.append(batch)
+            batch = []
+        size = size + 1 + entry if batch else entry + 2
+        batch.append((method, params))
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+# A contract view in a snapshot: its target, whether it may fail, its calldata.
+_View = tuple[bytes, bool, bytes]
+
+
+def _snapshot_chunks(
+    fixed: list[_View], identities: list[list[_View]], sessions: list[_View]
+) -> list[list[_View]]:
+    """A snapshot's views, in order, split into aggregate3 calls of at most
+    _SNAPSHOT_VIEWS views and one provider's identity each: an identity's gas
+    grows with the URI and catalog it stores."""
+    chunks: list[list[_View]] = []
+    chunk, identity = list(fixed), False
+    for group in identities:
+        if identity or len(chunk) + len(group) > _SNAPSHOT_VIEWS:
+            chunks.append(chunk)
+            chunk = []
+        chunk += group
+        identity = True
+    for view in sessions:
+        if len(chunk) == _SNAPSHOT_VIEWS:
+            chunks.append(chunk)
+            chunk = []
+        chunk.append(view)
+    chunks.append(chunk)
+    return chunks
+
+
+def _aggregate(chunk: list[_View]) -> tuple[str, list[object]]:
+    """The aggregate3 eth_call reading ``chunk`` after its block number, time
+    and parent hash; its block position is added by the caller."""
+    calls3 = [(_MULTICALL3, False, call) for call in _HEAD_CALLS] + chunk
+    data = _AGGREGATE3 + encode(["(address,bool,bytes)[]"], [calls3])
+    return ("eth_call", [{"to": address_hex(_MULTICALL3), "data": "0x" + data.hex()}])
+
+
+def _answers(raw: object, chunk: list[_View], head: Block) -> list[object] | None:
+    """The answers to an _aggregate of ``chunk`` after its head views, a view
+    allowed to fail that failed as _REVERTED; None when they ran at another
+    height than ``head``."""
+    answers = decode(["(bool,bytes)[]"], _data(raw), strict=True)[0]
+    if len(answers) != 3 + len(chunk) or not all(
+        ok or allowed
+        for (ok, _), allowed in zip(answers, [False] * 3 + [view[1] for view in chunk], strict=True)
+    ):
+        raise ChainEvidenceError("RPC snapshot is incomplete")
+    number, timestamp, parent = (
+        _decode_exact([kind], bytes(data))[0]
+        for kind, (_, data) in zip(("uint256", "uint256", "bytes32"), answers[:3], strict=True)
+    )
+    if number != head.observation.block_number:
+        return None
+    if (timestamp, parent) != (head.timestamp, head.parent_hash):
+        raise ChainEvidenceError("RPC snapshot and head are from different blocks")
+    return ["0x" + bytes(data).hex() if ok else _REVERTED for ok, data in answers[3:]]
 
 
 def _session(raw: object) -> ChainSession:
@@ -305,6 +464,47 @@ def _pause(raw: object) -> PauseLevel:
     return PauseLevel(result)
 
 
+def _binding_data(agent_id: int) -> bytes:
+    """Registry calldata for the funding wallet ``agent_id`` binds."""
+    uint256(agent_id, field="agent_id")
+    return _hash(b"getAgentWallet(uint256)")[:4] + encode(["uint256"], [agent_id])
+
+
+def _bound(answer: object) -> bytes:
+    """The funding wallet a getAgentWallet answer binds, zero when none."""
+    if answer is _REVERTED:
+        return bytes(20)  # A registry reverting for an unknown id binds none.
+    # Zero once ERC-8004 clears it on transfer, or after unsetAgentWallet.
+    return bytes.fromhex(_decode_exact(["address"], _data(answer))[0][2:])
+
+
+def _funding_watch(funding: tuple[int, bytes] | None) -> tuple[int, bytes] | None:
+    if funding is None:
+        return None
+    agent_id, wallet = funding
+    uint256(agent_id, field="agent_id")
+    return agent_id, fixed_bytes(wallet, 20, field="funding wallet", nonzero=True)
+
+
+def _signature_check(authorization: FundingAuthorization, signature: bytes) -> bytes:
+    """ERC-1271 isValidSignature calldata for a funding authorization."""
+    return _IS_VALID_SIGNATURE + encode(
+        ["bytes32", "bytes"], [funding_digest(authorization), signature]
+    )
+
+
+def _accepts(
+    authorization: FundingAuthorization, signature: bytes, code: object, answer: object
+) -> bool:
+    """USDC's decision (SignatureChecker.isValidSignatureNow) from the owner's
+    code and its isValidSignature answer: an owner without code must recover
+    through ECRecover; one with code must answer the ERC-1271 magic word, and
+    a reverted call is a refusal, as its failed staticcall is."""
+    if _data(code):
+        return answer is not _REVERTED and _data(answer)[:32] == _ERC1271_MAGIC
+    return funding_signer(authorization, signature) == authorization.owner
+
+
 def _read_only(method: str) -> None:
     if method not in _READ_ONLY:
         raise ChainEvidenceError("unsupported read-only RPC method")
@@ -329,7 +529,7 @@ def _answer(response: dict[str, Any], request_id: str, method: str) -> object:
         raise ChainEvidenceError("RPC response identity mismatch")
     error = response.get("error")
     if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
-        raise _RateLimited("RPC request was rate limited")
+        raise _RateLimited(error["code"])
     if (
         method == "eth_call"
         and isinstance(error, dict)
@@ -460,6 +660,20 @@ class FundingEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class FundingState:
+    """At a snapshot's block, what an opening's funding check reads: the
+    funding wallet the registry binds to ``agent_id`` (zero when none), and
+    whether ``wallet`` has code. USDC checks a funding signature from an
+    account with code through its ERC-1271 isValidSignature, and from one
+    without through ECDSA recovery (SignatureChecker.isValidSignatureNow)."""
+
+    agent_id: int
+    wallet: bytes
+    agent_wallet: bytes
+    has_code: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationEvidence:
     """Advisory execution/cost evidence at one canonical block, never a receipt."""
 
@@ -471,11 +685,12 @@ class SimulationEvidence:
 class ChainReader:
     """Synchronous, block-pinned reads; use outside the payment event loop.
 
-    Each step reads everything it needs at one block in one batch when the RPC
-    offers ``call_many``. Every state read is pinned with EIP-1898
-    ``{blockHash, requireCanonical: true}``, and the same batch reads that
-    block by number: requireCanonical is only a SHOULD, so the matching hash
-    is what shows the block was canonical while the batch was served. Facts
+    Each step reads everything it needs at one block through one ``call_many``
+    when the RPC offers it: HttpJsonRpc sends one round trip per JSON-RPC
+    batch of 32 calls and 1 MiB. Every state read is pinned with EIP-1898
+    ``{blockHash, requireCanonical: true}``, and the same ``call_many`` reads
+    that block by number: requireCanonical is only a SHOULD, so the matching
+    hash is what shows the block was canonical while the reads were served. Facts
     that cannot change for one reader are read once: the RPC's chain id, and
     the code at each pinned address (EIP-6780 removes code only in the
     transaction that created it). Proxy implementation slots are mutable and
@@ -665,44 +880,78 @@ class ChainReader:
         self, *, providers: tuple[int, ...] = (), sessions: tuple[bytes, ...] = ()
     ) -> tuple[Block, PauseLevel, dict[int, ProviderIdentity], dict[bytes, ChainSession]]:
         """The deployment, pause level, provider identities (an unusable
-        catalog read as ``None``) and sessions at the latest block, in one
-        round trip on a network whose committed blocks are final.
+        catalog read as ``None``) and sessions at the latest block, on a
+        network whose committed blocks are final.
 
-        One Multicall3 ``aggregate3`` eth_call reads every contract view at the
-        head it runs on. Its block number, time and parent hash must equal the
-        header read in the same batch, which anchors the snapshot to that
-        block; views that ran at another head are anchored to that block's
-        header, read by number in one more round trip. The implementation
-        slots, which no contract exposes, are read in the same batch. Without verified Multicall3 code, or on a network
-        without instant finality, this is the head and then one batch pinned
-        to it: two round trips.
+        Multicall3 ``aggregate3`` eth_calls at ``latest``, of at most
+        _SNAPSHOT_VIEWS views each, read every contract view, each with the
+        block number, time and parent hash it ran at. They go in the batch that
+        reads the header at ``latest``, the anchor. A call whose views ran at
+        another height is read again pinned to the header's hash, with the
+        header read by number in the same batch; one at the header's height
+        but in another block is a contradiction. Views from two blocks never
+        form a snapshot. The implementation slots, which no contract exposes,
+        are read with the header. One round trip while the calls fit one
+        JSON-RPC batch (HttpJsonRpc: 32 calls and 1 MiB) and ran at the
+        header's block; each further batch adds one, and calls that ran
+        elsewhere are sent once more. Without verified Multicall3 code, or on
+        a network without instant finality, this is the head and then the
+        reads pinned to it.
         """
+        return self._latest(providers, sessions)[:4]
+
+    def _latest(
+        self,
+        providers: tuple[int, ...],
+        sessions: tuple[bytes, ...],
+        funding: tuple[int, bytes] | None = None,
+    ) -> tuple[
+        Block,
+        PauseLevel,
+        dict[int, ProviderIdentity],
+        dict[bytes, ChainSession],
+        FundingState | None,
+    ]:
+        """``latest``, and with ``funding``, an agent id and its funding wallet,
+        their FundingState: the registry's binding for that id in the first
+        multicall, and the wallet's code in the same batch, which no contract
+        exposes either."""
+        wanted = _funding_watch(funding)
         if not self.profile.instant_finality or self._multicall is False:
             (head,) = self._blocks((None,))
-            found, _, pause, identities, states = self._observe_at(
+            found, _, pause, identities, states, state = self._observe_at(
                 head.observation.block_number,
                 head.observation.block_hash,
                 providers=providers,
                 sessions=sessions,
+                funding=wanted,
             )
-            return found, pause, identities, states
-        views: list[tuple[bytes, bytes]] = [(_MULTICALL3, call) for call in _HEAD_CALLS]
+            return found, pause, identities, states, state
         domain = not self._domain_checked
-        proxy = self.profile.domain.verifying_contract
+        proxy, registry = self.profile.domain.verifying_contract, self.profile.registry_address
+        fixed: list[_View] = []
         if domain:
-            views.append((proxy, encode_call("voucherDigest", (bytes(32), 0))))
-        views.append((proxy, encode_call("pauseLevel", ())))
-        for provider_id in providers:
-            views += [
-                (self.profile.registry_address, data) for data in self._identity_data(provider_id)
-            ]
-        views += [
-            (proxy, encode_call("getSession", (fixed_bytes(sid, 32, field="session_id"),)))
-            for sid in sessions
-        ]
-        aggregate = _AGGREGATE3 + encode(
-            ["(address,bool,bytes)[]"], [[(to, False, data) for to, data in views]]
+            fixed.append((proxy, False, encode_call("voucherDigest", (bytes(32), 0))))
+        fixed.append((proxy, False, encode_call("pauseLevel", ())))
+        if wanted is not None:
+            # A registry reverting for an unknown id binds none: allowed to fail.
+            fixed.append((registry, True, _binding_data(wanted[0])))
+        chunks = _snapshot_chunks(
+            fixed,
+            [
+                [(registry, False, data) for data in self._identity_data(provider_id)]
+                for provider_id in providers
+            ],
+            [
+                (
+                    proxy,
+                    False,
+                    encode_call("getSession", (fixed_bytes(sid, 32, field="session_id"),)),
+                )
+                for sid in sessions
+            ],
         )
+        aggregates = [_aggregate(chunk) for chunk in chunks]
         code = not self._code_checked
         unchecked = self._multicall is None
         calls: list[tuple[str, list[object]]] = self._network_calls()
@@ -710,17 +959,14 @@ class ChainReader:
             calls += [("eth_getCode", [address_hex(pin.address), "latest"]) for pin in self._pins()]
         if unchecked:
             calls.append(("eth_getCode", [address_hex(_MULTICALL3), "latest"]))
-        calls += [
-            ("eth_getBlockByNumber", ["latest", False]),
-            (
-                "eth_call",
-                [{"to": address_hex(_MULTICALL3), "data": "0x" + aggregate.hex()}, "latest"],
-            ),
-        ]
+        calls.append(("eth_getBlockByNumber", ["latest", False]))
+        calls += [(method, [*params, "latest"]) for method, params in aggregates]
         calls += [
             ("eth_getStorageAt", [address_hex(pin.address), _IMPLEMENTATION_SLOT, "latest"])
             for pin in (self.profile.proxy, self.profile.registry)
         ]
+        if wanted is not None:
+            calls.append(("eth_getCode", [address_hex(wanted[1]), "latest"]))
         results = self._check_network(self._many(calls))
         if code:
             for pin, raw in zip(self._pins(), results[:4], strict=True):
@@ -733,48 +979,46 @@ class ChainReader:
             self._multicall = _hash(_data(results[0])) == _MULTICALL3_CODE_HASH
             results = results[1:]
             if not self._multicall:
-                return self.latest(providers=providers, sessions=sessions)
+                return self._latest(providers, sessions, wanted)
         head = self._parse_block(results[0], None)
-        answers = decode(["(bool,bytes)[]"], _data(results[1]), strict=True)[0]
-        if len(answers) != len(views) or not all(ok for ok, _ in answers):
-            raise ChainEvidenceError("RPC snapshot is incomplete")
-        values: list[object] = ["0x" + bytes(data).hex() for _, data in answers]
-        number, timestamp, parent = (
-            _decode_exact([kind], _data(raw))[0]
-            for kind, raw in zip(("uint256", "uint256", "bytes32"), values[:3], strict=True)
-        )
-        if number != head.observation.block_number:
-            # Sent one call at a time, the views can run at a later head than the
-            # header read before them: anchor to the header of their own block.
-            (head,) = self._blocks((number,))
-        if (number, timestamp, parent) != (
-            head.observation.block_number,
-            head.timestamp,
-            head.parent_hash,
-        ):
-            raise ChainEvidenceError("RPC snapshot and head are from different blocks")
+        answered = [
+            _answers(raw, chunk, head)
+            for chunk, raw in zip(chunks, results[1 : 1 + len(chunks)], strict=True)
+        ]
+        results = results[1 + len(chunks) :]
         for implementation, raw in zip(
             (self.profile.implementation, self.profile.registry_implementation),
-            results[2:4],
+            results[:2],
             strict=True,
         ):
             if _data(raw, 32) != b"\0" * 12 + implementation.address:
                 raise ChainContradictionError("proxy implementation differs from release profile")
-        values = values[3:]
+        # Views that ran at another height than the header (sent in another
+        # batch, or to another backend) are read again at the header's block.
+        elsewhere = [index for index, found in enumerate(answered) if found is None]
+        if elsewhere:
+            again = self._read(head, [aggregates[index] for index in elsewhere])
+            for index, raw in zip(elsewhere, again, strict=True):
+                answered[index] = _answers(raw, chunks[index], head)
+                if answered[index] is None:
+                    raise ChainEvidenceError("RPC snapshot and head are from different blocks")
+        values = [value for chunk in answered for value in chunk or ()]
         if domain:
-            digest = decode_result("voucherDigest", _data(values[0]))[0]
+            digest = decode_result("voucherDigest", _data(values.pop(0)))[0]
             if digest != voucher_digest(self.profile.domain, bytes(32), 0):
                 raise ChainContradictionError("MPPI signing domain differs from release profile")
             self._domain_checked = True
-            values = values[1:]
-        pause = _pause(values[0])
-        values = values[1:]
+        pause = _pause(values.pop(0))
+        binding = values.pop(0) if wanted is not None else None
         identities = {}
         for provider_id in providers:
             identities[provider_id] = self._parse_identity(provider_id, head, values[:4], True)
             values = values[4:]
         states = {sid: _session(raw) for sid, raw in zip(sessions, values, strict=True)}
-        return head, pause, identities, states
+        state = None
+        if wanted is not None:
+            state = FundingState(*wanted, _bound(binding), bool(_data(results[2])))
+        return head, pause, identities, states, state
 
     def verify_deployment(self, block: Block) -> None:
         """Compare selected manifest code/implementations and MPPI EIP-712 domain.
@@ -851,12 +1095,10 @@ class ChainReader:
     def agent_wallet(self, agent_id: int, observation: ChainObservation) -> bytes:
         """Registry identity binds the funding wallet, never its session signer;
         read at the block another proof named, in one round trip."""
-        uint256(agent_id, field="agent_id")
-        data = _hash(b"getAgentWallet(uint256)")[:4] + encode(["uint256"], [agent_id])
         _, (raw,) = self._read_at(
             observation.block_number,
             observation.block_hash,
-            [self._call_params(self.profile.registry_address, data)],
+            [self._call_params(self.profile.registry_address, _binding_data(agent_id))],
         )
         return parse_address(_decode_exact(["address"], _data(raw))[0])
 
@@ -877,6 +1119,38 @@ class ChainReader:
         when funding executes; this one only refuses before submission.
         """
         uint256(agent_id, field="agent_id")
+        self._check_authorization(authorization, signature)
+        owner = authorization.owner
+        code, wallet, answer = self._read(
+            block,
+            [
+                ("eth_getCode", [address_hex(owner)]),
+                self._call_params(self.profile.registry_address, _binding_data(agent_id)),
+                self._call_params(owner, _signature_check(authorization, signature)),
+            ],
+        )
+        return FundingEvidence(
+            block, _accepts(authorization, signature, code, answer), _bound(wallet)
+        )
+
+    def funding_signature(
+        self, authorization: FundingAuthorization, signature: bytes, block: Block
+    ) -> bool:
+        """Whether USDC accepts ``signature`` for ``authorization`` at
+        ``block``: ``funding`` without the registry's binding, which a
+        snapshot already read (ChainSnapshot.funding), in one round trip."""
+        self._check_authorization(authorization, signature)
+        owner = authorization.owner
+        code, answer = self._read(
+            block,
+            [
+                ("eth_getCode", [address_hex(owner)]),
+                self._call_params(owner, _signature_check(authorization, signature)),
+            ],
+        )
+        return _accepts(authorization, signature, code, answer)
+
+    def _check_authorization(self, authorization: FundingAuthorization, signature: bytes) -> None:
         if (
             not isinstance(authorization, FundingAuthorization)
             or authorization.chain_id != self.profile.domain.chain_id
@@ -886,29 +1160,6 @@ class ChainReader:
             raise ValidationError(
                 ValidationCode.INVALID_VALUE, "funding check differs from selected deployment"
             )
-        owner = authorization.owner
-        bound = _hash(b"getAgentWallet(uint256)")[:4] + encode(["uint256"], [agent_id])
-        check = _IS_VALID_SIGNATURE + encode(
-            ["bytes32", "bytes"], [funding_digest(authorization), signature]
-        )
-        code, wallet, answer = self._read(
-            block,
-            [
-                ("eth_getCode", [address_hex(owner)]),
-                self._call_params(self.profile.registry_address, bound),
-                self._call_params(owner, check),
-            ],
-        )
-        if _data(code):
-            valid = answer is not _REVERTED and _data(answer)[:32] == _ERC1271_MAGIC
-        else:
-            valid = funding_signer(authorization, signature) == owner
-        if wallet is _REVERTED:
-            agent_wallet = bytes(20)  # A registry reverting for an unknown id binds none.
-        else:
-            # Zero once ERC-8004 clears it on transfer, or after unsetAgentWallet.
-            agent_wallet = bytes.fromhex(_decode_exact(["address"], _data(wallet))[0][2:])
-        return FundingEvidence(block, valid, agent_wallet)
 
     def _session_call(self, session_id: bytes) -> tuple[str, list[object]]:
         fixed_bytes(session_id, 32, field="session_id")
@@ -922,7 +1173,7 @@ class ChainReader:
         """Verify the deployment and read the pause level, provider identities
         (an unusable catalog read as ``None``) and sessions at ``block``, in one
         batch."""
-        found, _, pause, identities, states = self._observe_at(
+        found, _, pause, identities, states, _ = self._observe_at(
             block.observation.block_number,
             block.observation.block_hash,
             providers=providers,
@@ -940,11 +1191,19 @@ class ChainReader:
         providers: tuple[int, ...] = (),
         sessions: tuple[bytes, ...] = (),
         recheck: int | None = None,
+        funding: tuple[int, bytes] | None = None,
     ) -> tuple[
-        Block, Block | None, PauseLevel, dict[int, ProviderIdentity], dict[bytes, ChainSession]
+        Block,
+        Block | None,
+        PauseLevel,
+        dict[int, ProviderIdentity],
+        dict[bytes, ChainSession],
+        FundingState | None,
     ]:
         """``observe`` at a block known by number and hash, optionally re-reading
-        an earlier block by number, all in one batch."""
+        an earlier block by number, all in one ``call_many``; with ``funding``,
+        its FundingState at that block too (see ``_latest``)."""
+        wanted = _funding_watch(funding)
         with_code = not self._code_checked
         calls = self._deployment_calls(with_code)
         calls.append(
@@ -953,6 +1212,11 @@ class ChainReader:
         for provider_id in providers:
             calls += self._identity_calls(provider_id)
         calls += [self._session_call(session_id) for session_id in sessions]
+        if wanted is not None:
+            calls += [
+                self._call_params(self.profile.registry_address, _binding_data(wanted[0])),
+                ("eth_getCode", [address_hex(wanted[1])]),
+            ]
         block, results = self._read_at(number, block_hash, calls, recheck=recheck)
         again = None
         if recheck is not None:
@@ -965,9 +1229,14 @@ class ChainReader:
             identities[provider_id] = self._parse_identity(provider_id, block, results[:4], True)
             results = results[4:]
         states = {
-            session_id: _session(raw) for session_id, raw in zip(sessions, results, strict=True)
+            session_id: _session(raw)
+            for session_id, raw in zip(sessions, results[: len(sessions)], strict=True)
         }
-        return block, again, pause, identities, states
+        state = None
+        if wanted is not None:
+            binding, code = results[len(sessions) :]
+            state = FundingState(*wanted, _bound(binding), bool(_data(code)))
+        return block, again, pause, identities, states, state
 
     def session_at(
         self, number: int, block_hash: bytes, session_id: bytes
@@ -1100,6 +1369,51 @@ class ChainReader:
         ):
             raise ChainEvidenceError("opening descriptor, deposit or catalog mismatch")
         return OpeningEvidence(descriptor, observation, event["deposit"], catalog, tx_hash)
+
+    def opening_transaction(self, session_id: bytes, first: int, last: int) -> bytes | None:
+        """The transaction whose SessionOpened names ``session_id``, searched
+        from block ``first`` through ``last`` but over no more than 9,999
+        blocks (_LOG_SPAN), or ``None`` when there is none.
+
+        One eth_getLogs filtered by the pinned proxy and the event's indexed
+        sessionId. Its answer is a lead, never a proof: prove the transaction
+        by its receipt (``reconcile``). A session opens once (MPPI.sol open
+        refuses SessionExists), so two such transactions are inconsistent.
+        """
+        fixed_bytes(session_id, 32, field="session_id")
+        uint64(first, field="first block")
+        last = min(uint64(last, field="last block"), first + _LOG_SPAN - 1)
+        if last < first:
+            return None
+        proxy, topic = self.profile.domain.verifying_contract, event_topic("SessionOpened")
+        query = {
+            "address": address_hex(proxy),
+            "topics": ["0x" + topic.hex(), "0x" + session_id.hex()],
+            "fromBlock": hex(first),
+            "toBlock": hex(last),
+        }
+        (raw,) = self._check_network(self._many(self._network_calls() + [("eth_getLogs", [query])]))
+        if not isinstance(raw, list):
+            raise ChainEvidenceError("RPC logs missing")
+        found = set()
+        for value in raw:
+            log = _object(value)
+            if log.get("removed") is True:
+                continue
+            topics = log.get("topics")
+            if (
+                _data(log.get("address"), 20) != proxy
+                or not isinstance(topics, list)
+                or len(topics) < 2
+                or _data(topics[0], 32) != topic
+                or _data(topics[1], 32) != session_id
+                or not first <= _quantity(log.get("blockNumber")) <= last
+            ):
+                raise ChainEvidenceError("RPC log differs from its filter")
+            found.add(_data(log.get("transactionHash"), 32))
+        if len(found) > 1:
+            raise ChainEvidenceError("required MPPI event missing or ambiguous")
+        return found.pop() if found else None
 
     def _observation(self, number: int, block_hash: bytes) -> ChainObservation:
         return ChainObservation(

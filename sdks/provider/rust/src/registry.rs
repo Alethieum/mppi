@@ -7,7 +7,7 @@
 use crate::{
     Address, B256, Catalog, U256, ValidationCode, ValidationError,
     catalog::{DEFAULT_CATALOG_BYTES, parse_catalog},
-    chain::{Block, ChainError, ChainReader, decode_return},
+    chain::{Block, Call, ChainError, ChainReader, decode_return, eth_call},
     discovery::{MAX_DOCUMENT_BYTES, ProviderIdentity},
 };
 use alloy_primitives::keccak256;
@@ -383,74 +383,46 @@ impl RegistryReader {
         self.chain.verify_deployment(&block).await?;
         Ok(block)
     }
-    async fn selected_block(&self, block: Option<&Block>) -> Result<Block, ChainError> {
-        match block {
-            Some(block) => {
-                self.chain.verify_deployment(block).await?;
-                Ok(block.clone())
-            }
-            None => self.verified_block().await,
-        }
+    /// The deployment check and `calls` at `block`, or at the head, in one
+    /// exchange; the results that follow the deployment check.
+    async fn read_verified(
+        &self,
+        block: Option<&Block>,
+        calls: Vec<Call>,
+    ) -> Result<(Block, Vec<Value>), ChainError> {
+        let block = match block {
+            Some(block) => block.clone(),
+            None => self.chain.block(None).await?,
+        };
+        let with_code = self.chain.code_unchecked();
+        let mut all = self.chain.deployment_calls(with_code);
+        all.extend(calls);
+        let results = self.chain.read(&block, all).await?;
+        let results = self.chain.check_deployment(&results, with_code)?.to_vec();
+        Ok((block, results))
     }
-    pub async fn read(
+    /// The raw identity from the results of `identity_calls`.
+    fn identity_at(
         &self,
         agent_id: U256,
-        block: Option<&Block>,
+        block: &Block,
+        results: &[Value],
     ) -> Result<RegistryIdentity, ChainError> {
-        let block = self.selected_block(block).await?;
-        let registry = self.chain.profile().registry_address();
-        let owner = decode_return::<IdentityReads::ownerOfCall>(
-            &self
-                .chain
-                .call_at(
-                    registry,
-                    &IdentityReads::ownerOfCall { agentId: agent_id }.abi_encode(),
-                    &block,
-                )
-                .await?,
-        )?;
+        let [owner, agent_wallet, agent_uri, bytes] = results else {
+            return Err(invalid("RPC batch response count mismatch"));
+        };
+        let owner = decode_return::<IdentityReads::ownerOfCall>(&data(owner)?)?;
         if owner.is_zero() {
             return Err(invalid("registry identity owner is zero"));
         }
-        let agent_wallet = decode_return::<IdentityReads::getAgentWalletCall>(
-            &self
-                .chain
-                .call_at(
-                    registry,
-                    &IdentityReads::getAgentWalletCall { agentId: agent_id }.abi_encode(),
-                    &block,
-                )
-                .await?,
-        )?;
-        let agent_uri = decode_return::<IdentityReads::tokenURICall>(
-            &self
-                .chain
-                .call_at(
-                    registry,
-                    &IdentityReads::tokenURICall { agentId: agent_id }.abi_encode(),
-                    &block,
-                )
-                .await?,
-        )?;
+        let agent_wallet =
+            decode_return::<IdentityReads::getAgentWalletCall>(&data(agent_wallet)?)?;
+        let agent_uri = decode_return::<IdentityReads::tokenURICall>(&data(agent_uri)?)?;
         uri(&agent_uri)?;
-        let bytes = decode_return::<IdentityReads::getMetadataCall>(
-            &self
-                .chain
-                .call_at(
-                    registry,
-                    &IdentityReads::getMetadataCall {
-                        agentId: agent_id,
-                        key: "mppi.catalog".into(),
-                    }
-                    .abi_encode(),
-                    &block,
-                )
-                .await?,
-        )?;
+        let bytes = decode_return::<IdentityReads::getMetadataCall>(&data(bytes)?)?;
         if bytes.len() > DEFAULT_CATALOG_BYTES {
             return Err(invalid("registry catalog exceeds resource limit"));
         }
-        self.chain.check_canonical(&block).await?;
         Ok(RegistryIdentity {
             observation: *block.observation(),
             agent_id,
@@ -459,6 +431,49 @@ impl RegistryReader {
             agent_uri,
             catalog_bytes: bytes.to_vec(),
         })
+    }
+    pub async fn read(
+        &self,
+        agent_id: U256,
+        block: Option<&Block>,
+    ) -> Result<RegistryIdentity, ChainError> {
+        let (block, results) = self
+            .read_verified(block, self.chain.identity_calls(agent_id))
+            .await?;
+        self.identity_at(agent_id, &block, &results)
+    }
+    fn proof_domain_call(&self) -> Call {
+        eth_call(
+            self.chain.profile().registry_address(),
+            &IdentityWrites::eip712DomainCall {}.abi_encode(),
+        )
+    }
+    /// The registry's signing domain, and a deadline inside its window at `block`.
+    fn check_proof_context(
+        &self,
+        domain: &Value,
+        block: &Block,
+        deadline: U256,
+    ) -> Result<(), ChainError> {
+        let profile = self.chain.profile();
+        let domain = decode_return::<IdentityWrites::eip712DomainCall>(&data(domain)?)?;
+        if domain.fields.as_slice() != [0x0f]
+            || domain.name != PROOF_NAME
+            || domain.version != PROOF_VERSION
+            || domain.chainId != U256::from(profile.domain().chain_id())
+            || domain.verifyingContract != profile.registry_address()
+            || !domain.salt.is_zero()
+            || !domain.extensions.is_empty()
+        {
+            return Err(invalid(
+                "registry signing domain differs from selected profile",
+            ));
+        }
+        let timestamp = U256::from(block.timestamp());
+        if deadline < timestamp || deadline > timestamp + U256::from(300) {
+            return Err(invalid("recipient proof deadline outside registry window"));
+        }
+        Ok(())
     }
     pub async fn wallet_proof(
         &self,
@@ -477,37 +492,13 @@ impl RegistryReader {
             owner,
             deadline,
         )?;
-        let block = self.selected_block(block).await?;
-        let domain = decode_return::<IdentityWrites::eip712DomainCall>(
-            &self
-                .chain
-                .call_at(
-                    profile.registry_address(),
-                    &IdentityWrites::eip712DomainCall {}.abi_encode(),
-                    &block,
-                )
-                .await?,
-        )?;
-        if domain.fields.as_slice() != [0x0f]
-            || domain.name != PROOF_NAME
-            || domain.version != PROOF_VERSION
-            || domain.chainId != U256::from(profile.domain().chain_id())
-            || domain.verifyingContract != profile.registry_address()
-            || !domain.salt.is_zero()
-            || !domain.extensions.is_empty()
-        {
-            return Err(invalid(
-                "registry signing domain differs from selected profile",
-            ));
-        }
-        let timestamp = U256::from(block.timestamp());
-        if deadline < timestamp || deadline > timestamp + U256::from(300) {
-            return Err(invalid("recipient proof deadline outside registry window"));
-        }
-        if self.read(agent_id, Some(&block)).await?.owner != owner {
+        let mut calls = vec![self.proof_domain_call()];
+        calls.extend(self.chain.identity_calls(agent_id));
+        let (block, results) = self.read_verified(block, calls).await?;
+        self.check_proof_context(&results[0], &block, deadline)?;
+        if self.identity_at(agent_id, &block, &results[1..])?.owner != owner {
             return Err(invalid("registry owner differs from intended caller"));
         }
-        self.chain.check_canonical(&block).await?;
         Ok(proof)
     }
     fn check_operation(&self, operation: &RegistryOperation) -> Result<(), ChainError> {
@@ -518,13 +509,14 @@ impl RegistryReader {
         }
         Ok(())
     }
+    /// Identity owner and recipient proof context at the head, then the exact
+    /// call from the owner at that block: nothing is simulated for a caller
+    /// the identity does not name.
     pub async fn simulate(&self, operation: &RegistryOperation) -> Result<Block, ChainError> {
         self.check_operation(operation)?;
-        let block = self.verified_block().await?;
-        if let Some(id) = operation.agent_id()
-            && self.read(id, Some(&block)).await?.owner != operation.owner
-        {
-            return Err(invalid("registry caller must be identity owner"));
+        let mut calls = Vec::new();
+        if let Some(id) = operation.agent_id() {
+            calls.extend(self.chain.identity_calls(id));
         }
         if let RegistryIntent::SetAgentWallet {
             agent_id,
@@ -533,22 +525,41 @@ impl RegistryReader {
             ..
         } = operation.intent
         {
-            self.wallet_proof(
+            let profile = self.chain.profile();
+            agent_wallet_proof(
+                profile.domain().chain_id(),
+                profile.registry_address(),
                 agent_id,
                 new_wallet,
                 operation.owner,
                 deadline,
-                Some(&block),
+            )?;
+            calls.push(self.proof_domain_call());
+        }
+        let (block, results) = self.read_verified(None, calls).await?;
+        let mut results = &results[..];
+        if let Some(id) = operation.agent_id() {
+            if self.identity_at(id, &block, &results[..4])?.owner != operation.owner {
+                return Err(invalid("registry caller must be identity owner"));
+            }
+            results = &results[4..];
+        }
+        if let RegistryIntent::SetAgentWallet { deadline, .. } = operation.intent {
+            self.check_proof_context(&results[0], &block, deadline)?;
+        }
+        let simulated = self
+            .chain
+            .read(
+                &block,
+                vec![("eth_call", json!([{"from":encoded(operation.owner),"to":encoded(operation.call.to()),"data":encoded(operation.call.data()),"value":"0x0"}]))],
             )
             .await?;
-        }
-        let raw = data(&self.chain.rpc().call("eth_call", json!([{"from":encoded(operation.owner),"to":encoded(operation.call.to()),"data":encoded(operation.call.data()),"value":"0x0"},self.chain.position(&block)?])).await?)?;
+        let raw = data(&simulated[0])?;
         if operation.kind() == RegistryKind::Register {
             decode_return::<IdentityWrites::register_0Call>(&raw)?;
         } else if !raw.is_empty() {
             return Err(invalid("unexpected registry simulation output"));
         }
-        self.chain.check_canonical(&block).await?;
         Ok(block)
     }
     /// Only exact canonical registry effects confirm a transaction. Unknown
@@ -600,41 +611,52 @@ impl RegistryReader {
     ) -> Result<Option<(Block, Option<RegistryIdentity>)>, ChainError> {
         let raw = self
             .chain
-            .rpc()
-            .call("eth_getTransactionReceipt", json!([encoded(tx_hash)]))
-            .await?;
+            .many(vec![(
+                "eth_getTransactionReceipt",
+                json!([encoded(tx_hash)]),
+            )])
+            .await?
+            .remove(0);
         if raw.is_null() {
             // A missing receipt still needs the selected network established.
             self.verified_block().await?;
             return Ok(None);
         }
-        let block = self
-            .chain
-            .block(Some(quantity_u64(&raw["blockNumber"])?))
-            .await?;
-        if hash(&raw["transactionHash"])? != tx_hash
-            || hash(&raw["blockHash"])? != block.observation().block_hash()
-        {
+        if hash(&raw["transactionHash"])? != tx_hash {
             return Err(invalid("registry receipt is not canonical"));
         }
+        let number = quantity_u64(&raw["blockNumber"])?;
+        let block_hash = hash(&raw["blockHash"])?;
         let status = quantity_u64(&raw["status"])?;
         if status > 1 {
             return Err(invalid("invalid registry receipt status"));
         }
-        self.chain.verify_deployment(&block).await?;
-        if status == 0 {
-            self.chain.check_canonical(&block).await?;
+        let with_code = self.chain.code_unchecked();
+        let mut calls = self.chain.deployment_calls(with_code);
+        let confirmed = if status == 1 {
+            let events = self.events(&raw, number, block_hash, tx_hash)?;
+            let agent_id = self.confirmed_agent_id(operation, &events)?;
+            calls.extend(self.chain.identity_calls(agent_id));
+            Some((events, agent_id))
+        } else {
+            None
+        };
+        let (block, results) = self.chain.read_at(number, block_hash, calls).await?;
+        let results = self.chain.check_deployment(&results, with_code)?;
+        let Some((events, agent_id)) = confirmed else {
             return Ok(Some((block, None)));
-        }
-        let events = self.events(&raw, &block, tx_hash)?;
-        let identity = self.confirmed_identity(operation, &events, &block).await?;
-        self.chain.check_canonical(&block).await?;
-        Ok(Some((block, Some(identity))))
+        };
+        let identity = self.identity_at(agent_id, &block, results)?;
+        Ok(Some((
+            block,
+            Some(self.confirmed_identity(operation, &events, identity)?),
+        )))
     }
     fn events(
         &self,
         receipt: &Value,
-        block: &Block,
+        number: u64,
+        block_hash: B256,
         tx_hash: B256,
     ) -> Result<Vec<RegistryLog>, ChainError> {
         let logs = receipt["logs"]
@@ -652,8 +674,8 @@ impl RegistryReader {
                 || log["removed"] != Value::Bool(false)
                 || hash(&log["transactionHash"])? != tx_hash
                 || quantity(&log["transactionIndex"])? != tx_index
-                || quantity_u64(&log["blockNumber"])? != block.observation().block_number()
-                || hash(&log["blockHash"])? != block.observation().block_hash()
+                || quantity_u64(&log["blockNumber"])? != number
+                || hash(&log["blockHash"])? != block_hash
             {
                 return Err(invalid("registry event inclusion or order mismatch"));
             }
@@ -691,13 +713,14 @@ impl RegistryReader {
         }
         Ok(events)
     }
-    async fn confirmed_identity(
+    /// The identity the receipt's events name: the one registration for this
+    /// owner and URI, or the operation's own identity.
+    fn confirmed_agent_id(
         &self,
         operation: &RegistryOperation,
         events: &[RegistryLog],
-        block: &Block,
-    ) -> Result<RegistryIdentity, ChainError> {
-        let agent_id = if operation.kind() == RegistryKind::Register {
+    ) -> Result<U256, ChainError> {
+        if operation.kind() == RegistryKind::Register {
             let mut ids = Vec::new();
             for log in events
                 .iter()
@@ -718,12 +741,21 @@ impl RegistryReader {
             if ids.len() != 1 {
                 return Err(invalid("registration event missing or ambiguous"));
             }
-            ids[0]
+            Ok(ids[0])
         } else {
             operation
                 .agent_id()
-                .ok_or_else(|| invalid("registry identity missing"))?
-        };
+                .ok_or_else(|| invalid("registry identity missing"))
+        }
+    }
+    /// Only the intended effects, as events and as state read at their block.
+    fn confirmed_identity(
+        &self,
+        operation: &RegistryOperation,
+        events: &[RegistryLog],
+        identity: RegistryIdentity,
+    ) -> Result<RegistryIdentity, ChainError> {
+        let agent_id = identity.agent_id;
         let mut mints = 0usize;
         let mut metadata_matches = 0usize;
         let mut uri_matches = 0usize;
@@ -783,7 +815,6 @@ impl RegistryReader {
                 }
             }
         }
-        let identity = self.read(agent_id, Some(block)).await?;
         if identity.owner != operation.owner {
             return Err(invalid("confirmed registry owner differs from intent"));
         }
@@ -839,6 +870,73 @@ fn topic_address(topic: B256) -> Result<Address, ChainError> {
     Ok(Address::from_slice(&topic[12..]))
 }
 impl ChainReader {
+    /// Registry calldata for a provider's owner, recipient, URI and catalog.
+    pub(crate) fn identity_data(provider_id: U256) -> [Vec<u8>; 4] {
+        [
+            IdentityReads::ownerOfCall {
+                agentId: provider_id,
+            }
+            .abi_encode(),
+            IdentityReads::getAgentWalletCall {
+                agentId: provider_id,
+            }
+            .abi_encode(),
+            IdentityReads::tokenURICall {
+                agentId: provider_id,
+            }
+            .abi_encode(),
+            IdentityReads::getMetadataCall {
+                agentId: provider_id,
+                key: "mppi.catalog".into(),
+            }
+            .abi_encode(),
+        ]
+    }
+    pub(crate) fn identity_calls(&self, provider_id: U256) -> Vec<Call> {
+        let registry = self.profile().registry_address();
+        Self::identity_data(provider_id)
+            .iter()
+            .map(|calldata| eth_call(registry, calldata))
+            .collect()
+    }
+    /// The identity from the return data of [`Self::identity_data`] at `block`.
+    /// Only malformed or unavailable catalog content may be tolerated.
+    pub(crate) fn parse_identity(
+        &self,
+        provider_id: U256,
+        block: &Block,
+        raw: &[Vec<u8>],
+        allow_unavailable_catalog: bool,
+    ) -> Result<ProviderIdentity, ChainError> {
+        let [owner, recipient, uri, catalog] = raw else {
+            return Err(ChainError::InvalidEvidence(
+                "RPC batch response count mismatch",
+            ));
+        };
+        let owner = decode_return::<IdentityReads::ownerOfCall>(owner)?;
+        let recipient = decode_return::<IdentityReads::getAgentWalletCall>(recipient)?;
+        let uri = decode_return::<IdentityReads::tokenURICall>(uri)?;
+        if uri.len() > MAX_DOCUMENT_BYTES {
+            return Err(ChainError::InvalidEvidence(
+                "registry URI exceeds document limit",
+            ));
+        }
+        let raw = decode_return::<IdentityReads::getMetadataCall>(catalog)?;
+        let catalog = match parse_catalog(&raw, DEFAULT_CATALOG_BYTES) {
+            Ok(catalog) => Some(catalog),
+            Err(_) if allow_unavailable_catalog => None,
+            Err(_) => return Err(ChainError::InvalidEvidence("registry catalog is invalid")),
+        };
+        Ok(ProviderIdentity::new(
+            *block.observation(),
+            self.profile().registry_address(),
+            provider_id,
+            owner,
+            recipient,
+            uri,
+            catalog,
+        )?)
+    }
     /// Read recipient, owner, discovery URI and catalog at one canonical block.
     /// Only malformed/unavailable catalog content may be tolerated. RPC or
     /// identity failures still reject, including a cleared recipient wallet.
@@ -848,93 +946,26 @@ impl ChainReader {
         block: &Block,
         allow_unavailable_catalog: bool,
     ) -> Result<ProviderIdentity, ChainError> {
-        let registry = self.profile().registry_address();
-        let owner = decode_return::<IdentityReads::ownerOfCall>(
-            &self
-                .call_at(
-                    registry,
-                    &IdentityReads::ownerOfCall {
-                        agentId: provider_id,
-                    }
-                    .abi_encode(),
-                    block,
-                )
-                .await?,
-        )?;
-        let recipient = decode_return::<IdentityReads::getAgentWalletCall>(
-            &self
-                .call_at(
-                    registry,
-                    &IdentityReads::getAgentWalletCall {
-                        agentId: provider_id,
-                    }
-                    .abi_encode(),
-                    block,
-                )
-                .await?,
-        )?;
-        let uri = decode_return::<IdentityReads::tokenURICall>(
-            &self
-                .call_at(
-                    registry,
-                    &IdentityReads::tokenURICall {
-                        agentId: provider_id,
-                    }
-                    .abi_encode(),
-                    block,
-                )
-                .await?,
-        )?;
-        if uri.len() > MAX_DOCUMENT_BYTES {
-            return Err(ChainError::InvalidEvidence(
-                "registry URI exceeds document limit",
-            ));
-        }
-        let raw = decode_return::<IdentityReads::getMetadataCall>(
-            &self
-                .call_at(
-                    registry,
-                    &IdentityReads::getMetadataCall {
-                        agentId: provider_id,
-                        key: "mppi.catalog".into(),
-                    }
-                    .abi_encode(),
-                    block,
-                )
-                .await?,
-        )?;
-        let catalog = match parse_catalog(&raw, DEFAULT_CATALOG_BYTES) {
-            Ok(catalog) => Some(catalog),
-            Err(_) if allow_unavailable_catalog => None,
-            Err(_) => return Err(ChainError::InvalidEvidence("registry catalog is invalid")),
-        };
-        self.check_canonical(block).await?;
-        Ok(ProviderIdentity::new(
-            *block.observation(),
-            registry,
-            provider_id,
-            owner,
-            recipient,
-            uri,
-            catalog,
-        )?)
+        let results = self.read(block, self.identity_calls(provider_id)).await?;
+        let raw = results.iter().map(data).collect::<Result<Vec<_>, _>>()?;
+        self.parse_identity(provider_id, block, &raw, allow_unavailable_catalog)
     }
     /// The ERC-8004 identity binds the funded wallet, independently of the
     /// delegated session signer. A cleared wallet cannot authorize attachment.
     pub async fn agent_wallet(&self, agent_id: U256, block: &Block) -> Result<Address, ChainError> {
-        let wallet = decode_return::<IdentityReads::getAgentWalletCall>(
-            &self
-                .call_at(
+        let results = self
+            .read(
+                block,
+                vec![eth_call(
                     self.profile().registry_address(),
                     &IdentityReads::getAgentWalletCall { agentId: agent_id }.abi_encode(),
-                    block,
-                )
-                .await?,
-        )?;
+                )],
+            )
+            .await?;
+        let wallet = decode_return::<IdentityReads::getAgentWalletCall>(&data(&results[0])?)?;
         if wallet.is_zero() {
             return Err(ChainError::InvalidEvidence("registry wallet is unset"));
         }
-        self.check_canonical(block).await?;
         Ok(wallet)
     }
 }

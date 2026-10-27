@@ -26,7 +26,7 @@ from .config import (
     UpstreamConfig,
 )
 from .discovery import DiscoveryDocuments
-from .hooks import HookError, Hooks, ObserverStats
+from .hooks import HookError, Hooks, ObserverStats, OperationTiming
 from .interfaces import (
     CoverageProvider,
     ExecutionProvider,
@@ -46,6 +46,7 @@ __all__ = [
     "HookError",
     "Hooks",
     "ObserverStats",
+    "OperationTiming",
     "AdditionalService",
     "ChainConfig",
     "ConfigError",

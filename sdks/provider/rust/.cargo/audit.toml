@@ -1,0 +1,19 @@
+# cargo-audit settings for this crate's lock file. The foundation check runs
+# `cargo audit` from this directory: vulnerabilities fail it, and unmaintained,
+# unsound and yanked packages are listed as warnings. cargo-audit's format has
+# no expiry field, so each ignored advisory states why and when to review it.
+
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5: timing variability in operations intended to be
+    # constant-time; fixed only in 0.7.6. It is compiled into the library, the
+    # `mppi` binary and the tests through alloy-primitives' `k256` feature
+    # (k256 0.13.4, elliptic-curve 0.13.8), and no alloy-primitives release
+    # depends on k256 0.14. The library's only k256 operation is recovering the
+    # signer of a received signature (`verify_signature` in src/signing.rs),
+    # whose inputs are all public; it holds and signs with no secp256k1 key.
+    # The tests and the signing_vectors example sign with fixed, published test
+    # keys. Review by 2026-11-24, or sooner on an alloy-primitives release that
+    # moves to k256 0.14.
+    "RUSTSEC-2026-0387",
+]

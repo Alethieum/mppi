@@ -1,18 +1,60 @@
-//! Private, bounded command/wallet intent files. Never provider session storage.
+//! Locked, crash-safe local records for wallet operation journals.
+//!
+//! A [`TransactionWallet`](crate::capabilities::TransactionWallet) must durably
+//! bind each operation reference to its exact call before submitting it. The
+//! Circle adapter and the CLI keep their records with [`LocalState`]: one JSON
+//! object, exclusively locked while a handle is open and replaced atomically on
+//! every write. Never provider session storage.
 //!
 //! The caller owns the directory and its backups. Locks serialize cooperating
 //! local invocations; this is not a distributed lock. No credentials belong here.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
 
+/// How long `open` waits for a lock another descriptor still holds. A lock
+/// belongs to its open file description (flock(2)), and a child process spawned
+/// by any thread holds a copy of every open descriptor until it execs, so a lock
+/// this process has just released can stay held for that moment. A second live
+/// holder is still refused once the wait ends.
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(1);
+
+/// Unit tests only: records whose next `write` fails after writing its
+/// replacement, and whether after renaming it over the record. Before the
+/// rename, as a full disk or a crash would, the record is unchanged; after it,
+/// as a failed directory sync would, the replacement is in place although the
+/// write reports failure. Tests may run as root, which no directory
+/// permission refuses.
+#[cfg(test)]
+static FAILING_WRITES: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn fail_next_write(path: &Path) {
+    let path = path.canonicalize().expect("an existing record");
+    FAILING_WRITES.lock().unwrap().push((path, false));
+}
+#[cfg(test)]
+pub(crate) fn fail_next_write_after_rename(path: &Path) {
+    let path = path.canonicalize().expect("an existing record");
+    FAILING_WRITES.lock().unwrap().push((path, true));
+}
+#[cfg(test)]
+fn failing(path: &Path, renamed: bool) -> bool {
+    let mut failing = FAILING_WRITES.lock().unwrap();
+    let index = failing
+        .iter()
+        .position(|(failing, after)| failing == path && *after == renamed);
+    index.map(|index| failing.swap_remove(index)).is_some()
+}
+
+/// The record is unavailable, unsafe, invalid or held by another handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StateError;
+pub struct StateError;
 impl std::fmt::Display for StateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("local operation record unavailable, invalid or already in use")
@@ -20,7 +62,9 @@ impl std::fmt::Display for StateError {
 }
 impl std::error::Error for StateError {}
 
-pub(crate) struct LocalState {
+/// One bounded record, exclusively owned while this handle lives.
+#[derive(Debug)]
+pub struct LocalState {
     path: PathBuf,
     parent: PathBuf,
     _lock: File,
@@ -59,10 +103,26 @@ fn check_file(file: &File, path: &Path) -> Result<(), StateError> {
 }
 
 impl LocalState {
-    pub(crate) fn path(&self) -> &Path {
+    /// The record's path, in its canonical directory.
+    pub fn path(&self) -> &Path {
         &self.path
     }
-    pub(crate) fn open(path: impl AsRef<Path>, limit: usize) -> Result<Self, StateError> {
+    /// Opens the record at `path`, at most `limit` bytes (1 byte to 16 MiB),
+    /// and locks it exclusively until this handle is dropped. The directory must
+    /// exist and must not be group- or world-writable. The lock is the sibling
+    /// `<file>.lock`, created mode 0600 and never removed. Waits up to one second
+    /// for a lock another descriptor holds, then refuses the record as in use.
+    pub fn open(path: impl AsRef<Path>, limit: usize) -> Result<Self, StateError> {
+        Self::open_within(path, limit, LOCK_WAIT)
+    }
+    /// [`Self::open`], waiting up to `wait` for a lock another descriptor
+    /// holds. It sleeps the calling thread, so async callers run it on a
+    /// blocking thread.
+    pub(crate) fn open_within(
+        path: impl AsRef<Path>,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<Self, StateError> {
         if limit == 0 || limit > 16 * 1024 * 1024 {
             return Err(StateError);
         }
@@ -99,7 +159,16 @@ impl LocalState {
             .open(&lock_path)
             .map_err(|_| StateError)?;
         check_file(&lock, &lock_path)?;
-        lock.try_lock().map_err(|_| StateError)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return Err(StateError),
+            }
+        }
         // Never unlink a lock inode: waiters must continue to name this same lock.
         Ok(Self {
             path,
@@ -110,7 +179,11 @@ impl LocalState {
         })
     }
 
-    pub(crate) fn read(&self) -> Result<Option<Value>, StateError> {
+    /// The record, or `None` before its first write. Refuses a record that is
+    /// not a regular, single-link file without group or other permissions, that
+    /// exceeds the limit, or that is not one strict JSON object (UTF-8, no
+    /// duplicate keys, nesting at most 32).
+    pub fn read(&self) -> Result<Option<Value>, StateError> {
         if self.poisoned {
             return Err(StateError);
         }
@@ -132,7 +205,12 @@ impl LocalState {
         Ok(Some(value))
     }
 
-    pub(crate) fn write(&mut self, value: &Value) -> Result<(), StateError> {
+    /// Replaces the record with `value`, a JSON object within the limit. It is
+    /// durable when this returns: written to a new mode-0600 file, synced,
+    /// renamed over the record, and the directory synced. After any failure the
+    /// handle refuses every later read and write, since the rename may already
+    /// have happened; reopen the record to see what is durable.
+    pub fn write(&mut self, value: &Value) -> Result<(), StateError> {
         if self.poisoned || !value.is_object() {
             return Err(StateError);
         }
@@ -150,7 +228,15 @@ impl LocalState {
                 .map_err(|_| StateError)?;
             file.write_all(&bytes).map_err(|_| StateError)?;
             file.sync_all().map_err(|_| StateError)?;
+            #[cfg(test)]
+            if failing(&self.path, false) {
+                return Err(StateError);
+            }
             fs::rename(&temp, &self.path).map_err(|_| StateError)?;
+            #[cfg(test)]
+            if failing(&self.path, true) {
+                return Err(StateError);
+            }
             File::open(&self.parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|_| StateError)?;
@@ -198,6 +284,23 @@ mod tests {
         fs::write(&path, br#"{"a":1,"a":2}"#).unwrap();
         assert!(record.read().is_err());
         drop(record);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_lock_held_only_by_an_inherited_copy_is_awaited() {
+        let directory = directory();
+        let path = directory.join("intent.json");
+        let record = LocalState::open(&path, 128).unwrap();
+        // A child process spawned meanwhile holds a copy until it execs.
+        let inherited = record._lock.try_clone().unwrap();
+        drop(record);
+        let exec = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(inherited);
+        });
+        LocalState::open(&path, 128).unwrap();
+        exec.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

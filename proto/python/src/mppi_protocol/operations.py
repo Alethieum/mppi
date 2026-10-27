@@ -11,11 +11,11 @@ An exception carrying no structured result can preserve only the supplied ref.
 The caller retains the original PreparedOperation for reconciliation. These
 helpers maintain no storage and do not prescribe provider persistence.
 
-An adapter's FAILED result asserts a verified terminal rejection. So does its
-``NotSubmittedError``: its own durable record proves the call never reached the
-wallet service. Its success signal only triggers canonical MPPI receipt
+An adapter's FAILED result without a transaction hash asserts, as its
+``NotSubmittedError`` does, that its own durable record proves the call never
+reached the wallet service. A hash only triggers canonical MPPI receipt
 verification through ChainReader. A result keeps the error kind as ``cause``.
-No vendor-specific wallet adapter is implemented here.
+No vendor adapter is here (docs/sdk-interfaces.md, Wallet requirements).
 """
 
 from .capabilities import NotSubmittedError, TransactionWallet
@@ -95,15 +95,20 @@ def _result(
             # The payment may have succeeded. Retain the reconciliation handles.
             pass
         return OperationResult(
-            operation_ref, OperationState.UNKNOWN, response.wallet_operation_id, response.tx_hash
+            operation_ref,
+            OperationState.UNKNOWN,
+            response.wallet_operation_id,
+            response.tx_hash,
+            cause=response.cause,
         )
     state = OperationState.UNKNOWN
     if response.state is OperationState.FAILED:
         state = OperationState.FAILED
     elif response.state is OperationState.PENDING and response.wallet_operation_id is not None:
         state = OperationState.PENDING
-    # Wallet-provided observations/session outcomes are never chain evidence.
-    return OperationResult(operation_ref, state, response.wallet_operation_id)
+    # Wallet-provided observations/session outcomes are never chain evidence;
+    # the adapter's cause is kept, diagnostic only (not compared).
+    return OperationResult(operation_ref, state, response.wallet_operation_id, cause=response.cause)
 
 
 def submit_operation(

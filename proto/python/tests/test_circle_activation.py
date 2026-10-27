@@ -9,7 +9,7 @@ from eth_abi import encode
 from eth_utils import keccak
 from mppi_protocol.capabilities import WalletCall
 from mppi_protocol.chain import ChainReader, CodePin, DeploymentProfile
-from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError
+from mppi_protocol.circle import CircleAgentWallet, CircleAgentWalletError, _digest
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.registry import RegistryCalls
 from mppi_protocol.signing import voucher_digest
@@ -108,7 +108,7 @@ class Cli:
         elif args[:2] == ["wallet", "execute"]:
             row = json.loads(self.path.read_text())["operations"]["register-ref"]
             assert row["state"] == "unknown" and row["wallet_operation_id"] is None
-            assert row["call"] == {"chain_id": CHAIN, "to": hx(REGISTRY), "data": hx(REGISTER.data)}
+            assert row["call_digest"] == hx(_digest(REGISTER))
             route = row["route"]
             assert route in ("self", "direct_register")
             direct = route == "direct_register"
@@ -310,7 +310,11 @@ def test_legacy_registration_journal_remains_self_execution_after_opt_in(activat
         REGISTER, operation_ref="register-ref"
     )
     record = json.loads(cli.path.read_text())
-    del record["operations"]["register-ref"]["route"]
+    # A record from before route selection: the whole call, no route and no
+    # retirement mark.
+    row = record["operations"]["register-ref"]
+    del row["route"], row["call_digest"], row["retire_at"]
+    row["call"] = {"chain_id": CHAIN, "to": hx(REGISTRY), "data": hx(REGISTER.data)}
     cli.path.write_text(json.dumps(record))
     cli.pages = [cli.transaction("self")]
     assert create().execute(REGISTER, operation_ref="register-ref") == original
@@ -327,7 +331,7 @@ def test_route_schema_rejects_invalid_or_expanded_registration_authority(activat
     if change == "unknown_route":
         row["route"] = "arbitrary_direct"
     else:
-        row["call"]["to"] = hx(PROXY)
+        row["call_digest"] = hx(_digest(replace(REGISTER, to=PROXY)))
     cli.path.write_text(json.dumps(record))
     with pytest.raises(CircleAgentWalletError):
         create()

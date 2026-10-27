@@ -5,8 +5,8 @@
 //! supplied recovery evidence before admitting work.
 
 use crate::types::{
-    AccountingResult, ChainObservation, OperationResult, PaymentFailure, Readiness, RunContext,
-    SessionPage, SessionView, ShutdownResult,
+    AccountingResult, ChainObservation, OperationResult, OperationState, PaymentFailure, Readiness,
+    RunContext, SessionPage, SessionView, ShutdownResult,
 };
 use crate::{B256, RunAccounting, RunStatus, TokenCounts, ValidationCode, ValidationError, proto};
 use futures_core::Stream;
@@ -155,6 +155,29 @@ pub struct RecoveryEvidence {
     pub confirmed_units: u64,
     pub close_reference: Option<String>,
     pub inconsistent: bool,
+}
+impl RecoveryEvidence {
+    /// Nothing in this evidence remains to recover: its snapshot shows the
+    /// session `Closed`, which is terminal on chain, no run is reserved, every
+    /// retained operation is resolved and it is not inconsistent. Recovery
+    /// refuses such evidence `SESSION_CLOSED` once the follower shows the
+    /// session closed. Pass such records to `recover` at startup all the same:
+    /// the refusal hands the references the wallet binds to them to retirement.
+    pub fn is_final(&self) -> bool {
+        let resolved = |operation: &RecoveryOperation| {
+            !matches!(
+                operation.result.state(),
+                OperationState::Pending | OperationState::Unknown
+            ) || operation.result.observation().is_some()
+        };
+        self.snapshot.status == Some(proto::SessionStatus::Closed as i32)
+            && self.reservations.is_empty()
+            && [&self.operation, &self.baseline]
+                .into_iter()
+                .flatten()
+                .all(resolved)
+            && !self.inconsistent
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

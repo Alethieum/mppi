@@ -1,5 +1,15 @@
 //! Coherent cached chain evidence. Readiness performs no RPC work. A repeated
-//! head, stale timestamp, reorg, failed refresh or cancelled read fails closed.
+//! head cannot renew freshness. A stale timestamp, contradicting evidence, a
+//! failed refresh or a cancelled read fails closed. A lagging RPC is lag: the
+//! accepted evidence stays, ages as usual and is never renewed by it.
+//!
+//! A refresh reads everything watched at one block, the head
+//! ([`ChainReader`]'s Multicall3 snapshot): one round trip while its calls fit
+//! one JSON-RPC batch. Arc commits each block with BFT finality, "Every
+//! transaction in a committed block is immediately and irreversibly settled"
+//! with "no reorganization risk"
+//! (https://docs.arc.io/arc/concepts/deterministic-finality), so no accepted
+//! block is read again.
 use crate::{
     B256, U256,
     chain::{Block, ChainError, ChainReader, ChainSession},
@@ -11,7 +21,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard},
+    task::JoinHandle,
+};
 
 const MAX_MS: u64 = (i64::MAX as u64) / 1_000_000;
 fn unavailable() -> ChainError {
@@ -71,6 +84,10 @@ struct State {
     failed: bool,
     running: bool,
     generation: u64,
+    /// Refreshes that have taken the watched set to read, and the latest of
+    /// them accepted (see `watch_session`).
+    reads: u64,
+    accepted_read: u64,
 }
 struct Inner {
     reader: ChainReader,
@@ -160,6 +177,8 @@ impl ChainFollower {
                     failed: true,
                     running: false,
                     generation: 0,
+                    reads: 0,
+                    accepted_read: 0,
                 }),
                 refresh: AsyncMutex::new(()),
             }),
@@ -242,14 +261,36 @@ impl ChainFollower {
             .cloned()
             .ok_or_else(unavailable)
     }
+    /// Reads this session from the next refresh on and returns its state.
+    /// Watches that arrive while a refresh runs, or wait behind one, share the
+    /// next. A watch that takes the refresh lock once a refresh begun after it
+    /// was added has been accepted, and finds the accepted snapshot fresh and
+    /// holding the session, reads nothing more. Any other refreshes itself, so
+    /// a refresh that fails or lags reaches each watch as before.
     pub async fn watch_session(&self, id: B256) -> Result<ChainSession, ChainError> {
-        self.inner
+        let added = {
+            let mut state = self.inner.state.lock().map_err(|_| unavailable())?;
+            state.sessions.insert(id);
+            state.reads
+        };
+        let serial = self.inner.refresh.lock().await;
+        let read = self
+            .inner
             .state
             .lock()
             .map_err(|_| unavailable())?
-            .sessions
-            .insert(id);
-        self.refresh()
+            .accepted_read;
+        if read > added
+            && let Some(session) = self
+                .inner
+                .snapshot()
+                .ok()
+                .and_then(|current| current.sessions.get(&id).cloned())
+        {
+            return Ok(session);
+        }
+        self.inner
+            .refresh_serialized(&serial)
             .await?
             .sessions
             .get(&id)
@@ -435,14 +476,23 @@ impl Inner {
         Ok(self.clock.wall()?.max(estimate))
     }
     async fn refresh(&self) -> Result<Arc<ChainSnapshot>, ChainError> {
-        let _serial = self.refresh.lock().await;
-        let (generation, providers, sessions, previous) = {
-            let state = self.state.lock().map_err(|_| unavailable())?;
+        let serial = self.refresh.lock().await;
+        self.refresh_serialized(&serial).await
+    }
+    /// A refresh, run while the caller holds the refresh lock.
+    async fn refresh_serialized(
+        &self,
+        _serial: &AsyncMutexGuard<'_, ()>,
+    ) -> Result<Arc<ChainSnapshot>, ChainError> {
+        let (generation, read, providers, sessions, previous) = {
+            let mut state = self.state.lock().map_err(|_| unavailable())?;
             if !state.running {
                 return Err(unavailable());
             }
+            state.reads = state.reads.checked_add(1).ok_or_else(unavailable)?;
             (
                 state.generation,
+                state.reads,
                 state.providers.clone(),
                 state.sessions.clone(),
                 state.current.clone(),
@@ -453,44 +503,37 @@ impl Inner {
             generation,
             committed: false,
         };
-        let block = self.reader.block(None).await?;
-        if let Some(previous) = &previous {
-            let old = &previous.block;
-            if self
-                .reader
-                .block(Some(old.observation().block_number()))
-                .await?
-                != *old
+        let latest = match self.reader.latest(&providers, &sessions).await {
+            Ok(latest)
+                if previous.as_ref().is_none_or(|p| {
+                    latest.block.observation().block_number()
+                        >= p.block.observation().block_number()
+                }) =>
             {
-                return Err(ChainError::InvalidEvidence(
-                    "accepted canonical block changed",
-                ));
+                latest
             }
-            if old.observation().block_number().checked_add(1)
-                == Some(block.observation().block_number())
-                && block.parent_hash() != old.observation().block_hash()
-            {
-                return Err(ChainError::InvalidEvidence(
-                    "canonical head ancestry mismatch",
-                ));
+            Ok(_) | Err(ChainError::Lagging) => {
+                // The accepted evidence stays valid and keeps ageing. A watch
+                // it does not cover reports the lag; other watches stay ready.
+                let covered = previous.as_ref().is_some_and(|p| {
+                    providers.iter().all(|id| p.identities.contains_key(id))
+                        && sessions.iter().all(|id| p.sessions.contains_key(id))
+                });
+                guard.committed = true;
+                if !covered {
+                    return Err(ChainError::Lagging);
+                }
+                let result = self.snapshot();
+                guard.committed = result.is_ok();
+                return result;
             }
-        }
-        self.reader.verify_deployment(&block).await?;
-        let pause_level = self.reader.pause_level(&block).await?;
-        let mut identities = BTreeMap::new();
-        for id in providers {
-            identities.insert(id, self.reader.identity(id, &block, true).await?);
-        }
-        let mut states = BTreeMap::new();
-        for id in sessions {
-            states.insert(id, self.reader.session(id, &block).await?);
-        }
-        self.reader.check_canonical(&block).await?;
+            Err(error) => return Err(error),
+        };
         let current = Arc::new(ChainSnapshot {
-            block,
-            pause_level,
-            identities,
-            sessions: states,
+            block: latest.block,
+            pause_level: latest.pause_level,
+            identities: latest.identities,
+            sessions: latest.sessions,
             observed_at: self.clock.monotonic(),
         });
         if let Some(previous) = &previous {
@@ -507,6 +550,7 @@ impl Inner {
                 state.progress_at = current.observed_at;
             }
             state.current = Some(current);
+            state.accepted_read = read;
             state.failed = false;
         }
         let result = self.snapshot()?;
@@ -817,5 +861,251 @@ mod tests {
         assert!(!follower.readiness(None).ready());
         follower.stop().await.unwrap();
         assert!(follower.task.lock().unwrap().is_none());
+    }
+
+    /// An RPC whose backend serves blocks up to `served`; `rewritten` changes
+    /// the hash every later read reports for that block number. Each call
+    /// yields once, as a network read does; `heads` counts the reads of the
+    /// latest header, one per refresh.
+    struct ChainRpc {
+        served: AtomicU64,
+        rewritten: AtomicU64,
+        heads: AtomicUsize,
+    }
+    impl ChainRpc {
+        fn header(&self, number: u64) -> Value {
+            if number > self.served.load(Ordering::SeqCst) {
+                return Value::Null;
+            }
+            let hash = |n: u64| {
+                let salt = u64::from(self.rewritten.load(Ordering::SeqCst) == n);
+                crate::chain::encoded(alloy_primitives::keccak256(
+                    [n, salt].map(u64::to_be_bytes).concat(),
+                ))
+            };
+            serde_json::json!({"number":format!("0x{number:x}"),"hash":hash(number),"parentHash":hash(number - 1),"timestamp":format!("0x{:x}", TIME + number - 105)})
+        }
+    }
+    #[tonic::async_trait]
+    impl Rpc for ChainRpc {
+        async fn call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
+            tokio::task::yield_now().await;
+            let word = |raw: &[u8]| serde_json::json!(crate::chain::encoded(raw));
+            Ok(match method {
+                "eth_chainId" => serde_json::json!("0x4cef52"),
+                "eth_getBlockByNumber" => self.header(match params[0].as_str().unwrap() {
+                    "latest" => {
+                        self.heads.fetch_add(1, Ordering::SeqCst);
+                        self.served.load(Ordering::SeqCst)
+                    }
+                    raw => u64::from_str_radix(&raw[2..], 16).unwrap(),
+                }),
+                // The pinned code; nothing at Multicall3's address.
+                "eth_getCode" => serde_json::json!(if [1u8, 2, 3, 4]
+                    .iter()
+                    .any(|n| params[0] == word(Address::repeat_byte(*n).as_slice()))
+                {
+                    "0x6000"
+                } else {
+                    "0x"
+                }),
+                "eth_getStorageAt" => word(
+                    Address::repeat_byte(
+                        if params[0] == word(Address::repeat_byte(1).as_slice()) {
+                            2
+                        } else {
+                            4
+                        },
+                    )
+                    .into_word()
+                    .as_slice(),
+                ),
+                "eth_call" => {
+                    let data = params[0]["data"].as_str().unwrap();
+                    let is = |selector: [u8; 4]| data.starts_with(&crate::chain::encoded(selector));
+                    use crate::contract::abi::IMPPI;
+                    use alloy_sol_types::SolCall;
+                    if is(IMPPI::voucherDigestCall::SELECTOR) {
+                        word(
+                            Domain::new(5042002, Address::repeat_byte(1))
+                                .unwrap()
+                                .signing_context()
+                                .digest(&crate::signing::Voucher {
+                                    sessionId: B256::ZERO,
+                                    cumulativeAmount: 0,
+                                })
+                                .as_slice(),
+                        )
+                    } else if is(IMPPI::pauseLevelCall::SELECTOR) {
+                        word(&[0; 32])
+                    } else if is(IMPPI::getSessionCall::SELECTOR) {
+                        let mut raw = [0u8; 192];
+                        raw[24..32].copy_from_slice(&100u64.to_be_bytes());
+                        raw[152..160].copy_from_slice(&TIME.to_be_bytes());
+                        raw[160..].copy_from_slice(&[6; 32]);
+                        word(&raw)
+                    } else {
+                        return Err(ChainError::InvalidEvidence("unplanned follower test call"));
+                    }
+                }
+                _ => {
+                    return Err(ChainError::InvalidEvidence(
+                        "unplanned follower test method",
+                    ));
+                }
+            })
+        }
+    }
+    async fn following() -> (ChainFollower, Arc<ChainRpc>, Arc<TestClock>) {
+        let rpc = Arc::new(ChainRpc {
+            served: AtomicU64::new(100),
+            rewritten: AtomicU64::new(0),
+            heads: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(TestClock {
+            mono: AtomicU64::new(0),
+            wall: AtomicU64::new(TIME * 1000),
+        });
+        let pin = |n| {
+            CodePin::new(
+                Address::repeat_byte(n),
+                alloy_primitives::keccak256([0x60, 0]),
+            )
+            .unwrap()
+        };
+        let profile = DeploymentProfile::new(
+            Domain::new(5042002, Address::repeat_byte(1)).unwrap(),
+            Address::repeat_byte(3),
+            pin(1),
+            pin(2),
+            pin(3),
+            pin(4),
+        )
+        .unwrap();
+        let follower = ChainFollower::with_clock(
+            ChainReader::new(rpc.clone(), profile),
+            10000,
+            1000,
+            Some(10000),
+            clock.clone(),
+        )
+        .unwrap();
+        follower.start().await.unwrap();
+        follower.watch_session(B256::repeat_byte(5)).await.unwrap();
+        (follower, rpc, clock)
+    }
+    #[tokio::test]
+    async fn a_lagging_rpc_keeps_accepted_evidence_without_renewing_it() {
+        let (follower, rpc, clock) = following().await;
+        let accepted = follower.current().unwrap();
+        rpc.served.store(98, Ordering::SeqCst);
+        let kept = follower.refresh().await.unwrap();
+        assert!(Arc::ptr_eq(&accepted, &kept));
+        assert!(follower.readiness(Some(B256::repeat_byte(5))).ready());
+        // A new watch the retained evidence cannot cover reports the lag alone.
+        assert_eq!(
+            follower
+                .watch_session(B256::repeat_byte(7))
+                .await
+                .unwrap_err(),
+            ChainError::Lagging
+        );
+        assert!(follower.readiness(Some(B256::repeat_byte(5))).ready());
+        // Lag never renews freshness: the kept evidence ages out as usual.
+        clock.mono.store(10_000, Ordering::SeqCst);
+        assert!(follower.refresh().await.is_err());
+        assert!(!follower.readiness(Some(B256::repeat_byte(5))).ready());
+        clock.mono.store(10_001, Ordering::SeqCst);
+        rpc.served.store(101, Ordering::SeqCst);
+        let next = follower.refresh().await.unwrap();
+        assert_eq!(next.block().observation().block_number(), 101);
+        assert!(follower.readiness(Some(B256::repeat_byte(5))).ready());
+        follower.stop().await.unwrap();
+    }
+    /// Each id's watch, all at once, as recoveries at startup add theirs.
+    async fn watched_together(
+        follower: &Arc<ChainFollower>,
+        ids: &[B256],
+    ) -> Vec<Result<ChainSession, ChainError>> {
+        let watches: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let (follower, id) = (follower.clone(), *id);
+                tokio::spawn(async move { follower.watch_session(id).await })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for watch in watches {
+            results.push(watch.await.unwrap());
+        }
+        results
+    }
+    #[tokio::test]
+    async fn watches_waiting_behind_a_refresh_share_the_next_one() {
+        let (follower, rpc, _) = following().await;
+        let follower = Arc::new(follower);
+        let refreshes = || rpc.heads.load(Ordering::SeqCst);
+        let ids: Vec<B256> = (0x10..0x30).map(B256::repeat_byte).collect();
+        let before = refreshes();
+        let watched = watched_together(&follower, &ids).await;
+        // The first watch's refresh began before the others were added; the
+        // next one reads the 31 that waited behind it, for all of them.
+        assert_eq!(refreshes() - before, 2);
+        let current = follower.snapshot().unwrap();
+        for (id, watched) in ids.iter().zip(watched) {
+            assert_eq!(&watched.unwrap(), &current.sessions()[id]);
+            assert!(follower.readiness(Some(*id)).ready());
+        }
+        // Lag reaches each waiting watch the accepted snapshot cannot cover,
+        // from its own refresh, as before; the others stay ready.
+        rpc.served.store(98, Ordering::SeqCst);
+        let lagging: Vec<B256> = (0x30..0x38).map(B256::repeat_byte).collect();
+        let before = refreshes();
+        let watched = watched_together(&follower, &lagging).await;
+        assert_eq!(refreshes() - before, lagging.len());
+        assert!(watched.iter().all(|w| w == &Err(ChainError::Lagging)));
+        assert!(follower.readiness(Some(ids[0])).ready());
+        follower.stop().await.unwrap();
+    }
+    /// Polls `future` once, as its task does before it waits: it must wait.
+    async fn waiting<F: std::future::Future>(future: &mut std::pin::Pin<&mut F>) {
+        tokio::select! {
+            biased;
+            _ = future.as_mut() => panic!("finished without waiting"),
+            () = std::future::ready(()) => {}
+        }
+    }
+    #[tokio::test]
+    async fn a_watch_behind_a_failed_refresh_is_not_answered_from_an_earlier_read() {
+        let (follower, rpc, _) = following().await;
+        let id = B256::repeat_byte(0x40);
+        // In the lock's order: a refresh reading, one that begins after the
+        // watch is added, one that fails after it, then the watch.
+        let (first, shared, failing) = (follower.refresh(), follower.refresh(), follower.refresh());
+        let watch = follower.watch_session(id);
+        tokio::pin!(first, shared, failing, watch);
+        waiting(&mut first).await;
+        waiting(&mut shared).await;
+        waiting(&mut failing).await;
+        waiting(&mut watch).await;
+        first.await.unwrap();
+        assert!(shared.await.unwrap().sessions().contains_key(&id));
+        rpc.rewritten.store(100, Ordering::SeqCst);
+        let failure = failing.await.unwrap_err();
+        // The watch reads for itself and reports what its own refresh finds,
+        // as before, not the snapshot the failure left.
+        let before = rpc.heads.load(Ordering::SeqCst);
+        assert_eq!(watch.await.unwrap_err(), failure);
+        assert_eq!(rpc.heads.load(Ordering::SeqCst) - before, 1);
+        assert!(!follower.readiness(Some(id)).ready());
+        follower.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn contradicting_evidence_still_fails_closed() {
+        let (follower, rpc, _) = following().await;
+        rpc.rewritten.store(100, Ordering::SeqCst);
+        assert!(follower.refresh().await.is_err());
+        assert!(!follower.readiness(None).ready());
+        follower.stop().await.unwrap();
     }
 }

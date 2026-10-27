@@ -9,7 +9,7 @@ use crate::{
     onboarding::{
         OnboardingError, OnboardingProgress, OnboardingResult, SignedRecipientProof,
         confirm_registry_result, decode_retained, encode_retained, exact, fail, new_retained,
-        registration_document, result, save, wallet_registry_result,
+        read_failed, registration_document, result, save, wallet_registry_result,
     },
     registry::{RegistryCalls, RegistryIdentity, RegistryKind, RegistryOperation, RegistryReader},
     types::OperationState,
@@ -23,6 +23,7 @@ use std::{
 };
 
 const RECORD_LIMIT: usize = 8 << 20;
+const UNSUBMITTED: &str = "original update operation failed before submission; repair wallet setup and rerun the same requested changes";
 fn hx(value: impl AsRef<[u8]>) -> String {
     format!("0x{}", hex::encode(value))
 }
@@ -473,7 +474,7 @@ pub async fn update(
             let identity = registry
                 .read(current.identity().provider_id(), None)
                 .await
-                .map_err(|_| fail("current provider identity is unavailable"))?;
+                .map_err(read_failed("current provider identity is unavailable"))?;
             if identity.owner() != wallet.address() {
                 return Err(fail(
                     "provider identity is not owned by the selected wallet",
@@ -545,7 +546,7 @@ pub async fn update(
                     record["pending"] = Value::Null;
                     save(&mut store, &record)?;
                     return Err(fail(if retained.result.tx_hash().is_none() {
-                        "original update operation failed before submission; repair wallet setup and rerun the same requested changes"
+                        UNSUBMITTED
                     } else {
                         "original update transaction reverted; rerun the same requested changes"
                     }));
@@ -564,7 +565,7 @@ pub async fn update(
         let identity = registry
             .read(current.identity().provider_id(), None)
             .await
-            .map_err(|_| fail("current provider identity is unavailable"))?;
+            .map_err(read_failed("current provider identity is unavailable"))?;
         if identity.owner() != wallet.address() {
             return Err(fail("provider identity owner changed"));
         }
@@ -631,9 +632,9 @@ pub async fn update(
                         None,
                     )
                     .await
-                    .map_err(|_| {
-                        fail("recipient proof expired or context changed; export a fresh request")
-                    })?;
+                    .map_err(read_failed(
+                        "recipient proof expired or context changed; export a fresh request",
+                    ))?;
                 if expected != *proof.request() {
                     return Err(fail(
                         "recipient proof context differs from requested update",
@@ -652,7 +653,7 @@ pub async fn update(
                 let block = registry
                     .verified_block()
                     .await
-                    .map_err(|_| fail("recipient proof context unavailable"))?;
+                    .map_err(read_failed("recipient proof context unavailable"))?;
                 let deadline = crate::U256::from(block.timestamp()) + crate::U256::from(300u64);
                 let proof = registry
                     .wallet_proof(
@@ -663,7 +664,7 @@ pub async fn update(
                         Some(&block),
                     )
                     .await
-                    .map_err(|_| fail("recipient proof request unavailable"))?;
+                    .map_err(read_failed("recipient proof request unavailable"))?;
                 record["recipient_proof"] = proof.clone();
                 save(&mut store, &record)?;
                 return Ok(result(
@@ -700,7 +701,7 @@ pub async fn update(
         let latest = registry
             .read(current.identity().provider_id(), None)
             .await
-            .map_err(|_| fail("update preflight state unavailable"))?;
+            .map_err(read_failed("update preflight state unavailable"))?;
         if latest.owner() != wallet.address() {
             return Err(fail("provider identity owner changed before update"));
         }
@@ -726,11 +727,18 @@ pub async fn update(
         registry
             .simulate(&planned)
             .await
-            .map_err(|_| fail("planned update failed registry simulation"))?;
+            .map_err(read_failed("planned update failed registry simulation"))?;
         let retained = new_retained(planned)?;
         record["pending"] = encode_retained(&retained);
         save(&mut store, &record)?;
         let retained = wallet_registry_result(wallet.as_ref(), &retained, true).await?;
+        if retained.result.state() == OperationState::Failed {
+            // Proven never submitted. The wallet may keep no record of it to
+            // reconcile, so end it now; a rerun prepares a fresh intent.
+            record["pending"] = Value::Null;
+            save(&mut store, &record)?;
+            return Err(fail(UNSUBMITTED));
+        }
         submitted = true;
         record["pending"] = encode_retained(&retained);
         save(&mut store, &record)?;

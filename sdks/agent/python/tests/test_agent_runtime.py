@@ -7,10 +7,14 @@ installed two-role acceptance test; these are not chain or wallet integration.
 
 import asyncio
 import copy
+import hashlib
 import json
+import os
 import pickle
+import shutil
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import astuple, replace
 from pathlib import Path
@@ -28,12 +32,13 @@ from mppi_agent import (
     CompletionStream,
     FundingAuthorizationError,
     FundingNotice,
+    HookError,
     Hooks,
     PaymentError,
 )
 from mppi_agent import client as client_module
 from mppi_agent.checkpoint import Checkpoint
-from mppi_agent.client import _Output
+from mppi_agent.client import Sessions, _Output
 from mppi_agent.state import Ledger
 from mppi_protocol import follower as follower_module
 from mppi_protocol._observers import Observers
@@ -44,9 +49,10 @@ from mppi_protocol.chain import (
     Block,
     ChainContradictionError,
     ChainEvidenceError,
+    ChainLagError,
     ChainSession,
     ClosingEvidence,
-    FundingEvidence,
+    FundingState,
     OpeningEvidence,
 )
 from mppi_protocol.contract import ARC_USDC, ContractCalls, OperationKind
@@ -80,14 +86,12 @@ DESCRIPTOR = SessionDescriptor(
 
 
 def fundable(client: Client) -> Mock:
-    """Give a component client its agent id and a funding check that passes."""
+    """Give a component client its agent id and a funding check that passes:
+    the snapshot binds the id to a funding wallet with code, which approves."""
     client.agent_id = 43
-    check = Mock(
-        side_effect=lambda auth, signature, agent_id, block: FundingEvidence(
-            block, True, DESCRIPTOR.agent
-        )
-    )
-    client.chain.reader = SimpleNamespace(funding=check)
+    check = Mock(return_value=True)
+    client.chain.reader = SimpleNamespace(funding_signature=check)
+    client.chain.current.funding = FundingState(43, DESCRIPTOR.agent, DESCRIPTOR.agent, True)
     return check
 
 
@@ -106,6 +110,9 @@ def component_client() -> Client:
         readiness=lambda _: Readiness(True),
         confirmed_readiness=lambda _: Readiness(True),
         confirm=Mock(),
+        follow=Mock(),
+        start=AsyncMock(),
+        unwatch_funding=Mock(),
     )
     client.signer = SIGNER
     client.timeout = 1
@@ -122,7 +129,7 @@ def component_client() -> Client:
     client._queue_options = {"max_messages": 4, "max_bytes": 16384, "wait_ms": 50}
     client._nonce = client._snapshot_waiter = client._close_waiter = None
     client._snapshot_applied = None
-    client._operation_locks = {}
+    client._operation_locks, client._retiring = {}, None
     client._challenges = {}
     client._outputs = {}
     client._control = None
@@ -744,8 +751,30 @@ class _FreshOpening(Exception):
     """The opening after a retirement reached its new Challenge."""
 
 
-def closed_client(tmp_path: Path, kind: str, settled: int = 0) -> tuple[Client, bytes, Path]:
-    """A restored client whose session this agent itself closed (or did not)."""
+def exit_attempt(ref: str, attempt: int, state: OperationState) -> OperationResult:
+    """The result an exit attempt was saved with: CONFIRMED with its receipt's
+    block, FAILED mined and reverted, PENDING at the wallet with no hash yet,
+    or UNKNOWN with no hash, as after a crash between journal and wallet."""
+    tx = b"e" * 32 if attempt == 0 else b"e" * 31 + bytes([attempt])
+    observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+    if state is OperationState.CONFIRMED:
+        return OperationResult(ref, state, tx_hash=tx, observation=observation)
+    if state is OperationState.FAILED:
+        return OperationResult(ref, state, f"w-{attempt + 1}", tx)
+    if state is OperationState.PENDING:
+        return OperationResult(ref, state, f"w-{attempt + 1}")
+    return OperationResult(ref, state)
+
+
+def closed_client(
+    tmp_path: Path,
+    kind: str,
+    settled: int = 0,
+    exits: tuple[OperationState, ...] = (OperationState.CONFIRMED,),
+) -> tuple[Client, bytes, Path]:
+    """A restored client whose session this agent itself closed (or did not).
+    For an exit ``kind``, ``exits`` are its attempts' states in order, under
+    <kind>-<session id hex>, then .1, .2 and so on (exit_attempt)."""
     path = tmp_path / "agent.json"
     contract = ContractCalls(DOMAIN, "USDC", "2")
     observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
@@ -797,19 +826,25 @@ def closed_client(tmp_path: Path, kind: str, settled: int = 0) -> tuple[Client, 
             contract,
             {"releaseIdle": "release_idle", "requestClose": "request_close"}.get(kind, kind),
         )(DESCRIPTOR)
-        ref = kind + "-" + ledger.session_id.hex()
-        client._operations[ref] = (
-            call,
-            OperationResult(
-                ref, OperationState.CONFIRMED, tx_hash=b"e" * 32, observation=observation
-            ),
-        )
+        base = kind + "-" + ledger.session_id.hex()
+        for attempt, state in enumerate(exits):
+            ref = base if attempt == 0 else f"{base}.{attempt}"
+            client._operations[ref] = (call, exit_attempt(ref, attempt, state))
     checkpoint = Checkpoint(path)
     checkpoint.save(client._record())
     checkpoint.close()
-    # A new process restores the record, as from a CLI run after the close.
+    return restored_client(path, settled), ledger.session_id, path
+
+
+def restored_client(path: Path, settled: int = 0) -> Client:
+    """A new process restoring the checkpoint at ``path``, as from a CLI run
+    after the close, with fresh evidence that shows the session Closed."""
+    contract = ContractCalls(DOMAIN, "USDC", "2")
+    observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
     restored = component_client()
-    restored.contract, restored.wallet = contract, client.wallet
+    restored.contract = contract
+    restored.wallet = SimpleNamespace(address=DESCRIPTOR.agent)
+    restored.signer_reference = "fixture:public-test-key"
     restored._checkpoint, restored._checkpoint_lock = Checkpoint(path), asyncio.Lock()
     restored._saved = restored._checkpoint.load()
     restored._ledger, restored._operations = None, {}
@@ -824,12 +859,22 @@ def closed_client(tmp_path: Path, kind: str, settled: int = 0) -> tuple[Client, 
     # is final; a closed session never changes, so a later block shows the same.
     closed = ChainSession(100, settled, SessionStatus.CLOSED, 0, 100, CATALOG.rate_card_hash)
     restored.chain.current = SimpleNamespace(
-        block=Block(observation, 100, b"c" * 32), sessions={ledger.session_id: closed}
+        block=Block(observation, 100, b"c" * 32),
+        sessions={restored._ledger.session_id: closed},
+        pause_level=PauseLevel.NONE,
     )
     restored.chain.snapshot = lambda: restored.chain.current
     restored.chain.refresh = AsyncMock(return_value=restored.chain.current)
+    restored.chain.unwatch_session = Mock()
     restored.chain.reader = SimpleNamespace()
-    return restored, ledger.session_id, path
+    return restored
+
+
+async def explicitly_open(client: Client):
+    """client.sessions.open, run on the test's own loop."""
+    client.provider, client._identity = 7, None
+    client._sync = lambda work: work
+    return await Sessions(client).open(7, model="test/model")
 
 
 @pytest.mark.parametrize("kind", ["cooperative", "withdraw", "releaseIdle"])
@@ -854,7 +899,8 @@ def test_an_agents_own_close_retires_its_session_so_the_next_opening_funds_anoth
         assert after["scope"] == before["scope"]
         assert client._ledger is None and client._closed_result is None
         assert client._operations == {} and client._opening_ref is None
-        # Only a new Control stream carries the new session.
+        # Refreshes stop reading it; only a new Control stream carries the next one.
+        client.chain.unwatch_session.assert_called_once_with(identifier)
         assert isinstance(client._control_failure, ClientError)
         client._connect.assert_awaited()
         client._challenge.assert_awaited_once_with("test/model")
@@ -863,12 +909,587 @@ def test_an_agents_own_close_retires_its_session_so_the_next_opening_funds_anoth
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    "kind", ["reported", "requestClose", "excess", "active", "no_tokens", "no_agent_id"]
-)
-def test_a_close_not_yet_final_or_not_within_usage_keeps_its_session(
+def test_an_operation_without_a_transaction_hash_is_never_handed_to_the_wallets_retire(
+    tmp_path: Path,
+) -> None:
+    """A retirement hands the wallet's retire only references that hold a
+    transaction hash. A top-up that FAILED before any transaction stays in the
+    wallet's journal, which may yet hold a hash the agent never learned."""
+
+    async def scenario() -> None:
+        client, _, _ = closed_client(tmp_path, "cooperative")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        auth = FundingAuthorization(
+            DOMAIN.chain_id,
+            ARC_USDC,
+            "USDC",
+            "2",
+            DESCRIPTOR.agent,
+            DOMAIN.verifying_contract,
+            10,
+            0,
+            2_000_000_000,
+            b"t" * 32,
+        )
+        client._operations["top-up-x"] = (
+            client.contract.top_up(DESCRIPTOR, 10, auth, bytes(65)),
+            OperationResult("top-up-x", OperationState.FAILED),
+        )
+        await client._persist()
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert forgotten == [{"open-x"}]
+        assert client._operations == {}
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["forgotten", "kept"])
+def test_an_agents_retired_session_leaves_its_wallet_journal_too(
+    tmp_path: Path, refused: bool
+) -> None:
+    """Once the checkpoint names none of its operations, a wallet that can
+    forget them does: its journal no longer grows with every closed session.
+    A wallet that cannot leaves them, and the next opening goes on."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        references = set(client._operations)
+        assert len(references) == 2  # The opening and the withdrawal.
+        forgotten: list[tuple[set[str], float]] = []
+
+        def retire(*, operation_refs: Iterable[str], at: float) -> None:
+            # After the save that drops them, before the new Control stream.
+            assert json.loads(path.read_text())["operations"] == []
+            client._connect.assert_not_awaited()
+            forgotten.append((set(operation_refs), at))
+            if refused:
+                raise OSError("journal held elsewhere")
+
+        client.wallet.retire = retire
+        client._observers = Mock()
+        before = time.time()
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        ((refs, at),) = forgotten
+        assert refs == references and before <= at <= time.time()  # Unix seconds.
+        errors = [
+            item.args[1]
+            for item in client._observers.emit.call_args_list
+            if item.args[0] == "on_error"
+        ]
+        assert errors == ([HookError("retire", "OSError", identifier)] if refused else [])
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_retirement_whose_new_control_stream_fails_has_already_retired_its_records(
+    tmp_path: Path,
+) -> None:
+    """The save and the wallet's retire come before the new Control stream:
+    one that cannot begin (here its CA file is unreadable) leaves the session
+    retired and its records forgotten, and the next opening begins it. Before,
+    the stream came first, and its failure left the references unretired for
+    good once the next opening saved a checkpoint without them."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        client._connect = AsyncMock(side_effect=[OSError("CA file unreadable"), None])
+        with pytest.raises(OSError, match="CA file unreadable"):
+            await client._open("test/model", None)
+        assert forgotten == [references]
+        saved = json.loads(path.read_text())
+        assert "ledger" not in saved and saved["operations"] == []
+        assert (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert forgotten == [references]  # Nothing is left to retire.
+        assert client._connect.await_count == 2
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["withdraw", "none"], ids=["own_exit", "closed_by_other"])
+def test_a_retirement_whose_save_fails_keeps_the_session_for_the_next_open(
     tmp_path: Path, kind: str
 ) -> None:
+    """The save that drops the closed session fails. Memory is restored, as an
+    attachment's failed save restores its ledger, so every later save still
+    names the session and the next open retries the whole retirement,
+    retiring the wallet's references. Before, memory was already cleared: the
+    next save wrote a checkpoint without the session, and its references were
+    never retired."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind)
+        if kind == "none":
+            client._ledger.close_pending = False
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        save, failing = client._checkpoint.save, [True]
+
+        def save_once_failing(record: dict) -> None:
+            if "ledger" not in record and failing:  # The save that drops the session.
+                failing.clear()
+                raise ValidationError(
+                    ValidationCode.INVALID_VALUE, "checkpoint could not be durably written"
+                )
+            save(record)
+
+        client._checkpoint.save = save_once_failing
+
+        def opening():
+            return explicitly_open(client) if kind == "none" else client._open("test/model", None)
+
+        with pytest.raises(ValidationError, match="durably written"):
+            await opening()
+        assert forgotten == []
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        assert set(client._operations) == references and client._opening_ref == "open-x"
+        assert "ledger" in client._saved
+        client.chain.unwatch_session.assert_not_called()
+        await client._persist()  # Any later save, as the next opening's.
+        saved = json.loads(path.read_text())
+        assert "ledger" in saved and {item["ref"] for item in saved["operations"]} == references
+        with pytest.raises(_FreshOpening):
+            await opening()
+        assert forgotten == [references]
+        saved = json.loads(path.read_text())
+        assert "ledger" not in saved and saved["operations"] == []
+        assert (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        client.chain.unwatch_session.assert_called_once_with(identifier)
+        client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def hold_a_report_save_across_the_drop(client: Client, loop, report) -> list:
+    """When the retirement makes its first save, start ``report`` on the loop:
+    a report on the old attachment, whose own save is then held until the
+    retirement has dropped the session from memory, so it spans the drop.
+    Returns the report's future."""
+    real_save, saves, started = client._checkpoint.save, [], []
+
+    def save(record: dict) -> None:
+        saves.append(record)
+        if len(saves) == 1:
+            started.append(asyncio.run_coroutine_threadsafe(report(), loop))
+        elif len(saves) == 2:  # The report's, behind the retirement's first.
+            deadline = time.monotonic() + 5
+            while client._ledger is not None and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert client._ledger is None, "the retirement never dropped the session"
+        real_save(record)
+
+    client._checkpoint.save = save
+    return started
+
+
+def test_a_report_saved_across_a_retirement_never_brings_the_session_back(
+    tmp_path: Path,
+) -> None:
+    """A Drain on the old attachment (any report that saves: Meter, Receipt,
+    CloseResult, a close proof) is being saved while the retirement drops the
+    session. That record was built before the drop, and installing it as the
+    saved state brought the retired ledger and confirmed close back into the
+    retirement's own drop-save: after a restart the next session, which its
+    provider then closed capturing above validated usage, was taken for the
+    agent's own close. Now no save writes the session back, and the next
+    session is a close by someone else: a request gets SESSION_CLOSED,
+    sessions.open the CloseAccountingError, and close() sends its own
+    CloseRequest."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "cooperative")
+        drain = pb.ControlMessage(
+            drain=pb.Drain(session_id=identifier, reason=pb.DRAIN_REASON_PROVIDER_INITIATED)
+        )
+        started = hold_a_report_save_across_the_drop(
+            client, asyncio.get_running_loop(), lambda: client._control_report("drain", drain)
+        )
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert started and started[0].result(5) is None  # The report was saved.
+        saved = json.loads(path.read_text())
+        assert "ledger" not in saved and "confirmed_close" not in saved
+        # The next session's first save, as _open makes it.
+        client._ledger = Ledger(DOMAIN, replace(DESCRIPTOR, salt=b"z" * 32), CATALOG)
+        client._opening_ref = "open-y"
+        client._saved["funding_intent"] = {"model": "test/model"}
+        await client._persist()
+        client._checkpoint.close()
+        # After a restart; the provider has since closed it, capturing 5.
+        restarted = restored_client(path, settled=5)
+        new_id = restarted._ledger.session_id
+        assert new_id != identifier
+        assert restarted._closed_result is None and "confirmed_close" not in restarted._saved
+        with pytest.raises(PaymentError) as refused:
+            await restarted._open("test/model", None)
+        assert refused.value.failure.reason == "SESSION_CLOSED"
+        with pytest.raises(CloseAccountingError) as excess:
+            await explicitly_open(restarted)
+        assert (excess.value.capture_amount, excess.value.usage_amount) == (5, 0)
+        restarted.timeout, restarted._loop = 0.05, asyncio.get_running_loop()
+        restarted._ensure_close_attachment, restarted._send = AsyncMock(), AsyncMock()
+        result = await restarted._cooperative_close(new_id)
+        assert result.state is OperationState.UNKNOWN  # Its own request, unanswered.
+        ((message,), _) = restarted._send.await_args
+        assert message.close_request.session_id == new_id
+        restarted._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_report_saved_while_a_retirement_records_its_proof_keeps_that_proof(
+    tmp_path: Path,
+) -> None:
+    """A Drain's save is under way when sessions.open records the foreign
+    proof it retires on. Installing the Drain's record, built before that,
+    as the saved state lost closed_by_other, so the archived record did not
+    say how the session was retired."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "none")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        real_save = client._checkpoint.save
+        held = threading.Event()
+        drain = pb.ControlMessage(
+            drain=pb.Drain(session_id=identifier, reason=pb.DRAIN_REASON_PROVIDER_INITIATED)
+        )
+
+        def save(record: dict) -> None:
+            if not held.is_set():  # The Drain's: held until the proof is recorded.
+                held.set()
+                deadline = time.monotonic() + 5
+                while "closed_by_other" not in client._saved and time.monotonic() < deadline:
+                    time.sleep(0.001)
+            real_save(record)
+
+        client._checkpoint.save = save
+        reporting = asyncio.create_task(client._control_report("drain", drain))
+        await asyncio.sleep(0)  # The Drain holds the checkpoint lock, saving.
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        await reporting
+        archived = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert archived["closed_by_other"] == foreign_proof(0, [])
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_record_with_no_session_retained_names_none_of_its_keys(tmp_path: Path) -> None:
+    """The session's keys come from live state: with no ledger retained, a
+    save writes no ledger, funding intent, close record or foreign proof,
+    whatever the saved state still held."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "cooperative")
+        client._saved = {
+            **client._saved,
+            "funding_intent": {"model": "test/model"},
+            "reported_close": {"tx": (b"c" * 32).hex(), "capture": 0, "refunded": 100},
+            "closed_by_other": foreign_proof(0, []),
+        }
+        assert "ledger" in client._saved and "confirmed_close" in client._saved
+        client._ledger, client._opening_ref, client._operations = None, None, {}
+        await client._persist()
+        saved = json.loads(path.read_text())
+        for key in ("ledger", "funding_intent", "confirmed_close", "reported_close"):
+            assert key not in saved
+        assert "closed_by_other" not in saved and saved["scope"] == client._saved["scope"]
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_retried_retirement_replaces_an_archive_that_carries_less_evidence(
+    tmp_path: Path,
+) -> None:
+    """The first retirement of an untraceable withdrawal goes on the foreign
+    proof, archives its record and fails its drop-save. The wallet then holds
+    the withdrawal's hash, it is proven, and the retry retires the session as
+    the agent's own close. Its record carries all the first one did and more,
+    so it replaces the archive: the history says how the session was retired
+    and holds the withdrawal's hash, which the wallet's retire now forgets."""
+
+    async def scenario() -> None:
+        client, identifier, path, ref = untraceable_exit_client(tmp_path)
+        await client._persist()
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        save, failing = client._checkpoint.save, [True]
+
+        def save_once_failing(record: dict) -> None:
+            if "ledger" not in record and failing:  # The save that drops the session.
+                failing.clear()
+                raise ValidationError(
+                    ValidationCode.INVALID_VALUE, "checkpoint could not be durably written"
+                )
+            save(record)
+
+        client._checkpoint.save = save_once_failing
+        with pytest.raises(ValidationError, match="durably written"):
+            await explicitly_open(client)
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        assert "closed_by_other" in json.loads(history.read_text())
+        tx = b"e" * 32
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+        client.wallet.reconcile = Mock(
+            return_value=OperationResult(ref, OperationState.UNKNOWN, "w-1", tx)
+        )
+        client.chain.reader.reconcile = Mock(
+            return_value=OperationResult(ref, OperationState.CONFIRMED, "w-1", tx, observation)
+        )
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        archived = json.loads(history.read_text())
+        assert "closed_by_other" not in archived
+        (exit_record,) = [item for item in archived["operations"] if item["ref"] == ref]
+        assert (exit_record["state"], exit_record["tx"]) == ("confirmed", tx.hex())
+        assert forgotten == [{"open-x", ref}]
+        assert sorted(item.name for item in tmp_path.iterdir() if item.name.startswith(".")) == []
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["first_save", "link"])
+def test_a_retry_that_retires_on_the_agent_s_own_close_drops_an_earlier_foreign_proof(
+    monkeypatch, tmp_path: Path, failure: str
+) -> None:
+    """The first retirement of an untraceable withdrawal decided on the foreign
+    proof and recorded closed_by_other, then failed at its first save or at
+    linking the archive, before anything was archived or dropped. The wallet
+    then holds the withdrawal's hash, and the retry retires the session as the
+    agent's own close: its archived record names no foreign proof, since the
+    retry clears an earlier attempt's before recording its own."""
+
+    async def scenario() -> None:
+        client, identifier, path, ref = untraceable_exit_client(tmp_path)
+        await client._persist()
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        client.wallet.retire = Mock()
+        if failure == "first_save":
+            save, failing = client._checkpoint.save, [True]
+
+            def save_once_failing(record: dict) -> None:
+                if "closed_by_other" in record and failing:
+                    failing.clear()
+                    raise ValidationError(
+                        ValidationCode.INVALID_VALUE, "checkpoint could not be durably written"
+                    )
+                save(record)
+
+            client._checkpoint.save = save_once_failing
+            expected = (ValidationError, "durably written")
+        else:
+            link, failing = os.link, [True]
+
+            def link_once_failing(source, target) -> None:
+                if failing:
+                    failing.clear()
+                    raise OSError("no space left on device")
+                link(source, target)
+
+            monkeypatch.setattr(os, "link", link_once_failing)
+            expected = (ClientError, "could not be kept")
+        with pytest.raises(expected[0], match=expected[1]):
+            await explicitly_open(client)
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        assert not history.exists() and client._ledger is not None
+        assert "closed_by_other" in client._saved  # The first attempt's, in memory.
+        tx = b"e" * 32
+        observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 10, b"b" * 32)
+        client.wallet.reconcile = Mock(
+            return_value=OperationResult(ref, OperationState.UNKNOWN, "w-1", tx)
+        )
+        client.chain.reader.reconcile = Mock(
+            return_value=OperationResult(ref, OperationState.CONFIRMED, "w-1", tx, observation)
+        )
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        archived = json.loads(history.read_text())
+        assert "closed_by_other" not in archived
+        (exit_record,) = [item for item in archived["operations"] if item["ref"] == ref]
+        assert (exit_record["state"], exit_record["tx"]) == ("confirmed", tx.hex())
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_retried_retirement_never_replaces_an_archive_with_less_evidence(
+    tmp_path: Path,
+) -> None:
+    """An archive an earlier attempt left holds an operation the record this
+    retirement keeps does not. It stays as it was, and the retirement goes
+    on: a record carrying less never replaces one carrying more."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        earlier = json.loads(path.read_text())
+        earlier["operations"].append(
+            {**earlier["operations"][0], "ref": "top-up-z", "tx": "7a" * 32, "state": "failed"}
+        )
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        history.write_text(json.dumps(earlier))
+        history.chmod(0o600)
+        before = history.read_bytes()
+        with pytest.raises(_FreshOpening):
+            await client._open("test/model", None)
+        assert history.read_bytes() == before
+        assert client._ledger is None and "ledger" not in json.loads(path.read_text())
+        assert sorted(item.name for item in tmp_path.iterdir() if item.name.startswith(".")) == []
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def evidence_record(**changes) -> dict:
+    """A closed session's record, as an archive holds it, with ``changes``."""
+    record = {
+        "operations": [
+            {
+                "ref": "open-x",
+                "kind": "open",
+                "wallet_id": None,
+                "tx": "6f" * 32,
+                "state": "confirmed",
+                "observation": [5042002, "70" * 20, 10, "62" * 32],
+            },
+            {
+                "ref": "withdraw-x",
+                "kind": "withdraw",
+                "wallet_id": "w-1",
+                "tx": None,
+                "state": "unknown",
+                "observation": None,
+            },
+        ],
+        "reported_close": {"tx": "63" * 32, "capture": 0, "refunded": 100},
+        "closed_by_other": {"superseded": ["reported_close", "withdraw-x"]},
+    }
+    for key, value in changes.items():
+        if value is None:
+            record.pop(key)
+        else:
+            record[key] = value
+    return record
+
+
+def withdrawal(**changes) -> list[dict]:
+    """evidence_record's operations, its withdrawal changed by ``changes``."""
+    operations = evidence_record()["operations"]
+    operations[1] = {**operations[1], **changes}
+    return operations
+
+
+@pytest.mark.parametrize(
+    ("new", "kept"),
+    [
+        ({}, True),
+        ({"operations": withdrawal(tx="65" * 32, state="confirmed")}, True),
+        ({"operations": withdrawal(state="failed")}, True),
+        ({"operations": evidence_record()["operations"][:1]}, False),
+        ({"operations": withdrawal(wallet_id=None)}, False),
+        ({"operations": withdrawal(wallet_id="w-2")}, False),
+        ({"reported_close": None}, False),
+        ({"reported_close": None, "confirmed_close": {"tx": "63" * 32}}, True),
+        ({"reported_close": None, "confirmed_close": {"tx": "64" * 32}}, False),
+        ({"closed_by_other": None}, False),
+        ({"closed_by_other": None, "confirmed_close": {"tx": "63" * 32}}, True),
+        (
+            {
+                "closed_by_other": None,
+                "operations": withdrawal(tx="65" * 32, state="confirmed"),
+            },
+            True,
+        ),
+    ],
+    ids=[
+        "the_same",
+        "exit_proven",
+        "exit_failed",
+        "an_operation_lost",
+        "a_wallet_id_lost",
+        "a_wallet_id_changed",
+        "the_report_lost",
+        "the_report_confirmed",
+        "another_close_confirmed",
+        "the_foreign_proof_lost",
+        "a_confirmed_close_instead",
+        "an_own_exit_instead",
+    ],
+)
+def test_a_record_carries_another_s_evidence_only_when_it_keeps_each_part(new, kept) -> None:
+    """At least the old record's evidence: every operation it holds, with
+    its wallet operation id, hash and receipt block where it had one and its
+    state where final; its confirmed close; its reported close, or that
+    close confirmed; and its foreign proof, or a proof of the agent's own
+    close in its place."""
+    old = evidence_record()
+    assert client_module._evidence_kept(evidence_record(**new), old) is kept
+    final = evidence_record(operations=withdrawal(tx="65" * 32, state="confirmed"))
+    assert not client_module._evidence_kept(
+        evidence_record(operations=withdrawal(tx="65" * 32, state="failed")), final
+    )
+
+
+def test_a_wallet_retire_that_does_not_return_in_time_is_reported_and_the_opening_goes_on(
+    tmp_path: Path,
+) -> None:
+    """A third-party wallet's retire must not hold the open, funding and
+    operation locks: past the client's timeout it is reported as an on_error
+    HookError("retire", "TimeoutError", session id), and the opening goes on."""
+
+    async def scenario() -> None:
+        client, identifier, _ = closed_client(tmp_path, "withdraw")
+        client.timeout = 0.05
+        release = threading.Event()
+        client.wallet.retire = lambda *, operation_refs, at: release.wait(2.5)
+        client._observers = Mock()
+        started = time.monotonic()
+        try:
+            with pytest.raises(_FreshOpening):
+                await client._open("test/model", None)
+            assert time.monotonic() - started < 2
+        finally:
+            release.set()
+        errors = [
+            item.args[1]
+            for item in client._observers.emit.call_args_list
+            if item.args[0] == "on_error"
+        ]
+        assert errors == [HookError("retire", "TimeoutError", identifier)]
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["request", "sessions_open"])
+@pytest.mark.parametrize("kind", ["excess", "active", "no_tokens", "no_agent_id"])
+def test_a_close_not_yet_final_or_not_within_usage_keeps_its_session(
+    tmp_path: Path, kind: str, explicit: bool
+) -> None:
+    """The agent closed it itself, so an explicit open keeps the same rule
+    though the chain shows the session Closed (closed_client). A reported
+    close not yet proven is decided at open, by its proof
+    (test_a_reported_close_proven_at_open_decides_whose_close_it_was)."""
+
     async def scenario() -> None:
         client, identifier, path = closed_client(
             tmp_path, "cooperative" if kind in ("active", "no_tokens", "no_agent_id") else kind
@@ -882,15 +1503,13 @@ def test_a_close_not_yet_final_or_not_within_usage_keeps_its_session(
         elif kind == "no_agent_id":
             client.agent_id = None
         expected = {
-            "reported": (ClientError, "session close is pending"),
-            "requestClose": (ClientError, "session close is pending"),
             "excess": (CloseAccountingError, None),
             "active": (ClientError, "still ending"),
             "no_tokens": (ClientError, "initial_session_tokens is required"),
             "no_agent_id": (FundingAuthorizationError, "AGENT_ID_REQUIRED"),
         }[kind]
         with pytest.raises(expected[0], match=expected[1]):
-            await client._open("test/model", None)
+            await (explicitly_open(client) if explicit else client._open("test/model", None))
         assert path.read_bytes() == before
         assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
         assert client._ledger is not None and client._ledger.session_id == identifier
@@ -986,7 +1605,8 @@ def test_a_reconcile_that_started_during_a_retirement_never_resurrects_its_opera
     tmp_path: Path,
 ) -> None:
     """The reconcile arrives while retirement refreshes stale evidence, after it
-    took the operation locks, so no lock of its own existed to wait on."""
+    took the operation locks, before any lock of its own existed: it waits for
+    the retirement to end (_operation_lock), then finds its operation gone."""
 
     async def scenario() -> None:
         client, identifier, path = closed_client(tmp_path, "withdraw")
@@ -1026,6 +1646,229 @@ def test_a_reconcile_that_started_during_a_retirement_never_resurrects_its_opera
     asyncio.run(scenario())
 
 
+def retirement_at_its_barrier(client: Client) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold a retirement between taking its locks and committing: its proof
+    of the agent's own exit refreshes stale evidence and waits there."""
+    reading, release = asyncio.Event(), asyncio.Event()
+    current = client.chain.current
+
+    def stale():
+        if not release.is_set():
+            raise ChainEvidenceError("chain observation is unavailable or stale")
+        return current
+
+    async def refresh():
+        reading.set()
+        await release.wait()
+        return current
+
+    client.chain.snapshot = stale
+    client.chain.refresh = AsyncMock(side_effect=refresh)
+    return reading, release
+
+
+async def settle_tasks() -> None:
+    """Let every ready task run until it waits on something; no clock time."""
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("operation", ["reconcile", "top_up"])
+def test_an_operation_that_starts_during_a_retirement_waits_and_then_finds_it_retired(
+    tmp_path: Path, operation: str
+) -> None:
+    """A reconcile or top-up that starts once a retirement holds its locks,
+    even of an operation whose lock did not exist yet, waits for the
+    retirement to end, then finds the session retired and writes nothing."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        previous = client._operations["open-x"][1]
+        client.chain.reader.reconcile = Mock(return_value=previous)
+        reading, release = retirement_at_its_barrier(client)
+        retiring = asyncio.create_task(client._open("test/model", None))
+        await reading.wait()
+        assert "open-x" not in client._operation_locks
+        waiting = asyncio.create_task(
+            client._reconcile_ref("open-x")
+            if operation == "reconcile"
+            else client._top_up(identifier, 10)
+        )
+        await settle_tasks()
+        # It waits before its lock exists, so the retirement's commit sees none.
+        assert not waiting.done() and "open-x" not in client._operation_locks
+        release.set()
+        with pytest.raises(_FreshOpening):
+            await retiring
+        expected = (
+            "unknown retained operation reference" if operation == "reconcile" else "not retained"
+        )
+        with pytest.raises(ClientError, match=expected):
+            await waiting
+        client.chain.reader.reconcile.assert_not_called()
+        assert client._ledger is None and client._operations == {}
+        saved = json.loads(path.read_text())
+        assert saved["operations"] == [] and "funding_intent" not in saved
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("call", ["close", "reconcile"])
+def test_a_close_proof_that_starts_during_a_retirement_waits_and_then_finds_it_retired(
+    tmp_path: Path, call: str
+) -> None:
+    """sessions.open found the provider's reported close unprovable and is
+    retiring the session on the foreign proof. A close() or
+    reconcile("close-...") that starts meanwhile proves that close only under
+    the close's operation lock, so it waits for the retirement, then finds
+    the session retired. Before, it proved the close inside the retirement,
+    whose archive then held both the agent's confirmed close and
+    closed_by_other superseding a report it no longer held."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "reported")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        observation = client.chain.current.block.observation
+        reads = iter(["unreadable", "proven"])
+
+        def closing(*_):
+            if next(reads) == "unreadable":
+                raise ChainEvidenceError("successful canonical receipt required")
+            return ClosingEvidence(observation, 0, 100, b"c" * 32)
+
+        client.chain.reader.closing = Mock(side_effect=closing)
+        reading, release = retirement_at_its_barrier(client)
+        retiring = asyncio.create_task(explicitly_open(client))
+        await reading.wait()  # Decided on the foreign proof, reading it.
+        waiting = asyncio.create_task(
+            client._cooperative_close(identifier)
+            if call == "close"
+            else client._reconcile_ref("close-" + identifier.hex())
+        )
+        await settle_tasks()
+        assert not waiting.done()
+        assert client.chain.reader.closing.call_count == 1  # The retirement's alone.
+        release.set()
+        with pytest.raises(_FreshOpening):
+            await retiring
+        with pytest.raises(ClientError, match="not retained"):
+            await waiting
+        archived = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert "confirmed_close" not in archived and "reported_close" in archived
+        assert archived["closed_by_other"]["superseded"] == ["reported_close"]
+        assert client._closed_result is None and "confirmed_close" not in client._saved
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle", "requestClose"])
+def test_an_exit_waiting_for_the_open_lock_finds_its_session_retired(
+    tmp_path: Path, kind: str
+) -> None:
+    """An exit call passed its retained-session check, then waited for the
+    open lock while sessions.open retired the session. Under the lock it
+    checks again, as a top-up does: "session is not retained in this
+    checkpoint". Before, it went on with the retired ledger and, once the
+    follower no longer read the session, failed with a raw KeyError."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "cooperative")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        await client._open_lock.acquire()  # sessions.open, about to retire it.
+        exiting = asyncio.create_task(client._exit(identifier, OperationKind(kind)))
+        await settle_tasks()
+        assert not exiting.done()
+        await client._retire_closed(None, explicit=True)
+        client.chain.current.sessions.pop(identifier)  # A refresh no longer reads it.
+        client._open_lock.release()
+        with pytest.raises(ClientError, match="session is not retained in this checkpoint"):
+            await exiting
+        assert client._operations == {}
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_close_waiting_for_the_open_lock_never_attaches_the_next_session(
+    tmp_path: Path,
+) -> None:
+    """A close() passed its retained-session check, then waited for the open
+    lock while sessions.open retired the session and began the next one.
+    Under the lock it checks again before any close attachment: "session is
+    not retained in this checkpoint". Before, it began attaching the next
+    session instead: it started the provider connection and reconciled that
+    session's opening before it refused the old identifier."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect, client._start = AsyncMock(), AsyncMock()  # Not _local_start's.
+        await client._open_lock.acquire()  # sessions.open, about to retire it.
+        closing = asyncio.create_task(client._cooperative_close(identifier))
+        await settle_tasks()
+        assert not closing.done()
+        await client._retire_closed(None, explicit=True)
+        client._ledger = Ledger(DOMAIN, replace(DESCRIPTOR, salt=b"z" * 32), CATALOG)
+        client._opening_ref = "open-next"
+        pending = OperationResult("open-next", OperationState.PENDING)
+        client._operations["open-next"] = (None, pending)
+        client._reconcile_ref = AsyncMock(return_value=pending)
+        client._open_lock.release()
+        with pytest.raises(ClientError, match="session is not retained in this checkpoint"):
+            await closing
+        client._start.assert_not_awaited()
+        client._reconcile_ref.assert_not_awaited()
+        assert not client._ledger.close_pending and client._close_waiter is None
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_operation_waiting_on_a_retirement_whose_save_fails_goes_on_against_the_session(
+    tmp_path: Path,
+) -> None:
+    """The retirement's save that drops the session fails: memory is restored
+    and the guard ends with it, so the waiting reconcile then runs against
+    the restored session and records its result."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        previous = client._operations["open-x"][1]
+        client.chain.reader.reconcile = Mock(return_value=previous)
+        save, failing = client._checkpoint.save, [True]
+
+        def save_once_failing(record: dict) -> None:
+            if "ledger" not in record and failing:  # The save that drops the session.
+                failing.clear()
+                raise ValidationError(
+                    ValidationCode.INVALID_VALUE, "checkpoint could not be durably written"
+                )
+            save(record)
+
+        client._checkpoint.save = save_once_failing
+        reading, release = retirement_at_its_barrier(client)
+        retiring = asyncio.create_task(client._open("test/model", None))
+        await reading.wait()
+        waiting = asyncio.create_task(client._reconcile_ref("open-x"))
+        await settle_tasks()
+        assert not waiting.done() and "open-x" not in client._operation_locks
+        release.set()
+        with pytest.raises(ValidationError, match="durably written"):
+            await retiring
+        assert await waiting == previous
+        client.chain.reader.reconcile.assert_called_once()
+        assert client._retiring is None
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        saved = json.loads(path.read_text())
+        assert "ledger" in saved and "open-x" in {item["ref"] for item in saved["operations"]}
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_recovery_waiting_while_its_session_retired_leaves_the_next_attachment(
     tmp_path: Path,
 ) -> None:
@@ -1036,7 +1879,7 @@ def test_a_recovery_waiting_while_its_session_retired_leaves_the_next_attachment
         await client._open_lock.acquire()
         recovering = asyncio.create_task(client._recover(identifier))
         await asyncio.sleep(0)
-        await client._retire_closed(None)
+        await client._retire_closed(None, explicit=False)
         client._open_lock.release()
         with pytest.raises(ClientError, match="not retained"):
             await recovering
@@ -1052,11 +1895,1052 @@ def test_closing_a_stream_after_its_session_retired_only_ends_the_stream(
 ) -> None:
     async def scenario() -> None:
         client, _, _ = closed_client(tmp_path, "cooperative")
-        await client._retire_closed(None)
+        await client._retire_closed(None, explicit=False)
         output = _Output(ByteQueue())
         await client._cancel_run(b"r" * 32, output)
         with pytest.raises(ClientError, match="caller cancelled inference"):
             await output.queue.get_or_end()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_session_closed_by_someone_else_is_refused_without_reattaching(tmp_path: Path) -> None:
+    """A provider-initiated close or a third party's idle release: the session
+    is not this agent's to retire, and it never reopens on chain."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "none")
+        client._ledger.close_pending = False
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        before = path.read_bytes()
+        for _ in range(2):  # Every request sees the same refusal; nothing is resent.
+            with pytest.raises(PaymentError) as failure:
+                await client._open("test/model", None)
+            assert failure.value.failure.reason == "SESSION_CLOSED"
+            assert failure.value.failure.session_id == identifier
+        # A request opens lazily, and only an explicit open retires the session.
+        with pytest.raises(PaymentError) as failure:
+            await client._create("test/model", False, b'{"model":"test/model"}')
+        assert failure.value.failure.reason == "SESSION_CLOSED"
+        client._connect.assert_not_awaited()
+        assert path.read_bytes() == before
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["none", "requestClose"], ids=["provider_pending", "own_request"])
+def test_a_close_pending_that_someone_else_made_is_a_close_by_someone_else(
+    tmp_path: Path, kind: str
+) -> None:
+    """close_pending as the provider's snapshot reported it, or as the agent's
+    own requestClose set it (which only opens the close window), and then the
+    session Closed with no close of the agent's own to explain it: a request
+    gets the terminal SESSION_CLOSED, and sessions.open retires the session and
+    funds a new one."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind)
+        assert client._ledger.close_pending
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        before = path.read_bytes()
+        with pytest.raises(PaymentError) as failure:
+            await client._open("test/model", None)
+        assert failure.value.failure.reason == "SESSION_CLOSED"
+        assert failure.value.failure.session_id == identifier
+        with pytest.raises(PaymentError) as failure:
+            await client._create("test/model", False, b'{"model":"test/model"}')
+        assert failure.value.failure.reason == "SESSION_CLOSED"
+        client._connect.assert_not_awaited()
+        assert path.read_bytes() == before
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        assert client._ledger is None and client._operations == {}
+        assert (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert forgotten == [references]
+        client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("waiter", ["awaited", "failed"])
+def test_a_close_request_explains_a_closed_session_only_while_its_result_is_awaited(
+    tmp_path: Path, waiter: str
+) -> None:
+    """The chain shows the session Closed after the agent's cooperative close
+    request. While its result is awaited, that is the agent's own close in
+    flight, for a request and an explicit open alike. Once Control was lost,
+    which fails the waiter and keeps it (_end_control), nothing of the
+    agent's own explains the close: a request gets the terminal
+    SESSION_CLOSED, and sessions.open retires the session and funds another."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "none")
+        assert client._ledger.close_pending
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        client._close_waiter = asyncio.get_running_loop().create_future()
+        if waiter == "failed":
+            failed = client._close_waiter
+            client._end_control(ClientError("Control stream ended"))
+            assert client._close_waiter is failed
+            assert isinstance(failed.exception(), ClientError)
+        before = path.read_bytes()
+        if waiter == "awaited":
+            for opening in (client._open("test/model", None), explicitly_open(client)):
+                with pytest.raises(ClientError, match="session close is pending"):
+                    await opening
+            assert client._ledger is not None and path.read_bytes() == before
+            client._challenge.assert_not_awaited()
+        else:
+            with pytest.raises(PaymentError) as failure:
+                await client._open("test/model", None)
+            assert failure.value.failure.reason == "SESSION_CLOSED"
+            assert path.read_bytes() == before
+            client._connect.assert_not_awaited()
+            with pytest.raises(_FreshOpening):
+                await explicitly_open(client)
+            assert client._ledger is None and client._close_waiter is None
+            assert (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+            client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle"])
+def test_an_own_exit_that_failed_explains_no_closed_session(
+    tmp_path: Path, kind: str, caller: str
+) -> None:
+    """The agent's own withdraw or releaseIdle FAILED, and the chain shows the
+    session Closed: that exit took no effect, so nothing of the agent's own
+    explains the close. A request gets the terminal SESSION_CLOSED with no
+    chain read or reconnect; sessions.open retires the session on the foreign
+    proof, with nothing left unresolved."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind)
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        ref = kind + "-" + identifier.hex()
+        client._operations[ref] = (
+            client._operations[ref][0],
+            OperationResult(ref, OperationState.FAILED, tx_hash=b"e" * 32),
+        )
+        await client._persist()
+        before = path.read_bytes()
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        if caller == "request":
+            with pytest.raises(PaymentError) as failure:
+                await client._open("test/model", None)
+            assert failure.value.failure.reason == "SESSION_CLOSED"
+            assert path.read_bytes() == before and not history.exists()
+            client.chain.refresh.assert_not_awaited()
+            client._connect.assert_not_awaited()
+            client._challenge.assert_not_awaited()
+        else:
+            with pytest.raises(_FreshOpening):
+                await explicitly_open(client)
+            assert json.loads(history.read_text())["closed_by_other"] == foreign_proof(0, [])
+            assert client._ledger is None
+            client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["reconcile_failed", "refresh_closed"])
+def test_a_request_waiting_on_a_reconcile_never_retires_a_session_someone_else_closed(
+    tmp_path: Path, change: str
+) -> None:
+    """A request takes the own-close path, then waits for the operation lock a
+    reconcile of the agent's own withdrawal holds. Meanwhile the close turns
+    out to be someone else's: the withdrawal reconciles FAILED (it reverted,
+    as the provider closed first), or, after a withdrawal that had failed, a
+    refresh first shows the session Closed. Decided again under the locks,
+    the request is refused SESSION_CLOSED and nothing changes; only
+    sessions.open retires the session."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        ref = "withdraw-" + identifier.hex()
+        operation = client._operations[ref][0]
+        closed = client.chain.current.sessions[identifier]
+        failed = OperationResult(ref, OperationState.FAILED, tx_hash=b"e" * 32)
+        if change == "reconcile_failed":
+            uncertain = OperationResult(ref, OperationState.UNKNOWN, tx_hash=b"e" * 32)
+            client._operations[ref] = (operation, uncertain)
+        else:
+            client._operations[ref] = (operation, failed)
+            client.chain.current.sessions[identifier] = replace(
+                closed, status=SessionStatus.CLOSING
+            )
+        await client._persist()
+        assert client._ledger.close_pending and not client._closed_by_other()
+        references = set(client._operations)
+        retired: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: retired.append(set(operation_refs))
+        lock = client._operation_locks.setdefault(ref, asyncio.Lock())
+        await lock.acquire()  # A reconcile of the withdrawal, in flight.
+
+        async def reconcile() -> None:
+            await asyncio.sleep(0.05)
+            if change == "reconcile_failed":
+                client._operations[ref] = (operation, failed)
+                await client._persist()
+            else:
+                client.chain.current.sessions[identifier] = closed  # A refresh shows it.
+            lock.release()
+
+        reconciling = asyncio.create_task(reconcile())
+        with pytest.raises(PaymentError) as failure:
+            await client._open("test/model", None)  # As a request's lazy create.
+        await reconciling
+        assert failure.value.failure.code is PaymentCode.SESSION_NOT_READY
+        assert failure.value.failure.reason == "SESSION_CLOSED"
+        assert failure.value.failure.session_id == identifier
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        saved = json.loads(path.read_text())
+        assert "ledger" in saved and len(saved["operations"]) == 2
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert retired == []
+        client.chain.unwatch_session.assert_not_called()
+        client._connect.assert_not_awaited()
+        client._challenge.assert_not_awaited()
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        assert retired == [references]
+        client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh", "stale"])
+def test_an_explicit_open_retires_a_session_closed_by_someone_else_and_funds_another(
+    tmp_path: Path, stale: bool
+) -> None:
+    """Its provider's close or anyone's releaseIdle, with no close of the
+    agent's own begun: sessions.open retires it as after the agent's own close
+    and funds a new session with the same signer. Its settled total, here within usage, is the Closed state's in
+    fresh evidence, which a stale follower refreshes first."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "none")
+        client._ledger.close_pending = False
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        before = json.loads(path.read_text())
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        if stale:
+            current = client.chain.current
+
+            def snapshot():
+                if not client.chain.refresh.await_count:
+                    raise ChainEvidenceError("chain observation is unavailable or stale")
+                return current
+
+            client.chain.snapshot = snapshot
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        assert client.chain.refresh.await_count == (1 if stale else 0)
+        # Its last record stays readable beside the checkpoint.
+        history = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert history["ledger"]["descriptor"] == before["ledger"]["descriptor"]
+        assert history["operations"] == before["operations"]
+        after = json.loads(path.read_text())
+        assert "ledger" not in after and "funding_intent" not in after
+        assert after["operations"] == [] and after["opening_ref"] is None
+        assert after["scope"] == before["scope"]
+        assert client._ledger is None and client._operations == {}
+        client.chain.unwatch_session.assert_called_once_with(identifier)
+        assert forgotten == [references]
+        client._connect.assert_awaited()
+        client._challenge.assert_awaited_once_with("test/model")
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["excess", "active", "no_tokens", "no_agent_id"])
+def test_an_explicit_open_keeps_a_session_closed_by_someone_else_it_cannot_retire(
+    tmp_path: Path, kind: str
+) -> None:
+    """Settled above validated usage, as the existing accounting rule refuses
+    for the agent's own close; a request on it still ending; or no new session
+    that could be funded: nothing is dropped, archived or retired."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(
+            tmp_path, "none", settled=1 if kind == "excess" else 0
+        )
+        client._ledger.close_pending = False
+        client._connect = AsyncMock()
+        client.wallet.retire = Mock()
+        if kind == "active":
+            output = SimpleNamespace(task=asyncio.get_running_loop().create_future())
+            client._outputs[b"q" * 32] = output
+        elif kind == "no_tokens":
+            client.initial_session_tokens = None
+        elif kind == "no_agent_id":
+            client.agent_id = None
+        before = path.read_bytes()
+        expected = {
+            "excess": (CloseAccountingError, None),
+            "active": (ClientError, "still ending"),
+            "no_tokens": (ClientError, "initial_session_tokens is required"),
+            "no_agent_id": (FundingAuthorizationError, "AGENT_ID_REQUIRED"),
+        }[kind]
+        with pytest.raises(expected[0], match=expected[1]) as failure:
+            await explicitly_open(client)
+        if kind == "excess":
+            # No operation of the agent's closed it: there is no transaction to keep.
+            assert failure.value.operation is None
+            assert (failure.value.capture_amount, failure.value.usage_amount) == (1, 0)
+        assert path.read_bytes() == before
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        client.chain.unwatch_session.assert_not_called()
+        client.wallet.retire.assert_not_called()
+        client._connect.assert_not_awaited()
+        client._challenge.assert_not_awaited()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def foreign_proof(settled: int, superseded: list[str]) -> dict[str, object]:
+    """The record a retirement on the foreign proof archives (closed_client's
+    fresh evidence: block 10, no validated usage)."""
+    return {
+        "block": 10,
+        "block_hash": (b"b" * 32).hex(),
+        "settled": settled,
+        "usage": 0,
+        "superseded": superseded,
+    }
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+@pytest.mark.parametrize("proof", ["unavailable", "differs", "proven"])
+def test_a_reported_close_proven_at_open_decides_whose_close_it_was(
+    tmp_path: Path, proof: str, caller: str
+) -> None:
+    """The provider reported a close, and the chain shows the session Closed.
+    Opening proves the report. Proven, it is the agent's own close, which a
+    request or sessions.open retires. When its transaction is not that
+    session's SessionClosed (the proof stays PENDING) or its amounts differ,
+    the agent cannot show a close of its own: a request gets the terminal
+    SESSION_CLOSED, and sessions.open retires the session on the Closed
+    state's settled total, its archived record naming the unresolved report."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "reported")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        tx, observation = b"c" * 32, client.chain.current.block.observation
+        if proof == "unavailable":
+            closing = Mock(side_effect=ChainEvidenceError("successful canonical receipt required"))
+        else:
+            capture = 0 if proof == "proven" else 1
+            closing = Mock(return_value=ClosingEvidence(observation, capture, 100 - capture, tx))
+        client.chain.reader.closing = closing
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        before = json.loads(path.read_text())
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        opening = (
+            explicitly_open(client)
+            if caller == "sessions_open"
+            else client._open("test/model", None)
+        )
+        if proof != "proven" and caller == "request":
+            with pytest.raises(PaymentError) as failure:
+                await opening
+            assert failure.value.failure.reason == "SESSION_CLOSED"
+            assert failure.value.failure.session_id == identifier
+            assert json.loads(path.read_text()) == before
+            assert not history.exists() and forgotten == []
+            client._connect.assert_not_awaited()
+            client._challenge.assert_not_awaited()
+        else:
+            with pytest.raises(_FreshOpening):
+                await opening
+            archived = json.loads(history.read_text())
+            if proof == "proven":
+                assert "closed_by_other" not in archived and "reported_close" not in archived
+                assert archived["confirmed_close"]["tx"] == tx.hex()
+            else:
+                assert archived["closed_by_other"] == foreign_proof(0, ["reported_close"])
+                assert archived["reported_close"] == before["reported_close"]
+            saved = json.loads(path.read_text())
+            for key in ("ledger", "reported_close", "confirmed_close", "closed_by_other"):
+                assert key not in saved
+            assert forgotten == [references]
+            client._challenge.assert_awaited_once_with("test/model")
+        closing.assert_called_once_with(tx, identifier)
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+@pytest.mark.parametrize("tx", ["none", "held"])
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle"])
+def test_an_own_exit_left_unknown_with_no_transaction_is_a_close_by_someone_else(
+    tmp_path: Path, kind: str, tx: str, caller: str
+) -> None:
+    """The agent's own withdraw or releaseIdle is UNKNOWN, and the chain shows
+    the session Closed. With no transaction hash, as after a crash between its
+    journal save and execute, nothing the agent holds proves the exit: a
+    request gets the terminal SESSION_CLOSED, and sessions.open retires the
+    session on the Closed state's settled total, its archived record naming
+    the unresolved exit, whose reference the wallet keeps (its record is
+    never handed to retire). Opening asks the wallet for that record first;
+    here it holds no hash either. With a hash a reconcile can prove it:
+    opening reads its receipt first, unreadable here, so it stays the agent's
+    own close in flight."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind)
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        ref = kind + "-" + identifier.hex()
+        held = b"e" * 32 if tx == "held" else None
+        client._operations[ref] = (
+            client._operations[ref][0],
+            OperationResult(ref, OperationState.UNKNOWN, tx_hash=held),
+        )
+        await client._persist()
+        before = json.loads(path.read_text())
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        client.chain.reader.reconcile = Mock(
+            side_effect=TransportError("HTTP request failed", transient=True)
+        )
+        client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        opening = (
+            explicitly_open(client)
+            if caller == "sessions_open"
+            else client._open("test/model", None)
+        )
+        if tx == "none":
+            client.wallet.reconcile.assert_not_called()
+        if tx == "held" or caller == "request":
+            if tx == "held":
+                with pytest.raises(ClientError, match="session close is pending"):
+                    await opening
+                client.chain.reader.reconcile.assert_called_once()
+                assert client.chain.reader.reconcile.call_args.kwargs["tx_hash"] == held
+            else:
+                with pytest.raises(PaymentError) as failure:
+                    await opening
+                assert failure.value.failure.reason == "SESSION_CLOSED"
+                client._connect.assert_not_awaited()
+            assert json.loads(path.read_text()) == before
+            assert not history.exists() and forgotten == []
+            assert client._ledger is not None and client._ledger.session_id == identifier
+            client._challenge.assert_not_awaited()
+        else:
+            with pytest.raises(_FreshOpening):
+                await opening
+            archived = json.loads(history.read_text())
+            assert archived["closed_by_other"] == foreign_proof(0, [ref])
+            (exit_record,) = [item for item in archived["operations"] if item["ref"] == ref]
+            assert (exit_record["state"], exit_record["tx"]) == ("unknown", None)
+            saved = json.loads(path.read_text())
+            assert "ledger" not in saved and "closed_by_other" not in saved
+            assert saved["operations"] == []
+            assert forgotten == [references - {ref}]
+            client._challenge.assert_awaited_once_with("test/model")
+        if tx == "none":
+            client.wallet.reconcile.assert_called_once_with(operation_ref=ref)
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+@pytest.mark.parametrize("answer", ["failed", "unknown", "pending"])
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle"])
+def test_an_own_exit_pending_with_no_hash_is_reconciled_before_its_close_is_decided(
+    tmp_path: Path, kind: str, answer: str, caller: str
+) -> None:
+    """After a restart (closed_client restores the journal an earlier process
+    saved), the agent's own exit is PENDING at its wallet with no hash yet and
+    the chain shows the session Closed. Opening reconciles the exit first,
+    under the retirement's locks, and the rule for what the wallet then
+    reports applies: FAILED is the failed-exit rule and UNKNOWN with no hash
+    the foreign rule, so a request gets SESSION_CLOSED and sessions.open
+    retires the session on the foreign proof; still PENDING keeps the
+    own-close rule, and the next open asks again."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind, exits=(OperationState.PENDING,))
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        ref = kind + "-" + identifier.hex()
+        assert client._operations[ref][1] == OperationResult(ref, OperationState.PENDING, "w-1")
+        client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+        state = {
+            "failed": OperationState.FAILED,
+            "unknown": OperationState.UNKNOWN,
+            "pending": OperationState.PENDING,
+        }[answer]
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, state, "w-1"))
+        client.wallet.retire = Mock()
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+
+        def opening():
+            return (
+                explicitly_open(client)
+                if caller == "sessions_open"
+                else client._open("test/model", None)
+            )
+
+        if answer == "pending":
+            for count in (1, 2):
+                with pytest.raises(ClientError, match="session close is pending"):
+                    await opening()
+                assert client.wallet.reconcile.call_count == count
+            assert client._operations[ref][1].state is OperationState.PENDING
+            assert not history.exists()
+        elif caller == "request":
+            with pytest.raises(PaymentError) as failure:
+                await opening()
+            assert failure.value.failure.reason == "SESSION_CLOSED"
+            assert client._operations[ref][1].state is state
+            saved = {item["ref"]: item for item in json.loads(path.read_text())["operations"]}
+            assert saved[ref]["state"] == state.value  # What the wallet reported is kept.
+            assert not history.exists()
+            client._connect.assert_not_awaited()
+        else:
+            with pytest.raises(_FreshOpening):
+                await opening()
+            superseded = [ref] if answer == "unknown" else []
+            assert json.loads(history.read_text())["closed_by_other"] == foreign_proof(
+                0, superseded
+            )
+            client.wallet.retire.assert_called_once()
+            client._challenge.assert_awaited_once_with("test/model")
+        client.wallet.reconcile.assert_called_with(operation_ref=ref)
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def exit_due(client: Client, kind: str) -> None:
+    """Fresh evidence in which a new attempt of this exit kind is eligible:
+    withdraw an hour into Closing, releaseIdle a day after the session's last
+    activity, requestClose while Open and before that deadline."""
+    status, requested_at, now = {
+        "withdraw": (SessionStatus.CLOSING, 100, 100 + 3600),
+        "releaseIdle": (SessionStatus.OPEN, 0, 100 + 86400),
+        "requestClose": (SessionStatus.OPEN, 0, 200),
+    }[kind]
+    state = ChainSession(100, 0, status, requested_at, 100, CATALOG.rate_card_hash)
+    client.chain.current = SimpleNamespace(
+        block=Block(
+            ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 20, b"t" * 32),
+            now,
+            b"c" * 32,
+        ),
+        sessions={client._ledger.session_id: state},
+        pause_level=PauseLevel.NONE,
+    )
+
+
+def attempts_land(client: Client, outcomes: dict[str, OperationState]) -> list[str]:
+    """The wallet sends each new attempt, and its receipt shows the outcome
+    named for its reference: CONFIRMED, or FAILED (mined and reverted).
+    Returns the references sent, in order."""
+    sent: list[str] = []
+    observation = ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 21, b"u" * 32)
+
+    def execute(call, *, operation_ref):
+        sent.append(operation_ref)
+        tx = hashlib.sha256(operation_ref.encode()).digest()
+        return OperationResult(operation_ref, OperationState.PENDING, "w-" + operation_ref, tx)
+
+    def reconcile(operation, *, operation_ref, tx_hash, wallet_operation_id):
+        state = outcomes[operation_ref]
+        proof = observation if state is OperationState.CONFIRMED else None
+        return OperationResult(operation_ref, state, wallet_operation_id, tx_hash, proof)
+
+    client.wallet.execute = execute
+    client.chain.reader.reconcile = Mock(side_effect=reconcile)
+    client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+    return sent
+
+
+def saved_states(path: Path) -> dict[str, str]:
+    return {item["ref"]: item["state"] for item in json.loads(path.read_text())["operations"]}
+
+
+@pytest.mark.parametrize("kind", ["withdraw", "releaseIdle", "requestClose"])
+def test_a_failed_exit_is_sent_again_under_its_next_reference(tmp_path: Path, kind: str) -> None:
+    """The agent's withdraw, releaseIdle or requestClose FAILED. Called again,
+    the exit is sent as a new attempt under the next reference, .1, and after
+    that one FAILED too, .2; a confirmed attempt is final, so a call after it
+    only reconciles it. Each failed attempt stays in the journal."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, kind, exits=(OperationState.FAILED,))
+        base = kind + "-" + identifier.hex()
+        exit_due(client, kind)
+        sent = attempts_land(
+            client, {base + ".1": OperationState.FAILED, base + ".2": OperationState.CONFIRMED}
+        )
+        expected = [
+            (base + ".1", OperationState.FAILED),
+            (base + ".2", OperationState.CONFIRMED),
+            (base + ".2", OperationState.CONFIRMED),
+        ]
+        for ref, state in expected:
+            result = await client._exit(identifier, OperationKind(kind))
+            assert (result.operation_ref, result.state) == (ref, state)
+        assert sent == [base + ".1", base + ".2"]
+        assert saved_states(path) == {
+            "open-x": "confirmed",
+            base: "failed",
+            base + ".1": "failed",
+            base + ".2": "confirmed",
+        }
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "latest", ["pending", "unknown_with_hash", "unknown_without_hash", "reconciled_failed"]
+)
+def test_an_exit_attempt_still_pending_or_unknown_admits_no_new_one(
+    tmp_path: Path, latest: str
+) -> None:
+    """After a withdrawal FAILED, its next attempt is PENDING or UNKNOWN, so
+    it could still land: a call reconciles it and returns what it shows, with
+    nothing new sent. An UNKNOWN one with no hash, which the wallet still
+    cannot place, is never retried blind. Only once the reconcile shows the
+    attempt FAILED is the one after it sent."""
+
+    async def scenario() -> None:
+        state = (
+            OperationState.PENDING
+            if "pending" in latest or "failed" in latest
+            else (OperationState.UNKNOWN)
+        )
+        client, identifier, path = closed_client(
+            tmp_path, "withdraw", exits=(OperationState.FAILED, state)
+        )
+        base = "withdraw-" + identifier.hex()
+        ref = base + ".1"
+        exit_due(client, "withdraw")
+        sent = attempts_land(client, {base + ".2": OperationState.CONFIRMED})
+        if latest == "unknown_with_hash":
+            client._operations[ref] = (
+                client._operations[ref][0],
+                OperationResult(ref, OperationState.UNKNOWN, "w-2", b"h" * 32),
+            )
+            client.chain.reader.reconcile = Mock(
+                side_effect=TransportError("HTTP request failed", transient=True)
+            )
+        answers = {
+            "pending": OperationResult(ref, OperationState.PENDING, "w-2"),
+            "unknown_with_hash": None,
+            "unknown_without_hash": OperationResult(ref, OperationState.UNKNOWN),
+            "reconciled_failed": OperationResult(ref, OperationState.FAILED, "w-2"),
+        }
+        client.wallet.reconcile = Mock(return_value=answers[latest])
+        result = await client._exit(identifier, OperationKind.WITHDRAW)
+        if latest == "reconciled_failed":
+            assert (result.operation_ref, result.state) == (base + ".2", OperationState.CONFIRMED)
+            assert sent == [base + ".2"]
+            assert saved_states(path)[ref] == "failed"
+        else:
+            assert (result.operation_ref, result.state) == (ref, state)
+            assert sent == []
+            assert base + ".2" not in client._operations
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+@pytest.mark.parametrize("latest", ["confirmed", "pending"])
+def test_the_latest_exit_attempt_decides_whose_close_it_was(
+    tmp_path: Path, latest: str, caller: str
+) -> None:
+    """A withdrawal FAILED and its next attempt is the one that counts, and
+    the chain shows the session Closed. Confirmed, it is the agent's own
+    exit: a request or sessions.open retires the session as after its own
+    close, and the archived record keeps both attempts. Still pending, it is
+    the agent's own exit in flight, which opening reconciles first."""
+
+    async def scenario() -> None:
+        state = OperationState.CONFIRMED if latest == "confirmed" else OperationState.PENDING
+        client, identifier, path = closed_client(
+            tmp_path, "withdraw", exits=(OperationState.FAILED, state)
+        )
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        base = "withdraw-" + identifier.hex()
+        client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+        client.wallet.reconcile = Mock(
+            return_value=OperationResult(base + ".1", OperationState.PENDING, "w-2")
+        )
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        history = tmp_path / f"agent.{identifier.hex()}.closed.json"
+        opening = (
+            explicitly_open(client)
+            if caller == "sessions_open"
+            else client._open("test/model", None)
+        )
+        if latest == "confirmed":
+            with pytest.raises(_FreshOpening):
+                await opening
+            archived = json.loads(history.read_text())
+            assert "closed_by_other" not in archived
+            states = {item["ref"]: item["state"] for item in archived["operations"]}
+            assert (states[base], states[base + ".1"]) == ("failed", "confirmed")
+            assert forgotten == [{"open-x", base, base + ".1"}]
+            client.wallet.reconcile.assert_not_called()
+        else:
+            with pytest.raises(ClientError, match="session close is pending"):
+                await opening
+            client.wallet.reconcile.assert_called_once_with(operation_ref=base + ".1")
+            assert not history.exists() and forgotten == []
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+DATA = Path(__file__).parent / "data"
+
+
+@pytest.mark.parametrize("then", ["same_process", "restart"])
+def test_an_attempt_whose_journal_save_failed_is_dropped_and_its_exit_stays_retriable(
+    tmp_path: Path, then: str
+) -> None:
+    """The journal save that precedes a new withdrawal attempt's wallet call
+    fails, so the wallet is never called. The attempt is dropped from
+    memory, so no later save makes it durable, and the next call sends it, in
+    the same process or after a restart. Before, the unsent attempt stayed
+    UNKNOWN with no hash and the next save kept it: from then on the exit
+    only reconciled it, and with no record at the wallet it was never sent."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(
+            tmp_path, "withdraw", exits=(OperationState.FAILED,)
+        )
+        base = "withdraw-" + identifier.hex()
+        ref = base + ".1"
+        exit_due(client, "withdraw")
+        sent = attempts_land(client, {ref: OperationState.CONFIRMED})
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        real_save, failing = client._checkpoint.save, [True]
+
+        def save(record: dict) -> None:
+            if failing and ref in {item["ref"] for item in record["operations"]}:
+                failing.clear()  # The save before the wallet call.
+                raise ValidationError(
+                    ValidationCode.INVALID_VALUE, "checkpoint could not be durably written"
+                )
+            real_save(record)
+
+        client._checkpoint.save = save
+        with pytest.raises(ValidationError, match="durably written"):
+            await client._exit(identifier, OperationKind.WITHDRAW)
+        assert sent == [] and ref not in client._operations
+        await client._persist()  # Any later save, as a report's.
+        assert ref not in saved_states(path)
+        if then == "restart":
+            client._checkpoint.close()
+            client = restored_client(path)
+            exit_due(client, "withdraw")
+            sent = attempts_land(client, {ref: OperationState.CONFIRMED})
+            client.wallet.reconcile = Mock(
+                return_value=OperationResult(ref, OperationState.UNKNOWN)
+            )
+        result = await client._exit(identifier, OperationKind.WITHDRAW)
+        assert (result.operation_ref, result.state) == (ref, OperationState.CONFIRMED)
+        assert sent == [ref]
+        client.wallet.reconcile.assert_not_called()
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_withdrawal_a_0_1_5_journal_holds_failed_is_sent_again_after_the_upgrade(
+    tmp_path: Path,
+) -> None:
+    """mppi-agent 0.1.5 saved this journal (data/agent-0.1.5-failed-withdraw.json,
+    written with the released sources by data/agent_0_1_5_failed_withdraw.py):
+    its withdrawal FAILED under the one fixed reference 0.1.5 gives an exit,
+    which 0.1.5 returned forever. Restored here, the withdrawal is sent again
+    under withdraw-<session id hex>.1 and confirmed, and the failed attempt
+    stays in the journal."""
+
+    async def scenario() -> None:
+        path = tmp_path / "agent.json"
+        shutil.copyfile(DATA / "agent-0.1.5-failed-withdraw.json", path)
+        path.chmod(0o600)
+        client = restored_client(path)
+        identifier = client._ledger.session_id
+        base = "withdraw-" + identifier.hex()
+        assert client._operations[base][1] == OperationResult(base, OperationState.FAILED)
+        exit_due(client, "withdraw")
+        sent = attempts_land(client, {base + ".1": OperationState.CONFIRMED})
+        result = await client._exit(identifier, OperationKind.WITHDRAW)
+        assert (result.operation_ref, result.state) == (base + ".1", OperationState.CONFIRMED)
+        assert sent == [base + ".1"]
+        assert saved_states(path) == {
+            "open-x": "confirmed",
+            base: "failed",
+            base + ".1": "confirmed",
+        }
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def untraceable_exit_client(tmp_path: Path) -> tuple[Client, bytes, Path, str]:
+    """closed_client after a crash between the withdrawal's journal save and
+    the wallet call: the agent's journal holds it UNKNOWN with no hash."""
+    client, identifier, path = closed_client(tmp_path, "withdraw")
+    client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+    ref = "withdraw-" + identifier.hex()
+    client._operations[ref] = (
+        client._operations[ref][0],
+        OperationResult(ref, OperationState.UNKNOWN),
+    )
+    client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+    return client, identifier, path, ref
+
+
+@pytest.mark.parametrize("caller", ["request", "sessions_open"])
+def test_an_untraceable_exit_whose_wallet_holds_a_hash_is_reconciled_not_retired(
+    tmp_path: Path, caller: str
+) -> None:
+    """The wallet holds a hash for the withdrawal the agent's journal lacks:
+    asked first, the exit is traceable after all. It is reconciled normally,
+    its receipt not served yet, so it is the agent's own exit in flight: both
+    callers keep "session close is pending", and nothing is archived or
+    handed to the wallet's retire."""
+
+    async def scenario() -> None:
+        client, identifier, path, ref = untraceable_exit_client(tmp_path)
+        await client._persist()
+        tx = b"e" * 32
+        client.wallet.reconcile = Mock(
+            return_value=OperationResult(ref, OperationState.UNKNOWN, "w-1", tx)
+        )
+        client.chain.reader.reconcile = Mock(
+            side_effect=TransportError("HTTP request failed", transient=True)
+        )
+        client.wallet.retire = Mock()
+        opening = (
+            explicitly_open(client)
+            if caller == "sessions_open"
+            else client._open("test/model", None)
+        )
+        with pytest.raises(ClientError, match="session close is pending"):
+            await opening
+        client.wallet.reconcile.assert_called_once_with(operation_ref=ref)
+        assert client.chain.reader.reconcile.call_args.kwargs["tx_hash"] == tx
+        assert client._operations[ref][1] == OperationResult(ref, OperationState.UNKNOWN, "w-1", tx)
+        saved = {item["ref"]: item for item in json.loads(path.read_text())["operations"]}
+        assert (saved[ref]["tx"], saved[ref]["wallet_id"]) == (tx.hex(), "w-1")
+        client.wallet.retire.assert_not_called()
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("answer", ["no_hash", "no_answer"])
+def test_an_untraceable_exits_reference_is_never_handed_to_the_wallets_retire(
+    tmp_path: Path, answer: str
+) -> None:
+    """Asked first, the wallet holds no hash for the withdrawal either, or
+    cannot answer. sessions.open retires the session on the foreign proof, and
+    every other reference goes to the wallet's retire; the exit's does not, so
+    a record the wallet may hold with a hash is never forgotten. The archived
+    record keeps the exit, superseded."""
+
+    async def scenario() -> None:
+        client, identifier, path, ref = untraceable_exit_client(tmp_path)
+        await client._persist()
+        if answer == "no_hash":
+            client.wallet.reconcile = Mock(
+                return_value=OperationResult(ref, OperationState.UNKNOWN)
+            )
+        else:
+            client.wallet.reconcile = Mock(side_effect=RuntimeError("wallet service unavailable"))
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        client.wallet.reconcile.assert_called_once_with(operation_ref=ref)
+        assert forgotten == [{"open-x"}]
+        archived = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert archived["closed_by_other"]["superseded"] == [ref]
+        (exit_record,) = [item for item in archived["operations"] if item["ref"] == ref]
+        assert (exit_record["state"], exit_record["tx"]) == ("unknown", None)
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_exit_hash_that_turns_up_after_a_foreign_retirement_counts_nothing(
+    tmp_path: Path,
+) -> None:
+    """sessions.open retired the session on the foreign proof while the
+    agent's own withdrawal was UNKNOWN with no hash. The wallet then learns
+    the withdrawal's hash: on the Closed session it could only have reverted
+    or been the close itself, whose settled total the foreign proof already
+    bounded. Nothing reads or presents it again: the next opening funds,
+    signs and counts nothing for it, and its history stays archived."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "withdraw")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        ref = "withdraw-" + identifier.hex()
+        client._operations[ref] = (
+            client._operations[ref][0],
+            OperationResult(ref, OperationState.UNKNOWN),
+        )
+        await client._persist()
+        references = set(client._operations)
+        forgotten: list[set[str]] = []
+        client.wallet.retire = lambda *, operation_refs, at: forgotten.append(set(operation_refs))
+        client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+        client.wallet.reconcile = Mock(return_value=OperationResult(ref, OperationState.UNKNOWN))
+        client.signer = Mock(wraps=SIGNER, address=SIGNER.address)
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)
+        client.wallet.reconcile.assert_called_once_with(operation_ref=ref)  # Asked first.
+        late = OperationResult(ref, OperationState.PENDING, tx_hash=b"e" * 32)
+        client.wallet.reconcile = Mock(return_value=late)
+        client.wallet.execute = Mock(side_effect=AssertionError("nothing is funded again"))
+        client.chain.reader.reconcile = Mock(side_effect=AssertionError("nothing is read again"))
+        with pytest.raises(ClientError, match="unknown retained operation reference"):
+            await client._reconcile_ref(ref)
+        with pytest.raises(_FreshOpening):
+            await explicitly_open(client)  # The next opening's Challenge, nothing before it.
+        client.wallet.reconcile.assert_not_called()
+        client.wallet.execute.assert_not_called()
+        client.chain.reader.reconcile.assert_not_called()
+        assert client.signer.method_calls == []
+        assert forgotten == [references - {ref}]  # Retired once; the wallet keeps the exit.
+        assert client._ledger is None and client._operations == {}
+        assert client._challenge.await_count == 2
+        saved = json.loads(path.read_text())
+        assert "ledger" not in saved and saved["operations"] == []
+        archived = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert archived["closed_by_other"]["superseded"] == [ref]
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_close_proof_in_flight_when_a_retirement_begins_finishes_before_it_decides(
+    tmp_path: Path,
+) -> None:
+    """close() began proving the provider's reported close, and its read of
+    the chain is slow, when sessions.open begins retiring the session. The
+    proof holds the close's operation lock, which the retirement takes too,
+    so the retirement decides only once the proof is done: here the read
+    matches, and the session retires as the agent's own close. Before, the
+    retirement found the proof unreadable and retired it on the foreign
+    proof while the slow read could still match."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(tmp_path, "reported")
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        tx, observation = b"c" * 32, client.chain.current.block.observation
+        entered, release = threading.Event(), threading.Event()
+
+        def closing(*_):
+            entered.set()
+            release.wait(5)
+            return ClosingEvidence(observation, 0, 100, tx)
+
+        client.chain.reader.closing = Mock(side_effect=closing)
+        closing_call = asyncio.create_task(client._cooperative_close(identifier))
+        await asyncio.to_thread(entered.wait, 5)
+        retiring = asyncio.create_task(explicitly_open(client))
+        await settle_tasks()
+        assert not retiring.done()
+        release.set()
+        with pytest.raises(_FreshOpening):
+            await retiring
+        proven = await closing_call
+        assert (proven.state, proven.tx_hash) == (OperationState.CONFIRMED, tx)
+        client.chain.reader.closing.assert_called_once()
+        archived = json.loads((tmp_path / f"agent.{identifier.hex()}.closed.json").read_text())
+        assert archived["confirmed_close"]["tx"] == tx.hex()
+        assert "closed_by_other" not in archived and "reported_close" not in archived
+        saved = json.loads(path.read_text())
+        assert "confirmed_close" not in saved and "ledger" not in saved
+        client._checkpoint.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("marker", ["reported", "exit"])
+def test_a_close_the_agent_cannot_prove_whose_settled_total_exceeds_usage_is_never_retired(
+    tmp_path: Path, marker: str
+) -> None:
+    """The foreign rule's accounting holds for a close the agent cannot show
+    as its own: settled above validated usage, sessions.open raises
+    CloseAccountingError every time, a request gets SESSION_CLOSED, and the
+    session stays retained with nothing archived or retired."""
+
+    async def scenario() -> None:
+        client, identifier, path = closed_client(
+            tmp_path, "reported" if marker == "reported" else "withdraw", settled=1
+        )
+        client._connect = AsyncMock()  # Its own: the fixture shares one with _start.
+        if marker == "reported":
+            client.chain.reader.closing = Mock(
+                side_effect=ChainEvidenceError("successful canonical receipt required")
+            )
+        else:
+            ref = "withdraw-" + identifier.hex()
+            client._operations[ref] = (
+                client._operations[ref][0],
+                OperationResult(ref, OperationState.UNKNOWN),
+            )
+            await client._persist()
+            client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+            client.wallet.reconcile = Mock(
+                return_value=OperationResult(ref, OperationState.UNKNOWN)
+            )
+        client.wallet.retire = Mock()
+        before = path.read_bytes()
+        for _ in range(2):
+            with pytest.raises(CloseAccountingError) as failure:
+                await explicitly_open(client)
+            assert failure.value.operation is None
+            assert (failure.value.capture_amount, failure.value.usage_amount) == (1, 0)
+        with pytest.raises(PaymentError) as refused:
+            await client._open("test/model", None)
+        assert refused.value.failure.reason == "SESSION_CLOSED"
+        assert path.read_bytes() == before
+        assert not (tmp_path / f"agent.{identifier.hex()}.closed.json").exists()
+        assert client._ledger is not None and client._ledger.session_id == identifier
+        client.wallet.retire.assert_not_called()
+        client.chain.unwatch_session.assert_not_called()
+        client._connect.assert_not_awaited()
+        client._challenge.assert_not_awaited()
         client._checkpoint.close()
 
     asyncio.run(scenario())
@@ -2893,8 +4777,8 @@ def test_a_fresh_opening_records_its_proven_session_for_requests():
         sessions=(SessionOperationOutcome(ledger.session_id, 100, deposit=100),),
     )
     client._confirm_opened(ledger, outcome)
-    ((sid, state), _) = client.chain.confirm.call_args
-    assert sid == ledger.session_id
+    ((sid, state), proving) = client.chain.confirm.call_args
+    assert sid == ledger.session_id and proving == {"observation": observation}
     assert (state.deposit, state.settled_cumulative, state.status) == (100, 0, SessionStatus.OPEN)
     # An activity time no later than the opening's block: never a late deadline.
     assert state.last_activity == 1_799_999_990
@@ -2924,15 +4808,16 @@ class _OpenedChain:
             self.opened if number >= 10 else ChainSession(0, 0, SessionStatus.OPEN, 0, 0, bytes(32))
         )
 
-    def latest(self, *, providers, sessions):
+    def _latest(self, providers, sessions, funding):
+        assert funding is None
         self.latest_reads += 1
         states = {sid: self.state(self.head) for sid in sessions}
-        return self.block(self.head), PauseLevel.NONE, {}, states
+        return self.block(self.head), PauseLevel.NONE, {}, states, None
 
-    def _observe_at(self, number, block_hash, *, providers, sessions, recheck):
-        assert block_hash == bytes([number]) * 32
+    def _observe_at(self, number, block_hash, *, providers, sessions, recheck, funding):
+        assert block_hash == bytes([number]) * 32 and funding is None
         states = {sid: self.state(number) for sid in sessions}
-        return self.block(number), None, PauseLevel.NONE, {}, states
+        return self.block(number), None, PauseLevel.NONE, {}, states, None
 
     def session_at(self, number, block_hash, session_id):
         return self.block(number), self.state(number)
@@ -3032,6 +4917,142 @@ def test_a_refresh_accepted_during_the_attachment_read_keeps_its_newer_state(mon
         assert observed == opened
         assert current.sessions[ledger.session_id] == topped
         assert follower.current.sessions[ledger.session_id] == topped
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("served", [True, False], ids=["third_read", "never"])
+def test_a_snapshot_block_not_yet_served_is_read_again_after_jittered_waits(
+    monkeypatch, served
+) -> None:
+    """Agents refused together must not repeat in step: each repeat waits a
+    uniformly random share of 250 ms, then of 1 s, as chain reads do."""
+    waits: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(client_module, "_sleep", sleep)
+    monkeypatch.setattr(client_module, "_jitter", lambda: 0.5)
+
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        state = client.chain.current.sessions[ledger.session_id]
+        reached = SimpleNamespace(sessions={ledger.session_id: state})
+        lag = ChainLagError("RPC has not served that block yet")
+
+        def stale():
+            raise ChainEvidenceError("chain observation is unavailable or stale")
+
+        client.chain.snapshot = stale
+        client.chain.refresh_at = AsyncMock(side_effect=[lag, lag, reached if served else lag])
+        if served:
+            current, observed = await client._snapshot_evidence(12, b"h" * 32, ledger.session_id)
+            assert current is reached and observed == state
+        else:
+            with pytest.raises(
+                ClientError, match="^confirmed chain observation precedes snapshot$"
+            ):
+                await client._snapshot_evidence(12, b"h" * 32, ledger.session_id)
+        assert client.chain.refresh_at.await_count == 3
+        assert waits == [0.125, 0.5]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("served", [True, False], ids=["third_read", "never"])
+def test_a_snapshot_block_behind_the_head_not_yet_imported_is_read_again_after_jittered_waits(
+    monkeypatch, served
+) -> None:
+    """The follower is already past the provider's snapshot block, so only the
+    session is read at that block. A backend that has not imported it yet
+    (-32014 outlasting the reader's repeats is ChainLagError) is read again
+    after the same jittered waits as a refresh at that block. A block never
+    served ends in a ClientError that says so, not a protocol error; the
+    refresh's own says its evidence precedes the snapshot (pinned above)."""
+    waits: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr(client_module, "_sleep", sleep)
+    monkeypatch.setattr(client_module, "_jitter", lambda: 0.5)
+
+    async def scenario() -> None:
+        client = component_client()
+        ledger = client._ledger
+        state = client.chain.current.sessions[ledger.session_id]
+        head = Block(
+            ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 20, b"h" * 32),
+            100,
+            b"p" * 32,
+        )
+        current = SimpleNamespace(block=head, sessions={ledger.session_id: state})
+        client.chain.snapshot = lambda: current
+        lag = ChainLagError("RPC backend has not imported that block yet")
+        reads = Mock(side_effect=[lag, lag, (head, state) if served else lag])
+        client.chain.reader = SimpleNamespace(session_at=reads)
+        if served:
+            evidence, observed = await client._snapshot_evidence(12, b"s" * 32, ledger.session_id)
+            assert evidence is current and observed == state
+        else:
+            with pytest.raises(ClientError, match="^snapshot block was not served by the RPC$"):
+                await client._snapshot_evidence(12, b"s" * 32, ledger.session_id)
+        assert reads.call_args_list == [call(12, b"s" * 32, ledger.session_id)] * 3
+        assert waits == [0.125, 0.5]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["top_up", "close"])
+def test_a_lagging_read_after_a_confirmed_top_up_or_close_is_lag(monkeypatch, operation):
+    """The follower accepted block 12; the agent's top-up or close lands at
+    block 20 and is proven from its event. A backend that has reached block
+    15 but not 20 serves the earlier deposit or status: lag, and requests keep
+    the proven state. A refresh at or after block 20 replaces it."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(follower_module, "_sleep", AsyncMock())
+        client = component_client()
+        ledger = client._ledger
+        opened = ChainSession(100, 0, SessionStatus.OPEN, 0, 1_800_000_005, ledger.initial_hash)
+        chain = _OpenedChain(opened, 12)
+        follower = ChainFollower(
+            chain,
+            max_age_ms=60_000,
+            collection_margin_ms=1_000,
+            monotonic=lambda: 1_000.0,
+            wall_clock=lambda: 1_800_000_010.0,
+        )
+        follower._running = True
+        follower.follow(sessions=(ledger.session_id,))
+        await follower.refresh()
+        client.chain = follower
+        client._saved = {"version": 1}
+        proving = chain.block(20).observation
+        if operation == "top_up":
+            outcome = SessionOperationOutcome(ledger.session_id, 10, deposit=110)
+            result = OperationResult(
+                "top-up-x", OperationState.CONFIRMED, tx_hash=b"t" * 32, observation=proving,
+                sessions=(outcome,),
+            )  # fmt: skip
+            await client._top_up_confirmed(result)
+            proven = replace(opened, deposit=110)
+        else:
+            client._saved["reported_close"] = {"tx": "74" * 32, "capture": 0, "refunded": 100}
+            client._closed_error = None
+            chain.closing = lambda tx, sid: ClosingEvidence(proving, 0, 100, tx)
+            await client._prove_close()
+            proven = replace(opened, status=SessionStatus.CLOSED)
+        readiness = follower.confirmed_readiness(ledger.session_id)
+        chain.head = 15
+        await follower.refresh()
+        assert follower.current.sessions[ledger.session_id] == proven
+        assert follower.confirmed_readiness(ledger.session_id) == readiness
+        chain.opened, chain.head = replace(proven, last_activity=1_800_000_010), 21
+        await follower.refresh()
+        assert follower.current.sessions[ledger.session_id] == chain.opened
 
     asyncio.run(scenario())
 

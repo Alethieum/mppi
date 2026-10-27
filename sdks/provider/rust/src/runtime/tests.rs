@@ -104,12 +104,15 @@ impl TestRpc {
         json!({"number":"0x64","hash":hx(hash(0xbb)),"parentHash":hx(hash(0xbc)),"timestamp":format!("0x{TIME:x}"),"gasLimit":"0x1c9c380"})
     }
     fn receipt(&self) -> Value {
-        let d = descriptor();
+        self.opened(&descriptor(), hash(0xaa))
+    }
+    /// The canonical receipt of transaction `tx` opening descriptor `d`.
+    fn opened(&self, d: &SessionDescriptor, tx: B256) -> Value {
         let topics = vec![
             hx(keccak256(
                 "SessionOpened(bytes32,address,address,uint256,address,address,address,bytes32,uint64,bytes32)",
             )),
-            hx(self.sid()),
+            hx(domain().signing_context().session_id(d)),
             hx(aword(d.agent)),
             hx(d.providerId.to_be_bytes::<32>()),
         ];
@@ -123,8 +126,8 @@ impl TestRpc {
             self.initial_hash.to_vec(),
         ]
         .concat();
-        json!({"transactionHash":hx(hash(0xaa)),"blockHash":hx(hash(0xbb)),"blockNumber":"0x64","transactionIndex":"0x0","status":"0x1","logs":[{
-            "address":hx(addr(0x99)),"topics":topics,"data":hx(data),"logIndex":"0x0","transactionIndex":"0x0","transactionHash":hx(hash(0xaa)),"blockNumber":"0x64","blockHash":hx(hash(0xbb)),"removed":false
+        json!({"transactionHash":hx(tx),"blockHash":hx(hash(0xbb)),"blockNumber":"0x64","transactionIndex":"0x0","status":"0x1","logs":[{
+            "address":hx(addr(0x99)),"topics":topics,"data":hx(data),"logIndex":"0x0","transactionIndex":"0x0","transactionHash":hx(tx),"blockNumber":"0x64","blockHash":hx(hash(0xbb)),"removed":false
         }]})
     }
 }
@@ -945,13 +948,19 @@ async fn zero_price_requires_explicit_zero_voucher_and_checks_group_counts() {
 mod failure_tests;
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+#[path = "retirement_tests.rs"]
+mod retirement_tests;
 #[path = "services_tests.rs"]
 mod services_tests;
+#[path = "timing_tests.rs"]
+mod timing_tests;
 
 #[path = "control_auth_tests.rs"]
 mod control_auth_tests;
 #[path = "midstream_tests.rs"]
 mod midstream_tests;
+#[path = "wake_tests.rs"]
+mod wake_tests;
 
 #[tokio::test]
 async fn stale_chain_pause_and_catalog_change_fail_before_admission() {

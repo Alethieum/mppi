@@ -727,6 +727,82 @@ async fn retained_close_result_replays_after_authenticated_reconnect_without_new
 }
 
 #[tokio::test]
+async fn an_agents_close_request_drains_its_runs_once() {
+    let fixture = Fixture::new(1000).await;
+    fixture.voucher(100);
+    fixture.provider.inner.lock().unwrap().attachments.clear();
+    let (sender, mut response) = open(&fixture, None).await;
+    let nonce = nonce(&mut response).await;
+    send(&sender, proof(&fixture, nonce)).await;
+    let proto::control_message::Kind::SessionState(snapshot) = message(&mut response).await else {
+        panic!("missing authenticated state");
+    };
+    let generation = snapshot.control_generation.unwrap();
+    let auth = crate::signing::RunAuth {
+        sessionId: fixture.sid,
+        controlGeneration: generation,
+        runId: hash(1),
+        model: "example/model".into(),
+        rateCardHash: fixture.rpc.initial_hash,
+    };
+    let mut request = fixture.request(1);
+    request.control_generation = Some(generation);
+    request.auth_signature = Some(sign(&auth));
+    let run = fixture.provider.inner.begin_run(request).unwrap();
+    assert!(matches!(
+        fixture
+            .provider
+            .inner
+            .attempt_admission(&run, counts(1000))
+            .unwrap(),
+        Admission::Granted
+    ));
+    // The close waits for the active run: no wallet call, only the Drain.
+    send(&sender, close_request(&fixture)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            {
+                let state = fixture.provider.inner.lock().unwrap();
+                if state.sessions[&fixture.sid].close_pending && state.collecting.is_empty() {
+                    break;
+                }
+            }
+            yields().await;
+        }
+    })
+    .await
+    .unwrap();
+    send(&sender, challenge(9)).await;
+    // Count the Drains before that barrier; a frame may carry several messages.
+    let (mut drains, mut barrier) = (0, false);
+    while !barrier {
+        let frame = std::future::poll_fn(|cx| Pin::new(response.body_mut()).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = &frame.into_data().unwrap()[..];
+        while !data.is_empty() {
+            let length = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+            match proto::ControlMessage::decode(&data[5..5 + length])
+                .unwrap()
+                .kind
+            {
+                Some(proto::control_message::Kind::Drain(_)) => drains += 1,
+                Some(proto::control_message::Kind::Challenge(_)) => barrier = true,
+                _ => {}
+            }
+            data = &data[5 + length..];
+        }
+    }
+    assert_eq!(
+        drains, 1,
+        "one close request drained its runs {drains} times"
+    );
+    drop((sender, response));
+    stop(&fixture).await;
+}
+
+#[tokio::test]
 async fn retained_close_result_still_requires_owner_and_valid_close_proof() {
     for invalid_signature in [false, true] {
         let fixture = Fixture::new(1000).await;

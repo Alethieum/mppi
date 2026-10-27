@@ -9,7 +9,8 @@ use alloy_primitives::{B256, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 
 use crate::{
-    chain::{ChainReader, decode_return},
+    capabilities::TransactionWallet,
+    chain::{ChainReader, data, decode_return, eth_call},
     circle::{CircleAgentWallet, CircleOptions},
     cli::HostConfiguration,
     contract::{ARC_USDC, ContractCalls},
@@ -74,12 +75,39 @@ pub async fn runtime_from_config_with_options(
         )
         .map_err(|_| SetupError("restore the existing Circle Agent Wallet operation record"))?,
     );
-    compose(host, wallet, coverage, execution, options).await
+    compose(
+        host,
+        wallet.clone(),
+        Some(&wallet),
+        coverage,
+        execution,
+        options,
+    )
+    .await
 }
 
+/// Compose with another `TransactionWallet`, such as one whose operator key an
+/// HSM or KMS holds. Its address must be the saved operator; the deployment and
+/// USDC domain are verified as for Circle. Setup cannot verify another wallet's
+/// account, network or access: the wallet owns those checks. `options.circle`
+/// is not used.
+pub async fn runtime_from_config_with_wallet(
+    host: HostConfiguration,
+    wallet: Arc<dyn TransactionWallet>,
+    coverage: Arc<dyn CoverageProvider>,
+    execution: Arc<dyn ExecutionProvider>,
+    options: RuntimeOptions,
+) -> Result<Mppi, SetupError> {
+    compose(host, wallet, None, coverage, execution, options).await
+}
+
+/// `circle` is the same wallet when it is the Circle adapter, whose account,
+/// network and CLI version are then verified; any other wallet is checked by
+/// its address alone.
 async fn compose(
     host: HostConfiguration,
-    wallet: Arc<CircleAgentWallet>,
+    wallet: Arc<dyn TransactionWallet>,
+    circle: Option<&CircleAgentWallet>,
     coverage: Arc<dyn CoverageProvider>,
     execution: Arc<dyn ExecutionProvider>,
     options: RuntimeOptions,
@@ -95,9 +123,11 @@ async fn compose(
         ));
     }
     if wallet.address() != config.identity().wallet_address() {
-        return Err(SetupError(
-            "saved provider operator differs from Circle Agent Wallet",
-        ));
+        return Err(SetupError(if circle.is_some() {
+            "saved provider operator differs from Circle Agent Wallet"
+        } else {
+            "saved provider operator differs from the supplied wallet"
+        }));
     }
     let follower = Arc::new(
         ChainFollower::new(
@@ -108,10 +138,12 @@ async fn compose(
         )
         .map_err(|_| SetupError("invalid provider chain polling policy"))?,
     );
-    wallet.verify_wallet().await.map_err(|error| match error {
-        crate::circle::CircleError::Authentication => SetupError("Circle Agent Wallet session missing or expired; run circle wallet login EMAIL (mainnet) or circle wallet login EMAIL --testnet, then rerun"),
-        _ => SetupError("Circle Agent Wallet account, network or CLI version could not be verified"),
-    })?;
+    if let Some(circle) = circle {
+        circle.verify_wallet().await.map_err(|error| match error {
+            crate::circle::CircleError::Authentication => SetupError("Circle Agent Wallet session missing or expired; run circle wallet login EMAIL (mainnet) or circle wallet login EMAIL --testnet, then rerun"),
+            _ => SetupError("Circle Agent Wallet account, network or CLI version could not be verified"),
+        })?;
+    }
     let contract = verified_usdc_contract(&chain).await?;
     Mppi::with_limits_and_hooks(
         config,
@@ -144,22 +176,28 @@ async fn verified_usdc_contract(chain: &ChainReader) -> Result<ContractCalls, Se
     let invalid =
         |_| SetupError("Arc USDC deployment or authorization domain could not be verified");
     let block = chain.block(None).await.map_err(invalid)?;
-    chain.verify_deployment(&block).await.map_err(invalid)?;
-    async fn read<C: SolCall>(
-        chain: &ChainReader,
-        call: C,
-        block: &crate::chain::Block,
-    ) -> Result<C::Return, SetupError> {
-        let raw = chain
-            .call_at(ARC_USDC, &call.abi_encode(), block)
-            .await
-            .map_err(|_| SetupError("Arc USDC authorization domain unavailable"))?;
-        decode_return::<C>(&raw)
+    let with_code = chain.code_unchecked();
+    let mut calls = chain.deployment_calls(with_code);
+    for data in [
+        ArcUsdc::nameCall {}.abi_encode(),
+        ArcUsdc::versionCall {}.abi_encode(),
+        ArcUsdc::decimalsCall {}.abi_encode(),
+        ArcUsdc::DOMAIN_SEPARATORCall {}.abi_encode(),
+    ] {
+        calls.push(eth_call(ARC_USDC, &data));
+    }
+    let results = chain.read(&block, calls).await.map_err(invalid)?;
+    let results = chain
+        .check_deployment(&results, with_code)
+        .map_err(invalid)?;
+    fn decode<C: SolCall>(raw: &serde_json::Value) -> Result<C::Return, SetupError> {
+        data(raw)
+            .and_then(|raw| decode_return::<C>(&raw))
             .map_err(|_| SetupError("Arc USDC authorization domain is not canonical ABI"))
     }
-    if read(chain, ArcUsdc::nameCall {}, &block).await? != "USDC"
-        || read(chain, ArcUsdc::versionCall {}, &block).await? != "2"
-        || read(chain, ArcUsdc::decimalsCall {}, &block).await? != 6
+    if decode::<ArcUsdc::nameCall>(&results[0])? != "USDC"
+        || decode::<ArcUsdc::versionCall>(&results[1])? != "2"
+        || decode::<ArcUsdc::decimalsCall>(&results[2])? != 6
     {
         return Err(SetupError(
             "Arc USDC authorization domain differs from supported values",
@@ -170,12 +208,11 @@ async fn verified_usdc_contract(chain: &ChainReader) -> Result<ContractCalls, Se
         keccak256("USDC"), keccak256("2"),
         U256::from(chain.profile().domain().chain_id()), ARC_USDC,
     ).abi_encode());
-    if read(chain, ArcUsdc::DOMAIN_SEPARATORCall {}, &block).await? != expected {
+    if decode::<ArcUsdc::DOMAIN_SEPARATORCall>(&results[3])? != expected {
         return Err(SetupError(
             "Arc USDC authorization domain separator is inconsistent",
         ));
     }
-    chain.check_canonical(&block).await.map_err(invalid)?;
     ContractCalls::new(*chain.profile().domain(), "USDC".into(), "2".into())
         .map_err(|_| SetupError("Arc USDC contract configuration is invalid"))
 }

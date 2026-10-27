@@ -9,15 +9,23 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from mppi_protocol.errors import ValidationCode, ValidationError
 
 MAX_CHECKPOINT_BYTES = 64 << 20
+# How long opening waits for a lock another descriptor still holds. A lock
+# belongs to its open file description (flock(2)), and a child process spawned
+# by any thread holds a copy of every open descriptor until it execs, so a lock
+# just released here can stay held for that moment. A second live holder is
+# still refused once the wait ends.
+_LOCK_WAIT_SECONDS = 1.0
 
 
 def _invalid(message: str) -> ValidationError:
@@ -42,10 +50,20 @@ _VERSIONS = (1, 2)
 class Checkpoint:
     """One mode-0600, bounded, exclusively owned non-secret local record."""
 
-    def __init__(self, path: Path, *, require_existing: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        require_existing: bool = False,
+        lock_wait: float = _LOCK_WAIT_SECONDS,
+    ) -> None:
+        """Open and lock the record, waiting up to ``lock_wait`` seconds (one
+        by default) for a lock another descriptor holds."""
         self.path = Path(path).absolute()
         self._lock: int | None = None
         try:
+            if type(lock_wait) not in (int, float) or not 0 <= lock_wait < math.inf:
+                raise _invalid("invalid checkpoint lock wait")
             if not require_existing:
                 self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             lock_path = self.path.with_name(self.path.name + ".lock")
@@ -55,7 +73,15 @@ class Checkpoint:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
                 raise _invalid("checkpoint lock permissions must be 0600")
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            deadline = time.monotonic() + lock_wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             if self.load() is None and require_existing:
                 raise _invalid("restore the original local operation record")
         except Exception:

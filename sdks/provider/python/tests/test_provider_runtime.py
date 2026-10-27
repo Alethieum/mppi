@@ -5,18 +5,22 @@ for payment-state unit tests; they do not establish live contract integration.
 Provider execution supplies every count and final outcome through public hooks.
 """
 
+import ast
 import asyncio
+import json
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import grpc
 import pytest
 from mppi.v1 import mppi_pb2 as pb
 from mppi.v1 import mppi_pb2_grpc as stubs
-from mppi_protocol import RunAccounting, TokenCounts
+from mppi_protocol import RunAccounting, TokenCounts, circle
 from mppi_protocol.accounting import RunStatus
 from mppi_protocol.catalog import CatalogRow, publish_catalog
 from mppi_protocol.chain import (
@@ -25,11 +29,14 @@ from mppi_protocol.chain import (
     ChainReader,
     ChainSession,
     ClosingEvidence,
+    CodePin,
+    DeploymentProfile,
     OpeningEvidence,
 )
+from mppi_protocol.circle import CircleAgentWallet
 from mppi_protocol.contract import ARC_USDC, ContractCalls
 from mppi_protocol.discovery import ProviderIdentity
-from mppi_protocol.errors import ValidationError
+from mppi_protocol.errors import ValidationCode, ValidationError
 from mppi_protocol.follower import ChainSnapshot
 from mppi_protocol.signing import LocalSessionSigner, session_id
 from mppi_protocol.types import (
@@ -344,6 +351,10 @@ class Facts:
         self.height = max(self.height, 101)
         return self.state
 
+    def unwatch_session(self, sid):
+        assert sid == SID
+        self.watched = False
+
     async def refresh(self):
         return self.snapshot()
 
@@ -460,9 +471,20 @@ class Work:
 
 
 @asynccontextmanager
-async def serving(*, work=None, cfg=None, deposit=100000, control_auth_timeout=60.0, hooks=None):
+async def serving(
+    *,
+    work=None,
+    cfg=None,
+    deposit=100000,
+    control_auth_timeout=60.0,
+    closed_retention=86400.0,
+    hooks=None,
+    chain=None,
+    wallet=None,
+):
     cfg = cfg or config()
-    facts, wallet, work = Facts(cfg, deposit=deposit), Wallet(), work or Work()
+    facts, work = (chain or Facts)(cfg, deposit=deposit), work or Work()
+    wallet = wallet or Wallet()
     provider = Mppi(
         cfg,
         chain=facts,
@@ -471,6 +493,7 @@ async def serving(*, work=None, cfg=None, deposit=100000, control_auth_timeout=6
         coverage=work.coverage,
         execution=work.execute,
         control_auth_timeout=control_auth_timeout,
+        closed_retention=closed_retention,
         hooks=hooks,
     )
     assert provider.discovery("/discover") is None
@@ -1148,6 +1171,291 @@ def test_capture_and_cooperative_close_use_actual_usage_not_voucher_buffer():
     asyncio.run(scenario())
 
 
+def test_a_close_the_wallet_refused_unsent_is_prepared_again_at_most_once_per_interval():
+    """Maintenance prepares a close that never began again at most once per
+    settlement interval (1,000 s here), so a failure that repeats does not spin
+    the wallet; the close continues under its reference."""
+    from mppi_protocol.capabilities import NotSubmittedError
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            execute, refused = peer.wallet.execute, []
+
+            def refuse(call, *, operation_ref):
+                if not refused:
+                    return execute(call, operation_ref=operation_ref)
+                refused.append(operation_ref)
+                raise NotSubmittedError("Circle was not asked to execute")
+
+            refused.append("first")
+            peer.wallet.execute = refuse
+            first = await peer.provider.sessions.close(SID)
+            assert first.state is OperationState.FAILED and first.tx_hash is None
+            await asyncio.sleep(1.0)  # About 20 maintenance passes.
+            assert refused == ["first", first.operation_ref], "a refused close spins the wallet"
+            refused.clear()
+            session = peer.provider._sessions[SID]
+            session.last_collection -= peer.provider.config.settlement.interval_ms / 1000
+            for _ in range(100):
+                if peer.wallet.calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert [reference for _, reference in peer.wallet.calls] == [first.operation_ref]
+
+    asyncio.run(scenario())
+
+
+def test_a_close_mined_and_reverted_is_retried_under_its_successor_reference():
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            mode = ["revert"]
+
+            def reconcile(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+                if mode[0] == "revert":
+                    observation = peer.facts.block(peer.facts.height).observation
+                    return OperationResult(
+                        operation_ref,
+                        OperationState.FAILED,
+                        wallet_operation_id,
+                        tx_hash,
+                        observation,
+                    )
+                return OperationResult(
+                    operation_ref, OperationState.PENDING, wallet_operation_id, tx_hash
+                )
+
+            peer.facts.reader.reconcile = reconcile
+            peer.facts.reader.simulate = lambda prepared, *, sender: None
+            provider = peer.provider
+            reverted = await provider.sessions.close(SID)
+            assert reverted.state is OperationState.FAILED and reverted.tx_hash is not None
+            first, successor = reverted.operation_ref, reverted.operation_ref + ".1"
+            before = await provider.sessions.checkpoint(SID)
+            # At most once per settlement interval (1,000 s here), by a call or
+            # by maintenance: each attempt is a transaction.
+            assert await provider.sessions.close(SID) == reverted
+            await asyncio.sleep(0.3)
+            assert [reference for _, reference in peer.wallet.calls] == [first]
+            interval = provider.config.settlement.interval_ms / 1000
+            mode[0] = "pending"
+            provider._sessions[SID].last_collection -= interval
+            for _ in range(100):
+                if len(peer.wallet.calls) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert [reference for _, reference in peer.wallet.calls] == [first, successor]
+            # The close intent names its current reference, so its checkpoint recovers.
+            after = await provider.sessions.checkpoint(SID)
+            assert after.close_reference == successor
+            assert after.operation.result.operation_ref == successor
+            # A runtime restored from a checkpoint older than the retry derives
+            # the same successor, so the wallet's binding continues that retry.
+            mode[0] = "revert"
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(before)
+                restored._sessions[SID].last_collection -= interval
+                mode[0] = "pending"
+                assert (await restored.sessions.close(SID)).operation_ref == successor
+                assert [reference for _, reference in peer.wallet.calls] == [
+                    first,
+                    successor,
+                    successor,
+                ]
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_a_reverted_close_is_sent_again_only_when_its_successor_simulates():
+    """A close mined and reverted is retried only once its successor simulates.
+    While the simulation fails, as it does for a close that keeps reverting, the
+    runtime records no intent and sends nothing, and the next attempt waits its
+    interval; once the simulation passes, the successor is sent."""
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            mode = ["revert"]
+            simulated = []
+
+            def reconcile(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+                if mode[0] == "revert":
+                    observation = peer.facts.block(peer.facts.height).observation
+                    return OperationResult(
+                        operation_ref,
+                        OperationState.FAILED,
+                        wallet_operation_id,
+                        tx_hash,
+                        observation,
+                    )
+                return OperationResult(
+                    operation_ref, OperationState.PENDING, wallet_operation_id, tx_hash
+                )
+
+            def simulate(prepared, *, sender):
+                simulated.append(prepared)
+                if mode[0] == "revert":
+                    # What the reader raises for an eth_call that reverts.
+                    raise ChainEvidenceError("invalid RPC bytes")
+
+            peer.facts.reader.reconcile = reconcile
+            peer.facts.reader.simulate = simulate
+            provider = peer.provider
+            reverted = await provider.sessions.close(SID)
+            assert reverted.state is OperationState.FAILED and reverted.tx_hash is not None
+            first, successor = reverted.operation_ref, reverted.operation_ref + ".1"
+            session = provider._sessions[SID]
+            interval = provider.config.settlement.interval_ms / 1000
+
+            def unchanged():
+                assert session.close_reference == first
+                assert session.operation.result == reverted
+                assert successor not in provider._references
+
+            # A close call simulates the successor and fails with it.
+            session.last_collection -= interval
+            with pytest.raises(ChainEvidenceError):
+                await provider.sessions.close(SID)
+            assert len(simulated) == 1
+            unchanged()
+            # The attempt counts: the next waits its interval, by a call or by
+            # maintenance, which then tries again.
+            assert await provider.sessions.close(SID) == reverted
+            await asyncio.sleep(0.2)
+            assert len(simulated) == 1
+            for attempt in (2, 3):
+                session.last_collection -= interval
+                for _ in range(100):
+                    if len(simulated) == attempt:
+                        break
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.2)
+                assert len(simulated) == attempt
+                unchanged()
+            assert [reference for _, reference in peer.wallet.calls] == [first]
+            # Once the successor simulates, it is sent.
+            mode[0] = "pending"
+            session.last_collection -= interval
+            for _ in range(100):
+                if len(peer.wallet.calls) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert [reference for _, reference in peer.wallet.calls] == [first, successor]
+            assert len(simulated) == 4
+            assert session.close_reference == successor
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("reference", "successor"),
+    (
+        ("close:ab", "close:ab.1"),
+        ("close:ab.1", "close:ab.2"),
+        ("close:ab.9", "close:ab.10"),
+        ("close:ab.01", "close:ab.01.1"),
+        ("close:ab.+1", "close:ab.+1.1"),
+        ("close:ab.x", "close:ab.x.1"),
+        ("close:ab.\u0663", "close:ab.\u0663.1"),
+        ("close:ab.18446744073709551615", "close:ab.18446744073709551615.1"),
+    ),
+)
+def test_a_close_reference_counts_its_retries(reference, successor):
+    assert runtime._successor(reference) == successor
+
+
+@pytest.mark.parametrize("close", (True, False))
+def test_a_restored_collection_that_never_began_is_prepared_again(close):
+    """After a restart, a settlement or close the wallet attested never began
+    was restored UNKNOWN and only ever reconciled, so its session could never
+    settle or close."""
+    from mppi_protocol.capabilities import NotSubmittedError
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            execute = peer.wallet.execute
+
+            def refuse(call, *, operation_ref):
+                raise NotSubmittedError("Circle was not asked to execute")
+
+            peer.wallet.execute = refuse
+            collect = peer.provider.sessions.close if close else peer.provider.sessions.settle
+            first = await collect(SID)
+            assert first.state is OperationState.FAILED and first.tx_hash is None
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(evidence)
+                assert restored._sessions[SID].operation.result.state is OperationState.FAILED
+                # A journal with no record answers UNKNOWN, as Circle's does.
+                peer.wallet.reconcile = lambda *, operation_ref: OperationResult(
+                    operation_ref, OperationState.UNKNOWN
+                )
+                peer.wallet.execute = execute
+                again = await (restored.sessions.close if close else restored.sessions.settle)(SID)
+                assert [reference for _, reference in peer.wallet.calls] == [again.operation_ref]
+                if close:
+                    # A close continues under its reference.
+                    assert again.operation_ref == first.operation_ref
+                else:
+                    assert again.operation_ref != first.operation_ref
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("origin", ("host", "agent"))
+def test_a_close_waiting_for_an_active_run_drains_once_then_closes_when_it_ends(origin):
+    from mppi_provider import Hooks
+
+    drains = []
+
+    async def scenario():
+        async with serving(work=Work(hold=True), hooks=Hooks(on_drain=drains.append)) as peer:
+            await peer.attach(voucher=1010)
+            completion = asyncio.create_task(peer.complete())
+            await peer.work.started.wait()
+            if origin == "host":
+                waiting = await peer.provider.sessions.close(SID)
+                assert waiting.state is OperationState.UNKNOWN
+            else:
+                await peer.control.write(
+                    pb.ControlMessage(
+                        close_request=pb.CloseRequest(
+                            session_id=SID, signature=SIGNER.sign_close(DOMAIN, SID)
+                        )
+                    )
+                )
+            await asyncio.sleep(0.5)  # About 10 maintenance passes.
+            await delivered(drains, 1)
+            assert len(drains) == 1, f"{len(drains)} Drains for one close"
+            assert not peer.wallet.calls
+            peer.work.release.set()
+            await asyncio.gather(completion, return_exceptions=True)
+            # The close is prepared once its run ends, not an interval later.
+            for _ in range(100):
+                if peer.wallet.calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(peer.wallet.calls) == 1
+            await asyncio.sleep(0.2)
+            assert len(drains) == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("reconnect", (False, True))
 def test_control_replays_confirmed_close_without_new_payment_or_close_event(reconnect):
     from mppi_provider import Hooks
@@ -1553,7 +1861,7 @@ def test_above_deposit_voucher_refresh_has_chain_policy_deadline(monkeypatch):
             assert payment is not None and payment.reason == "STATE_UNAVAILABLE"
             assert cancelled.is_set() and calls == [True]
             assert peer.provider._sessions[SID].voucher.cumulative == 1010
-            async with asyncio.timeout(0.2), peer.provider._condition:
+            async with asyncio.timeout(0.2), peer.provider._lock:
                 assert not peer.provider._sessions[SID].owner.live
 
     asyncio.run(scenario())
@@ -1905,7 +2213,7 @@ def test_authorization_wait_deadline_is_checked_before_late_voucher_admission(el
 
             with monkeypatch.context() as patch:
                 patch.setattr(runtime, "asyncio", SimpleNamespace(**patched_asyncio))
-                patch.setattr(peer.provider._condition, "wait", receive_voucher_after_wait)
+                patch.setattr(session.wake, "wait", receive_voucher_after_wait)
                 if elapsed < 1:
                     assert (await peer.complete())[-1].terminal.status == pb.RUN_STATUS_COMPLETED
                     assert len(peer.work.calls) == 1
@@ -2199,15 +2507,16 @@ def restore_reader(facts):
     facts.reader.simulate = lambda prepared, *, sender: None
 
 
-def replacement(peer, cfg=None):
+def replacement(peer, cfg=None, wallet=None, closed_retention=86400.0):
     restore_reader(peer.facts)
     provider = Mppi(
         cfg or peer.provider.config,
         chain=peer.facts,
         contract=ContractCalls(DOMAIN, "USDC", "2"),
-        wallet=peer.wallet,
+        wallet=peer.wallet if wallet is None else wallet,
         coverage=peer.work.coverage,
         execution=peer.work.execute,
+        closed_retention=closed_retention,
     )
     return provider
 
@@ -2331,6 +2640,57 @@ def test_a_run_served_after_the_restored_checkpoint_is_never_answered_not_admitt
     asyncio.run(scenario())
 
 
+class Undispatched(Work):
+    """Admitted, then held before the host dispatches anything to its backend."""
+
+    async def execute(self, request, context, reports, stop):
+        self.calls.append(context)
+        self.started.set()
+        await self.release.wait()
+        if False:
+            yield b""
+
+
+def test_a_restored_never_metered_run_cancelled_at_zero_lets_its_session_reattach():
+    """After a crash between admission and dispatch, an admitted run with no meter
+    and no final is restored unresolved and refuses every reattachment. A host
+    whose records prove nothing reached its backend reports it CANCELLED at zero;
+    the session then reattaches with that definitive outcome."""
+    rid = b"\x02" * 32
+
+    async def scenario():
+        async with serving(work=Undispatched()) as peer:
+            await peer.attach(voucher=1010)
+            call = peer.chat.Completions(peer.request(rid))
+            await asyncio.wait_for(peer.work.started.wait(), 1)
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            (run,) = evidence.runs
+            assert run.admitted and run.accounting.final_status is None and run.meter_seq == 0
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(evidence)
+                assert restored._sessions[SID].runs[rid].unresolved
+                _, attaching = reconnect(restored, [rid])
+                with pytest.raises(_RpcFailure) as refused:
+                    await attaching
+                assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+                await restored.runs.report_terminal(
+                    run.context, TokenCounts(0, 0, 0), RunStatus.CANCELLED
+                )
+                candidate, attaching = reconnect(restored, [rid])
+                await attaching
+                row = await answered(candidate, rid)
+                assert row.status == pb.RUN_STATUS_CANCELLED
+                assert (row.input_tokens, row.cache_tokens, row.output_tokens) == (0, 0, 0)
+                assert (await restored.sessions.get(SID)).usage_amount == 0
+            finally:
+                call.cancel()
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -2391,6 +2751,247 @@ def test_recovery_rejects_incomplete_or_contradictory_evidence_atomically(change
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("change", "check"),
+    [
+        ("drop_voucher", "admitted usage has no accepted voucher"),
+        ("confirm_units", "confirmed units have no covered baseline"),
+        ("drop_final", "a finished run has no final state"),
+        ("current_catalog", "the evidence lacks the current catalog"),
+        ("wallet", "the wallet could not look up a saved transaction (TimeoutError)"),
+        # Its catalog's lookup raised a bare KeyError, as Rust's does not.
+        ("model_rates", "a run's model has no rates in its catalog"),
+    ],
+)
+def test_each_refusal_for_unavailable_evidence_names_its_check(change, check):
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            if change == "wallet":
+                await peer.provider.sessions.settle(SID)
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            if change == "drop_voucher":
+                evidence.snapshot.ClearField("accepted_voucher")
+            elif change == "confirm_units":
+                evidence = replace(evidence, confirmed_units=1)
+            elif change == "drop_final":
+                del evidence.snapshot.run_states[:]
+            elif change == "current_catalog":
+                evidence.snapshot.current_rate_card_hash = bytes(32)
+            elif change == "model_rates":
+                run = evidence.runs[0]
+                context = replace(run.context, model="example/unpriced")
+                signature = SIGNER.sign_run(DOMAIN, context)
+                run = replace(run, context=context, signature=signature)
+                evidence = replace(evidence, runs=(run,))
+            restored = replacement(peer)
+            lookup = peer.wallet.reconcile
+            if change == "wallet":
+
+                def unavailable(*, operation_ref):
+                    raise TimeoutError
+
+                peer.wallet.reconcile = unavailable
+            await restored.start()
+            try:
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.recover(evidence)
+                assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+                assert str(refused.value) == f"SESSION_NOT_READY: {check}"
+            finally:
+                peer.wallet.reconcile = lookup
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("change", "check"),
+    [
+        ("run", "a run's acceptance signature is invalid"),
+        ("voucher", "the accepted voucher's signature is invalid"),
+    ],
+)
+def test_an_invalid_signature_in_recovery_keeps_its_error_and_names_its_check(change, check):
+    """An invalid run or voucher signature in recovery evidence raised a
+    ValidationError(INVALID_VALUE) with the signing module's own text, which
+    shipped. It keeps that type and code, and its message names the check as
+    Rust's INCONSISTENT_STATE refusal does."""
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            if change == "run":
+                evidence = replace(evidence, runs=(replace(evidence.runs[0], signature=bytes(65)),))
+            else:
+                voucher = evidence.snapshot.accepted_voucher
+                voucher.signature = SIGNER.sign_voucher(DOMAIN, SID, voucher.cumulative + 1)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                with pytest.raises(ValidationError) as refused:
+                    await restored.sessions.recover(evidence)
+                assert refused.value.code is ValidationCode.INVALID_VALUE
+                assert str(refused.value) == f"SESSION_NOT_READY: {check}"
+                assert check in RUST_INCONSISTENT_CHECKS
+                assert SID not in restored._sessions
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_each_checkpoint_refusal_names_its_check():
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.checkpoint(SID)
+                assert str(refused.value) == "SESSION_NOT_READY: the session is not held"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+            preparing = waiting(peer, SID, 9, 50000)
+            await settle()
+            with pytest.raises(_RpcFailure) as refused:
+                await peer.provider.sessions.checkpoint(SID)
+            assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+            assert str(refused.value) == "SESSION_NOT_READY: a run is still preparing"
+            preparing.cancel()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("change", "check"),
+    [
+        # A check of several conditions has one label.
+        ("close_state", "the descriptor is not this provider's, or the close state is malformed"),
+        # Only this runtime refuses it as inconsistent state.
+        ("unattached", "an unattached checkpoint has private accounting history"),
+        ("meter_seq", "a run's context, admission or meter sequence contradicts the evidence"),
+        ("usage", "the priced usage differs from the runs' totals"),
+        ("final", "a final state differs from its run"),
+        ("confirmed_units", "the confirmed units exceed the session's units"),
+    ],
+)
+def test_each_refusal_for_inconsistent_evidence_names_its_check(change, check):
+    async def scenario():
+        async with serving() as peer:
+            if change == "unattached":
+                evidence = replace(await unused_checkpoint(peer), confirmed_units=1)
+            else:
+                await peer.attach(voucher=1010)
+                await peer.complete()
+                evidence = await peer.provider.sessions.checkpoint(SID)
+            if change == "close_state":
+                evidence.snapshot.close_pending = True
+            elif change == "meter_seq":
+                run = replace(evidence.runs[0], meter_seq=evidence.snapshot.meter_seq + 1)
+                evidence = replace(evidence, runs=(run,))
+            elif change == "usage":
+                evidence.snapshot.usage_by_price[0].output_tokens += 1
+            elif change == "final":
+                evidence.snapshot.run_states[0].status = pb.RUN_STATUS_FAILED
+            elif change == "confirmed_units":
+                evidence = replace(evidence, confirmed_units=10**6)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.recover(evidence)
+                assert refused.value.payment.reason == "INCONSISTENT_STATE"
+                assert str(refused.value) == f"SESSION_NOT_READY: {check}"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+# Every check an INCONSISTENT_STATE recovery refusal names, in both runtimes,
+# and those only one of them has.
+SHARED_INCONSISTENT_CHECKS = (
+    "a saved operation does not collect this session or misstates its units",
+    "the wallet's record of a saved transaction differs from the evidence",
+    "the chain's record of a saved transaction differs from the evidence",
+    "the descriptor is not this provider's, or the close state is malformed",
+    "a catalog does not match its hash or repeats",
+    "the opening transaction shows another descriptor",
+    "the checkpoint block contradicts the chain or the opening",
+    "the session's chain state at the checkpoint block differs from the evidence",
+    "the current catalog differs from the provider's at the checkpoint block",
+    "a publication names no catalog of the evidence or repeats",
+    "a catalog's publication differs from the chain",
+    "a run's context, admission or meter sequence contradicts the evidence",
+    "an admitted run's accounting contradicts its coverage or meter sequence",
+    "a run that was not admitted has accounting",
+    "the session's meter sequence is not its runs' last",
+    "the reservations differ from the active runs",
+    "a priced usage row differs from its run",
+    "the priced usage differs from the runs' totals",
+    "an unfinished run has a final state",
+    "a run that was not admitted has another final status",
+    "a final state differs from its run",
+    "a final state names no run of the evidence",
+    "the accepted voucher does not cover the usage or exceeds the deposit",
+    "the usage is below the settled amount",
+    "a saved operation exceeds the session's usage or names another descriptor",
+    "a saved close does not match the session's close intent",
+    "the confirmed units exceed the session's units",
+    "the evidence is older than the held session or contradicts it",
+    "a run differs from the held session's",
+    "the chain follower's view contradicts the evidence",
+    "another held session holds this reference for a different operation",
+)
+PYTHON_INCONSISTENT_CHECKS = (
+    "an unattached checkpoint has private accounting history",
+    "the checkpoint block is no longer canonical",
+)
+RUST_INCONSISTENT_CHECKS = (
+    "two blocks read at one height differ",
+    "a run's acceptance signature is invalid",
+    "a run's accounting overflows",
+    "the priced usage overflows",
+    "the accepted voucher's signature is invalid",
+)
+
+
+def test_every_inconsistent_state_refusal_in_recovery_names_a_listed_check():
+    listed = SHARED_INCONSISTENT_CHECKS + PYTHON_INCONSISTENT_CHECKS
+    assert len(set(listed + RUST_INCONSISTENT_CHECKS)) == len(listed + RUST_INCONSISTENT_CHECKS)
+    tree = ast.parse(Path(runtime.__file__).read_text())
+    [sessions] = [node for node in tree.body if getattr(node, "name", None) == "_Sessions"]
+    recovery = [
+        node
+        for node in sessions.body
+        if getattr(node, "name", None) in ("_restore_operation", "_restore", "_recover")
+    ]
+    assert len(recovery) == 3
+    named = set()
+    for node in (node for function in recovery for node in ast.walk(function)):
+        # Only the helper builds the refusal.
+        built = isinstance(node, ast.Constant) and node.value == "INCONSISTENT_STATE"
+        assert not built, "a refusal built without the helper"
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_inconsistent":
+            # Each names its check with a literal from the list.
+            [_, label] = node.args
+            assert isinstance(label, ast.Constant) and label.value in listed, ast.unparse(node)
+            named.add(label.value)
+    assert named == set(listed), "a listed check is never named"
+    # The Rust runtime names the shared checks and its own, and its test checks
+    # that each of its calls names one literal.
+    source = Path(__file__).resolve().parents[2] / "rust" / "src" / "runtime" / "recovery.rs"
+    rust = re.findall(
+        r'(?<![\w.])inconsistent\(\s*sid\s*,\s*"([^"\\]*)"\s*,?\s*\)', source.read_text()
+    )
+    assert set(rust) == set(SHARED_INCONSISTENT_CHECKS + RUST_INCONSISTENT_CHECKS)
+
+
 def test_recovery_cannot_replace_live_owner():
     async def scenario():
         async with serving() as peer:
@@ -2402,6 +3003,161 @@ def test_recovery_cannot_replace_live_owner():
                 await peer.provider.sessions.recover(evidence)
             assert failure.value.payment.reason == "CONTROL_NOT_READY"
             assert peer.provider._sessions[SID].owner is owner
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("refusal", ("refresh", "install"))
+def test_a_refused_recovery_releases_the_watch_it_took(refusal):
+    """Like Rust's PendingWatch: the last recovery or opening of a session it
+    does not install releases that session's watch."""
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                # Nothing in the restored process watches the session yet.
+                peer.facts.watched = False
+                watch = peer.facts.watch_session
+
+                async def refused(sid):
+                    state = await watch(sid)
+                    if refusal == "refresh":
+                        # As ChainFollower.watch_session: the watch is added,
+                        # then the refresh fails.
+                        raise ChainEvidenceError("refresh failed")
+                    # The follower now shows less deposit than the evidence.
+                    peer.facts.state = replace(peer.facts.state, deposit=1)
+                    return state
+
+                peer.facts.watch_session = refused
+                with pytest.raises((ChainEvidenceError, _RpcFailure)):
+                    await restored.sessions.recover(evidence)
+                assert SID not in restored._sessions
+                assert not restored.sessions._watching
+                assert not peer.facts.watched, "a refused recovery left its watch behind"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_an_opening_keeps_its_watch_while_a_recovery_of_that_session_is_refused():
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                peer.facts.watched = False
+                watch, entered, release = peer.facts.watch_session, asyncio.Event(), asyncio.Event()
+
+                async def held(sid):
+                    state = await watch(sid)
+                    entered.set()
+                    await release.wait()
+                    return state
+
+                peer.facts.watch_session = held
+                attachment = runtime._Attachment(runtime.ByteQueue())
+                opening = asyncio.create_task(
+                    restored._opening(attachment, pb.SessionOpen(session_id=SID, open_tx=OPEN_TX))
+                )
+                await entered.wait()
+                peer.facts.watch_session = watch
+                # A recovery of the same session, refused while the opening reads.
+                observation = replace(evidence.observation, block_hash=bytes(32))
+                with pytest.raises((_RpcFailure, ValidationError)):
+                    await restored.sessions.recover(replace(evidence, observation=observation))
+                release.set()
+                await opening
+                assert SID in restored._sessions
+                assert peer.facts.watched, "the installed opening lost its watch"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_sessions_recover_concurrently_reading_before_any_runtime_lock(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            evidence = []
+            for n in (1, 2):
+                sid, _ = await opened(peer, n)
+                evidence.append(await peer.provider.sessions.checkpoint(sid))
+            restored = replacement(peer)
+            # Each recovery's first read waits for the other's: only reads that
+            # overlap get past it.
+            meeting = threading.Barrier(2, timeout=2)
+            opening = peer.facts.reader.opening
+
+            def together(tx, sid, **kwargs):
+                meeting.wait()
+                return opening(tx, sid, **kwargs)
+
+            peer.facts.reader.opening = together
+            await restored.start()
+            try:
+                await asyncio.gather(*(restored.sessions.recover(item) for item in evidence))
+                assert set(restored._sessions) == {item.snapshot.session_id for item in evidence}
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_a_collection_proceeds_while_a_recovery_reads_and_its_intent_still_refuses_it():
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+
+            def pending(prepared, *, operation_ref, tx_hash, wallet_operation_id=None):
+                return OperationResult(
+                    operation_ref, OperationState.PENDING, wallet_operation_id, tx_hash
+                )
+
+            peer.facts.reader.reconcile = pending
+            # The session's Control has ended, so recovery may replace it.
+            async with peer.provider._lock:
+                peer.provider._detach(peer.provider._sessions[SID].owner)
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restore_reader(peer.facts)
+            entered, release = threading.Event(), threading.Event()
+            opening = peer.facts.reader.opening
+
+            def held(tx, sid, **kwargs):
+                entered.set()
+                release.wait(5)
+                return opening(tx, sid, **kwargs)
+
+            peer.facts.reader.opening = held
+            recovery = asyncio.create_task(peer.provider.sessions.recover(evidence))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                # While the recovery reads, a collection leaves the session a
+                # capture whose outcome is still unknown.
+                async with asyncio.timeout(1):
+                    collected = await peer.provider.sessions.settle(SID)
+                assert collected.state is OperationState.PENDING
+            finally:
+                release.set()
+            with pytest.raises(_RpcFailure) as refused:
+                await recovery
+            assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+            assert str(refused.value) == (
+                "SESSION_NOT_READY: the evidence lacks the held session's unresolved or"
+                " close operation"
+            )
+            retained = peer.provider._sessions[SID].operation
+            assert retained is not None and retained.reference == collected.operation_ref
+            assert len(peer.wallet.calls) == 1
 
     asyncio.run(scenario())
 
@@ -2615,18 +3371,23 @@ def test_recovery_accepts_wallet_bound_canonical_revert(saved_wallet_id):
     asyncio.run(scenario())
 
 
-def test_closed_recovery_returns_original_cooperative_close_result():
+def test_a_completed_cooperative_close_is_final_evidence_never_recovered():
     async def scenario():
         async with serving() as peer:
             await peer.attach(voucher=1010)
             _ = [chunk async for chunk in peer.chat.Completions(peer.request())]
             first = await peer.provider.sessions.close(SID)
             evidence = await peer.provider.sessions.checkpoint(SID)
+            assert evidence.is_final()
             restored = replacement(peer)
             await restored.start()
             try:
-                await restored.sessions.recover(evidence)
-                assert await restored.sessions.close(SID) == first
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.recover(evidence)
+                assert refused.value.payment.reason == "SESSION_CLOSED"
+                assert not restored._sessions
+                # Within its retention window the live runtime still returns it.
+                assert await peer.provider.sessions.close(SID) == first
                 assert len(peer.wallet.calls) == 1
             finally:
                 await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
@@ -2642,25 +3403,21 @@ def test_closed_recovery_cannot_forget_a_retained_cooperative_close_operation(re
             await peer.complete()
             first = await peer.provider.sessions.close(SID)
             evidence = await peer.provider.sessions.checkpoint(SID)
-            restored = replacement(peer)
-            await restored.start()
-            try:
-                await restored.sessions.recover(evidence)
-                previous = restored._sessions[SID]
-                assert previous.close_result is not None
-                assert previous.operation.result == first
-                missing = replace(
-                    evidence,
-                    operation=None,
-                    baseline=evidence.operation if retain_result else evidence.baseline,
-                )
+            restore_reader(peer.facts)
+            previous = peer.provider._sessions[SID]
+            assert previous.close_result is not None
+            assert previous.operation.result == first
+            missing = replace(
+                evidence,
+                operation=None,
+                baseline=evidence.operation if retain_result else evidence.baseline,
+            )
+            for candidate in (evidence, missing):
                 with pytest.raises(_RpcFailure):
-                    await restored.sessions.recover(missing)
-                assert restored._sessions[SID] is previous
-                assert await restored.sessions.close(SID) == first
-                assert len(peer.wallet.calls) == 1
-            finally:
-                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+                    await peer.provider.sessions.recover(candidate)
+                assert peer.provider._sessions[SID] is previous
+            assert await peer.provider.sessions.close(SID) == first
+            assert len(peer.wallet.calls) == 1
 
     asyncio.run(scenario())
 
@@ -2944,6 +3701,118 @@ def test_automatic_batch_splits_rejected_simulation_and_collects_eligible_sessio
     asyncio.run(scenario())
 
 
+def test_collection_calldata_is_as_the_batch_bound_assumes():
+    calls = ContractCalls(DOMAIN, "USDC", "2")
+    signature = SIGNER.sign_voucher(DOMAIN, SID, 2**64 - 1)
+    top = 2**64 - 1
+    assert len(calls.settle(DESCRIPTOR, top, top, signature).call.data) == 452
+    assert len(calls.close(DESCRIPTOR, top, top, signature).call.data) == 452
+    for n in (0, 1, 2, 136, 137):
+        items = [
+            (replace(DESCRIPTOR, salt=i.to_bytes(32, "big")), top, top, signature) for i in range(n)
+        ]
+        assert len(calls.settle_batch(items).call.data) == 260 + 448 * n
+    assert runtime._batch_sessions(61440) == 136
+    assert runtime._batch_sessions(runtime._SETTLE_CALL_BYTES) == 1
+
+
+class BoundedWallet(Wallet):
+    """States its own call bound: three sessions' batch is 1,604 bytes."""
+
+    max_call_bytes = 1604
+
+
+async def due_batch(peer, count):
+    """``count`` sessions, each authorizing a capture of zero, collected as
+    maintenance collects every due session; their collection calls by
+    reference, in order."""
+    provider = peer.provider
+    peer.facts.reader.simulate = lambda prepared, *, sender: None
+    sids = [(await opened(peer, n))[0] for n in range(1, count + 1)]
+    for sid in sids:
+        provider._sessions[sid].voucher = pb.Voucher(
+            session_id=sid, cumulative=0, signature=SIGNER.sign_voucher(DOMAIN, sid, 0)
+        )
+    provider._schedule_batch_collection(tuple(sids))
+    for _ in range(500):
+        if not provider._collecting:
+            break
+        await asyncio.sleep(0.01)
+    assert not provider._collecting
+    covered = {}
+    for sid in sids:
+        covered.setdefault(provider._sessions[sid].operation.reference, []).append(sid)
+    references = [reference for _, reference in peer.wallet.calls]
+    assert references == list(covered), "a due session was not collected"
+    return sids, peer.wallet.calls, [covered[reference] for reference in references]
+
+
+def test_maintenance_batches_fit_the_wallets_call_bound_and_collect_every_due_session(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            sids, calls, groups = await due_batch(peer, 140)
+            assert all(len(call.data) <= 61440 for call, _ in calls)
+            assert [len(group) for group in groups] == [136, 4]
+            assert sorted(sum(groups, [])) == sorted(sids)
+
+    asyncio.run(scenario())
+
+
+def test_a_wallet_stating_a_smaller_call_bound_gets_batches_split_to_fit_it(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch, wallet=BoundedWallet()) as peer:
+            sids, calls, groups = await due_batch(peer, 5)
+            assert all(len(call.data) <= 1604 for call, _ in calls)
+            assert [len(group) for group in groups] == [3, 2]
+            assert sorted(sum(groups, [])) == sorted(sids)
+
+    asyncio.run(scenario())
+
+
+def test_a_batch_over_the_wallets_call_bound_is_refused_before_any_intent():
+    """Circle refused calldata over 60 KiB after the runtime recorded the batch,
+    which then stranded every member."""
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            other, _ = second_session(peer)
+            with pytest.raises(ValidationError):
+                await peer.provider.sessions.settleBatch((SID,) * 68 + (other,) * 69)
+            assert not peer.wallet.calls
+            assert peer.provider._sessions[SID].operation is None
+            assert peer.provider._sessions[other].operation is None
+            assert (await peer.provider.sessions.settle(SID)).state is OperationState.CONFIRMED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("bound", "accepted"), ((0, False), (451, False), (True, False), (452.0, False), (452, True))
+)
+def test_a_call_bound_below_one_settlement_is_refused_at_construction(bound, accepted):
+    cfg = config()
+    wallet = Wallet()
+    wallet.max_call_bytes = bound
+
+    def construct():
+        return Mppi(
+            cfg,
+            chain=Facts(cfg),
+            contract=ContractCalls(DOMAIN, "USDC", "2"),
+            wallet=wallet,
+            coverage=Work().coverage,
+            execution=Work().execute,
+        )
+
+    if accepted:
+        assert construct()._max_call_bytes == bound
+    else:
+        with pytest.raises(ValidationError):
+            construct()
+
+
 def test_confirmed_close_remains_observable_when_contract_later_pauses():
     async def scenario():
         async with serving() as peer:
@@ -3129,6 +3998,65 @@ def test_cancelled_collection_distinguishes_pre_submit_from_uncertain_execution(
                     assert len(peer.wallet.calls) == 1
             finally:
                 release.set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("batch", (False, True))
+def test_a_collection_cancelled_before_its_wallet_call_began_leaves_no_intent(batch):
+    """Its wallet call waits for a worker thread (a busy default executor, as
+    during many recoveries) when the caller is cancelled: the call never runs,
+    so no intent stays to be reconciled for good."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+            busy, blockers = threading.Event(), []
+
+            def occupy():
+                blockers.append(loop.run_in_executor(None, busy.wait, 5))
+
+            if batch:
+                # A batch first simulates in the thread; the thread is taken
+                # again before its wallet call is queued.
+                peer.facts.reader.simulate = lambda prepared, *, sender: loop.call_soon_threadsafe(
+                    occupy
+                )
+            else:
+                occupy()
+            sessions = peer.provider.sessions
+            task = asyncio.create_task(sessions.settleBatch(()) if batch else sessions.settle(SID))
+
+            def retained():
+                if batch:
+                    return sessions._empty_batch
+                return peer.provider._sessions[SID].operation
+
+            for _ in range(200):
+                if retained() is not None:
+                    break
+                await asyncio.sleep(0.005)
+            assert retained() is not None
+            await asyncio.sleep(0.05)  # Its wallet call now waits for the thread.
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            busy.set()
+            await asyncio.gather(*blockers)
+            await asyncio.sleep(0.05)
+            assert not peer.wallet.calls, "the wallet was asked after its caller was cancelled"
+            assert retained() is None, "an intent the wallet never saw stays to reconcile"
+            # A journal with no record answers UNKNOWN, as Circle's does.
+            peer.wallet.reconcile = lambda *, operation_ref: OperationResult(
+                operation_ref, OperationState.UNKNOWN
+            )
+            peer.facts.reader.simulate = lambda prepared, *, sender: None
+            await (sessions.settleBatch(()) if batch else sessions.settle(SID))
+            assert len(peer.wallet.calls) == 1
 
     asyncio.run(scenario())
 
@@ -3528,5 +4456,1888 @@ def test_lifecycle_hooks_observe_committed_payment_flow_without_mutating_state()
             closed = next(value for name, value in records if name == "close")
             assert closed.capture_amount == 20
             assert peer.provider.hook_stats.failed == 0
+
+    asyncio.run(scenario())
+
+
+# Closed sessions retire instead of counting against a limit. A closed session
+# is terminal on chain (MPPI.sol ``_existingSession``), so one with nothing left
+# to serve, collect or reconcile retires after its retention window and is
+# never reinstalled.
+
+DAY = 86400.0
+
+
+class ManyFacts(Facts):
+    """Facts for any number of sessions; ``state`` remains the first one's."""
+
+    def __init__(self, config, **kwargs):
+        self.states, self.descriptors, self.watching = {}, {}, set()
+        super().__init__(config, **kwargs)
+
+    state = property(
+        lambda self: self.states[SID], lambda self, value: self.states.__setitem__(SID, value)
+    )
+    watched = property(
+        lambda self: SID in self.watching,
+        lambda self, value: self.watching.add(SID) if value else self.watching.discard(SID),
+    )
+
+    def session(self, n):
+        """Session ``n`` funded like the first one, and its opening transaction."""
+        descriptor = replace(DESCRIPTOR, salt=n.to_bytes(32, "big"))
+        sid = session_id(DOMAIN, descriptor)
+        self.descriptors[sid] = descriptor
+        self.states[sid] = self.states[SID]
+        return sid, b"\x77" + n.to_bytes(31, "big")
+
+    def close(self, sid, requested_at=0):
+        """Closed by the provider's close or an idle release; a withdrawal
+        follows an earlier close request."""
+        self.states[sid] = replace(
+            self.states[sid], status=SessionStatus.CLOSED, close_requested_at=requested_at
+        )
+
+    @property
+    def current(self):
+        return ChainSnapshot(
+            self.block(self.height),
+            self.pause,
+            {42: self.identity},
+            {sid: self.states[sid] for sid in self.watching},
+            time.monotonic(),
+        )
+
+    async def watch_session(self, sid):
+        self.watching.add(sid)
+        self.height = max(self.height, 101)
+        return self.states[sid]
+
+    def unwatch_session(self, sid):
+        self.watching.discard(sid)
+
+    def readiness(self, sid=None):
+        if sid is None or sid == SID or sid not in self.states:
+            return super().readiness(sid)
+        if self.states[sid].status is SessionStatus.CLOSED:
+            failure = PaymentFailure(PaymentCode.SESSION_NOT_READY, "SESSION_CLOSED", sid)
+            return Readiness(False, (failure,))
+        return Readiness(True)
+
+    def opening(self, tx, sid, *, accepted_catalog=None):
+        if sid == SID:
+            return super().opening(tx, sid, accepted_catalog=accepted_catalog)
+        assert tx[:1] == b"\x77" and sid in self.descriptors
+        return OpeningEvidence(
+            self.descriptors[sid],
+            self.block(self.opening_block).observation,
+            self.states[sid].deposit,
+            self.config.catalog,
+            tx,
+        )
+
+
+@asynccontextmanager
+async def many(monkeypatch, **kwargs):
+    """A served provider over ManyFacts whose retention clock the test moves."""
+    clock = SimpleNamespace(now=float(int(time.monotonic())))  # Whole seconds add exactly.
+    # The runtime's wall clock, for the times it gives the wallet's retire,
+    # moves with it.
+    monkeypatch.setattr(
+        runtime, "time", SimpleNamespace(monotonic=lambda: clock.now, time=lambda: clock.now)
+    )
+    async with serving(chain=ManyFacts, **kwargs) as peer:
+        peer.clock, peer.passes = clock, 0
+        retire = peer.provider._retire
+
+        def counted():
+            retire()
+            peer.passes += 1
+
+        peer.provider._retire = counted
+        yield peer
+
+
+def unavailable(*_):
+    raise ChainEvidenceError("closing evidence unavailable")
+
+
+async def passes(peer):
+    """Two complete maintenance passes, whatever the machine's speed."""
+    target = peer.passes + 2
+    for _ in range(500):
+        if peer.passes >= target:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("maintenance stopped")
+
+
+async def owned(peer, n):
+    """Session ``n`` opened and authenticated on its own Control stream."""
+    sid, tx = peer.facts.session(n)
+    attachment = runtime._Attachment(runtime.ByteQueue())
+    await peer.provider._opening(attachment, pb.SessionOpen(session_id=sid, open_tx=tx))
+    await reattach(peer, sid, attachment)
+    return sid, tx, attachment
+
+
+async def reattach(peer, sid, attachment):
+    request = pb.ReconnectRequest(
+        session_id=sid,
+        nonce=attachment.nonce,
+        signature=SIGNER.sign_reconnect(DOMAIN, sid, attachment.nonce),
+        last_meter_seq=0,
+    )
+    await peer.provider._attach(attachment, request)
+
+
+async def opened(peer, n):
+    """Session ``n`` opened and authenticated on its own Control stream, which
+    then ends, as an agent's does when it is done."""
+    sid, tx, attachment = await owned(peer, n)
+    peer.provider._detach(attachment)
+    return sid, tx
+
+
+def test_closed_sessions_retire_so_openings_never_stop_at_a_session_count(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            sids = []
+            # A hundred more than the 1,024 sessions the Rust runtime once held.
+            for n in range(1, 1125):
+                sid, _ = await opened(peer, n)
+                peer.facts.close(sid)
+                sids.append(sid)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert len(set(sids)) == 1124 and not peer.provider._sessions
+            assert not peer.facts.watching, "retired sessions stay watched"
+
+    asyncio.run(scenario())
+
+
+def test_a_resent_opening_for_a_closed_session_is_refused_and_never_reinstalled(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            sid, tx = await opened(peer, 1)
+            peer.facts.close(sid)
+            # As after its retirement: this process no longer holds the session.
+            del peer.provider._sessions[sid]
+            attachment = runtime._Attachment(runtime.ByteQueue())
+            with pytest.raises(_RpcFailure) as refused:
+                await peer.provider._opening(attachment, pb.SessionOpen(session_id=sid, open_tx=tx))
+            assert refused.value.payment.reason == "SESSION_CLOSED"
+            assert sid not in peer.provider._sessions
+            assert sid not in peer.facts.watching
+            # A reattachment naming a run served before then gets no snapshot
+            # at all, so never NOT_ADMITTED for it.
+            request = pb.ReconnectRequest(
+                session_id=sid,
+                nonce=attachment.nonce,
+                signature=SIGNER.sign_reconnect(DOMAIN, sid, attachment.nonce),
+                last_meter_seq=0,
+                pending_run_ids=[b"\x09" * 32],
+            )
+            with pytest.raises(_RpcFailure) as refused:
+                await peer.provider._attach(attachment, request)
+            assert refused.value.payment.reason == "STATE_UNAVAILABLE"
+            assert not attachment.queue._items
+
+    asyncio.run(scenario())
+
+
+def test_an_opening_refused_for_a_bound_control_releases_the_watch_it_took(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            first, _, attachment = await owned(peer, 1)
+            second, tx = peer.facts.session(2)
+            with pytest.raises(_RpcFailure) as refused:
+                await peer.provider._opening(
+                    attachment, pb.SessionOpen(session_id=second, open_tx=tx)
+                )
+            assert refused.value.reason == "Control already bound to a session"
+            assert second not in peer.provider._sessions
+            assert not peer.provider.sessions._watching
+            assert peer.facts.watching == {first}, "a refused opening left its watch behind"
+
+    asyncio.run(scenario())
+
+
+def test_an_agent_reattaching_to_a_retired_session_is_told_it_closed(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            sid, tx = await opened(peer, 1)
+            peer.facts.close(sid)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert sid not in peer.provider._sessions
+            # The agent's reattachment: SessionOpen, then a signed ReconnectRequest.
+            control = stubs.ControlStub(peer.channel).Session()
+            try:
+                nonce = (await asyncio.wait_for(control.read(), 1)).reconnect_challenge.nonce
+                await control.write(
+                    pb.ControlMessage(session_open=pb.SessionOpen(session_id=sid, open_tx=tx))
+                )
+                await control.write(
+                    pb.ControlMessage(
+                        reconnect_request=pb.ReconnectRequest(
+                            session_id=sid,
+                            nonce=nonce,
+                            signature=SIGNER.sign_reconnect(DOMAIN, sid, nonce),
+                            last_meter_seq=3,
+                        )
+                    )
+                )
+                with pytest.raises(grpc.aio.AioRpcError) as ended:
+                    await asyncio.wait_for(control.read(), 1)
+            finally:
+                control.cancel()
+            failure = parse_payment_error(ended.value.code(), ended.value.trailing_metadata())
+            assert failure.code is PaymentCode.SESSION_NOT_READY
+            assert failure.reason == "SESSION_CLOSED" and failure.session_id == sid
+            assert sid not in peer.provider._sessions
+
+    asyncio.run(scenario())
+
+
+def test_a_closed_session_is_retained_for_its_window_and_while_anything_remains(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            provider = peer.provider
+            # Within its window an agent can still read it, and the host can
+            # still take its final checkpoint.
+            sid, _ = await opened(peer, 1)
+            peer.facts.close(sid)
+            await passes(peer)
+            peer.clock.now += DAY - 1
+            await passes(peer)
+            assert sid in provider._sessions
+            await provider.sessions.checkpoint(sid)
+            peer.clock.now += 1
+            await passes(peer)
+            assert sid not in provider._sessions, "a final session outlived its window"
+            for read in (provider.sessions.get, provider.sessions.checkpoint):
+                with pytest.raises(_RpcFailure) as missing:
+                    await read(sid)
+                assert missing.value.payment.reason == "STATE_UNAVAILABLE"
+
+            observation = peer.facts.block(101).observation
+
+            def operation(sid, kind, state):
+                descriptor = provider._sessions[sid].opening.descriptor
+                signature = SIGNER.sign_voucher(DOMAIN, sid, 1)
+                prepared = (
+                    provider.contract.close(descriptor, 1, 1, signature)
+                    if kind == "close"
+                    else provider.contract.settle(descriptor, 1, 1, signature)
+                )
+                confirmed = state is OperationState.CONFIRMED
+                reference = kind + ":retire"
+                return runtime._PendingOperation(
+                    prepared,
+                    reference,
+                    OperationResult(
+                        reference,
+                        state,
+                        None,
+                        b"\xcc" * 32 if confirmed else None,
+                        observation if confirmed else None,
+                    ),
+                    {sid: 0},
+                )
+
+            def closing(session, state):
+                session.close_pending, session.close_reference = True, "close:retire"
+                session.operation = operation(session.sid, "close", state)
+
+            def result(session):
+                session.close_result = pb.CloseResult(
+                    session_id=session.sid, tx_hash=b"\xcc" * 32, capture_amount=1, refunded=99
+                )
+
+            cases = (
+                (
+                    "an unresolved operation",
+                    lambda s: setattr(
+                        s, "operation", operation(s.sid, "settle", OperationState.PENDING)
+                    ),
+                    lambda s: setattr(
+                        s, "operation", operation(s.sid, "settle", OperationState.FAILED)
+                    ),
+                ),
+                (
+                    "an unresolved baseline",
+                    lambda s: setattr(
+                        s, "baseline", operation(s.sid, "settle", OperationState.UNKNOWN)
+                    ),
+                    lambda s: setattr(s, "baseline", None),
+                ),
+                (
+                    "a close in progress",
+                    lambda s: closing(s, OperationState.PENDING),
+                    lambda s: setattr(
+                        s, "operation", operation(s.sid, "close", OperationState.FAILED)
+                    ),
+                ),
+                (
+                    "a confirmed close without its result",
+                    lambda s: closing(s, OperationState.CONFIRMED),
+                    result,
+                ),
+                (
+                    "the inconsistent flag",
+                    lambda s: setattr(s, "inconsistent", True),
+                    lambda s: setattr(s, "inconsistent", False),
+                ),
+            )
+            # Reconciliation reads nothing new while these are held.
+            peer.wallet.reconcile = lambda *, operation_ref: OperationResult(
+                operation_ref, OperationState.UNKNOWN
+            )
+            peer.facts.reader.closing = unavailable
+            for n, (blocker, hold, release) in enumerate(cases, start=2):
+                sid, _ = await opened(peer, n)
+                hold(provider._sessions[sid])
+                peer.facts.close(sid)
+                for _ in range(2):
+                    await passes(peer)
+                    peer.clock.now += DAY
+                await passes(peer)
+                assert sid in provider._sessions, f"retired with {blocker}"
+                release(provider._sessions[sid])
+                await passes(peer)
+                peer.clock.now += DAY
+                await passes(peer)
+                assert sid not in provider._sessions, f"kept after {blocker} ended"
+
+            # A live owner holds a final session past its window, until it detaches.
+            sid, tx = await opened(peer, 9)
+            owner = runtime._Attachment(runtime.ByteQueue())
+            provider._sessions[sid].owner = owner
+            peer.facts.close(sid)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert sid in provider._sessions, "retired with a live owner"
+            provider._detach(owner)
+            await passes(peer)
+            assert sid not in provider._sessions, "kept after its owner detached"
+
+    asyncio.run(scenario())
+
+
+def test_an_active_run_keeps_a_closed_session_until_its_final(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch, work=Work(hold=True)) as peer:
+            await peer.attach(voucher=1010)
+            completion = asyncio.create_task(peer.complete())
+            await peer.work.started.wait()
+            peer.facts.close(SID)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert SID in peer.provider._sessions, "retired with an active run"
+            peer.work.release.set()
+            await completion
+            assert peer.provider._sessions[SID].runs[b"\x02" * 32].accounting.final_status
+            peer.provider._detach(peer.provider._sessions[SID].owner)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert SID not in peer.provider._sessions, "kept after its run ended"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exit", ("withdraw", "release_idle"))
+def test_a_pending_close_another_exit_completed_is_final_and_retires(monkeypatch, exit):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            provider = peer.provider
+            sid, _ = await opened(peer, 1)
+            session = provider._sessions[sid]
+            session.close_pending, session.close_reference = True, "close:retire"
+            if exit == "release_idle":
+                # Its own close reverted: the contract already held it closed.
+                prepared = provider.contract.close(session.opening.descriptor, 0, 0, b"")
+                session.operation = runtime._PendingOperation(
+                    prepared,
+                    "close:retire",
+                    OperationResult("close:retire", OperationState.FAILED),
+                    {sid: 0},
+                )
+            peer.facts.close(sid, requested_at=peer.facts.now - 3600 if exit == "withdraw" else 0)
+            closes = []
+            original = provider.sessions.close
+
+            async def counted(target):
+                closes.append(target)
+                return await original(target)
+
+            provider.sessions.close = counted
+            await passes(peer)
+            closes.clear()
+            await passes(peer)
+            assert sid not in closes, "a final close is retried"
+            peer.clock.now += DAY
+            await passes(peer)
+            assert sid not in provider._sessions, "a close another exit completed stays pending"
+
+    asyncio.run(scenario())
+
+
+def test_final_evidence_of_a_closed_session_is_refused_and_unfinished_evidence_recovers():
+    async def scenario():
+        async with serving(work=Work(final=False)) as peer:
+            await peer.attach(voucher=1010)
+            completion = asyncio.create_task(peer.complete())
+            await peer.work.started.wait()
+            peer.facts.state = replace(peer.facts.state, status=SessionStatus.CLOSED)
+            with pytest.raises(grpc.aio.AioRpcError):
+                await completion
+            run = peer.provider._sessions[SID].runs[b"\x02" * 32]
+            unfinished = await peer.provider.sessions.checkpoint(SID)
+            await peer.provider.report_terminal(
+                run.context, TokenCounts(10, 0, 10), RunStatus.CANCELLED
+            )
+            finished = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                for recover in (restored.sessions.recover, restored.sessions.recover_current):
+                    with pytest.raises(_RpcFailure) as refused:
+                        await recover(finished)
+                    assert refused.value.payment.reason == "SESSION_CLOSED"
+                assert not restored._sessions
+                # Its reservation is unresolved: recovered, then retired once it ends.
+                await restored.sessions.recover(unfinished)
+                assert restored._sessions[SID].runs[b"\x02" * 32].unresolved
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("saved", "recorded", "handed_over"),
+    (
+        (b"\xaa" * 32, b"\xaa" * 32, True),
+        (b"\xaa" * 32, b"\xdd" * 32, False),
+        (b"\xaa" * 32, None, False),
+        (None, b"\xaa" * 32, False),
+        (None, None, True),
+    ),
+    ids=(
+        "the record's transaction",
+        "another transaction",
+        "no transaction",
+        "a transaction the record lacks",
+        "no transaction on either side",
+    ),
+)
+def test_a_final_record_hands_over_only_references_the_wallet_binds_to_it(
+    saved, recorded, handed_over
+):
+    """A final record hands over only a reference the wallet's own record binds
+    to it: both name the same transaction, or neither names one. A mixed-up or
+    corrupt record could pair this session's call with another session's
+    reference, whose record would then be forgotten; and a wallet record with a
+    transaction the record lacks is traceable, so it stays for the wallet's
+    reconciliation. The wallet is asked about each; one not handed over is
+    kept, which is always safe."""
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            closed = await peer.provider.sessions.close(SID)
+            assert closed.state is OperationState.CONFIRMED
+            # This session's capture, under another session's reference.
+            reference = "settle:another-session"
+            capture = peer.provider.contract.settle(
+                DESCRIPTOR, 1, 1, SIGNER.sign_voucher(DOMAIN, SID, 1)
+            )
+            result = (
+                OperationResult(
+                    reference,
+                    OperationState.CONFIRMED,
+                    None,
+                    saved,
+                    peer.facts.block(100).observation,
+                )
+                if saved is not None
+                else OperationResult(reference, OperationState.FAILED)
+            )
+            final = replace(
+                await peer.provider.sessions.checkpoint(SID),
+                baseline=RecoveryOperation(capture, result, ((SID, 0),)),
+            )
+            assert final.is_final()
+
+            looked_up = []
+
+            def reconcile(*, operation_ref):
+                looked_up.append(operation_ref)
+                if operation_ref == closed.operation_ref:
+                    return Wallet.reconcile(peer.wallet, operation_ref=operation_ref)
+                if recorded is None:
+                    return OperationResult(operation_ref, OperationState.UNKNOWN)
+                return OperationResult(operation_ref, OperationState.PENDING, None, recorded)
+
+            peer.wallet.reconcile = reconcile
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.recover(final)
+                assert refused.value.payment.reason == "SESSION_CLOSED"
+                [(references, _)] = await handed(peer.wallet, 1)
+                expected = {closed.operation_ref} | ({reference} if handed_over else set())
+                assert set(references) == expected
+                assert reference in looked_up, "the wallet was not asked"
+                assert not restored._references
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+async def handed_over(provider):
+    """The retire call maintenance made for what was due, or the check that
+    kept it, has ended, and nothing more is waiting to go."""
+    for _ in range(300):
+        task = provider._retiring
+        if task is not None and task.done() and not provider._retirable:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("maintenance never handed the references over")
+
+
+@pytest.mark.parametrize(
+    ("recorded", "retired"),
+    ((b"\xcc" * 32, False), (None, True)),
+    ids=("a transaction the record lacks", "no transaction on either side"),
+)
+def test_a_reference_restored_without_a_wallet_lookup_is_retired_only_if_the_wallet_agrees(
+    recorded, retired
+):
+    """A record restored without a transaction hash, as a settlement that never
+    began is, was not looked up in the wallet at recovery, and no wallet answer
+    in this process has matched it since. Its hand-over takes recovery's wallet
+    check: a wallet record with a transaction the record lacks is traceable and
+    kept; one that agrees goes."""
+    from mppi_protocol.capabilities import NotSubmittedError
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            execute = peer.wallet.execute
+
+            def refuse(call, *, operation_ref):
+                raise NotSubmittedError("Circle was not asked to execute")
+
+            peer.wallet.execute = refuse
+            never_began = await peer.provider.sessions.settle(SID)
+            assert never_began.state is OperationState.FAILED and never_began.tx_hash is None
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            looked_up = []
+
+            def reconcile(*, operation_ref):
+                looked_up.append(operation_ref)
+                if operation_ref != never_began.operation_ref:
+                    return Wallet.reconcile(peer.wallet, operation_ref=operation_ref)
+                if recorded is None:
+                    return OperationResult(operation_ref, OperationState.UNKNOWN)
+                return OperationResult(operation_ref, OperationState.PENDING, None, recorded)
+
+            peer.wallet.reconcile = reconcile
+            peer.wallet.execute = execute
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(evidence)
+                assert never_began.operation_ref not in looked_up
+                # The next capture replaces it; its confirmation supersedes it.
+                replaced = await restored.sessions.settle(SID)
+                assert replaced.state is OperationState.CONFIRMED
+                assert replaced.operation_ref != never_began.operation_ref
+                await handed_over(restored)
+                references = {name for names, _ in peer.wallet.retired for name in names}
+                assert (never_began.operation_ref in references) is retired
+                assert never_began.operation_ref in looked_up, "the wallet was not asked"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("agrees", (False, True), ids=("still disagrees", "agrees again"))
+def test_a_reference_whose_last_wallet_answer_disagreed_is_retired_only_if_the_wallet_agrees(
+    agrees,
+):
+    """A capture whose wallet lookup lost its transaction hash is still confirmed
+    from the chain by the hash this process kept, so no wallet answer in this
+    process matches its record. Its hand-over takes recovery's wallet check: a
+    wallet that still cannot show that hash keeps the record; one whose record
+    agrees again lets it go."""
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            confirm = peer.facts.reader.reconcile
+
+            def pending(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+                return OperationResult(
+                    operation_ref, OperationState.PENDING, wallet_operation_id, tx_hash
+                )
+
+            peer.facts.reader.reconcile = pending
+            first = await peer.provider.sessions.settle(SID)
+            assert first.state is OperationState.PENDING and first.tx_hash is not None
+            # The wallet's lookup shows no hash; the chain confirms the one kept.
+            looked_up = []
+
+            def reconcile(*, operation_ref):
+                looked_up.append(operation_ref)
+                if agrees and len(looked_up) > 1:
+                    return Wallet.reconcile(peer.wallet, operation_ref=operation_ref)
+                return OperationResult(operation_ref, OperationState.UNKNOWN)
+
+            peer.wallet.reconcile = reconcile
+            peer.facts.reader.reconcile = confirm
+            confirmed = await peer.provider.sessions.settle(SID)
+            assert confirmed.state is OperationState.CONFIRMED
+            assert (confirmed.operation_ref, confirmed.tx_hash) == (
+                first.operation_ref,
+                first.tx_hash,
+            )
+            # A later capture supersedes it, and maintenance hands it over.
+            await peer.complete(peer.request(b"\x03" * 32))
+            later = await peer.provider.sessions.settle(SID)
+            assert later.state is OperationState.CONFIRMED
+            assert later.operation_ref != first.operation_ref
+            await handed_over(peer.provider)
+            references = {name for names, _ in peer.wallet.retired for name in names}
+            assert (first.operation_ref in references) is agrees
+            assert looked_up.count(first.operation_ref) == 2, "the wallet was not asked"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ("queued", "in flight"))
+def test_a_recovery_naming_a_reference_due_for_retire_keeps_it_from_retire(phase):
+    """A reference handed over for the wallet's retire, still queued (as a
+    refused call leaves it, for a settlement interval) or in a retire call
+    already under way, is not passed to retire once a recovery has installed a
+    session that names it again: the install takes it off the queue, and the
+    call checks again, just before each wallet call, that no session needs it."""
+
+    async def scenario():
+        wallet = Pausing()
+        async with serving(wallet=wallet) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            first = await peer.provider.sessions.settle(SID)
+            assert first.state is OperationState.CONFIRMED
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                due = time.time() + DAY
+                async with restored._lock:
+                    if phase == "queued":
+                        restored._retire_after = time.monotonic() + 3600
+                    else:
+                        # An earlier second's call is under way as the recovery
+                        # installs the session.
+                        wallet.pause = True
+                        restored._retirable.append(("settle:earlier", due - 10))
+                    restored._retirable.append((first.operation_ref, due))
+                if phase == "in flight":
+                    assert await asyncio.to_thread(wallet.entered.wait, 5)
+                await restored.sessions.recover(evidence)
+                assert first.operation_ref in restored._references
+                restored._retire_after = None
+                wallet.release.set()
+                for _ in range(300):
+                    task = restored._retiring
+                    if not restored._retirable and (task is None or task.done()):
+                        break
+                    await asyncio.sleep(0.01)
+                references = {name for names, _ in wallet.retired for name in names}
+                assert first.operation_ref not in references, (
+                    "a reference the installed session names was handed to retire"
+                )
+                assert ("settle:earlier" in references) is (phase == "in flight")
+            finally:
+                wallet.release.set()
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_adopting_a_held_record_keeps_its_wallet_check():
+    """A recovery whose record names a reference without a transaction hash
+    adopts the record object a held session holds for it ("A recovered batch
+    shares one retained operation object", the loop including the session being
+    replaced). The held record, kept against a wallet answer that disagreed
+    with it, keeps its pending wallet check (_unconfirmed): no wallet answer in
+    this process matched it, and the wallet is not asked here. Rust keeps it
+    too, refusing a recovery whose record does not preserve the held record's
+    identity (preserves_identity in check_replacement and against another held
+    session's record)."""
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            execute = peer.wallet.execute
+
+            def lost(call, *, operation_ref):
+                execute(call, operation_ref=operation_ref)
+                raise RuntimeError("the answer was lost")
+
+            peer.wallet.execute = lost
+            first = await peer.provider.sessions.settle(SID)
+            peer.wallet.execute = execute
+            assert first.state is OperationState.UNKNOWN and first.tx_hash is None
+            older = await peer.provider.sessions.checkpoint(SID)
+
+            def pending(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+                return OperationResult(
+                    operation_ref, OperationState.PENDING, wallet_operation_id, tx_hash
+                )
+
+            peer.facts.reader.reconcile = pending
+            reconciled = await peer.provider.sessions.settle(SID)
+            assert reconciled.operation_ref == first.operation_ref
+            assert reconciled.tx_hash is not None
+            current = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(current)
+                held = restored._sessions[SID].operation
+                assert held.reference == first.operation_ref and held.result.tx_hash
+                # As a wallet answer that disagreed with the held record leaves it.
+                restored._unconfirmed[first.operation_ref] = held.result
+                lookups = peer.wallet.lookups.count(first.operation_ref)
+                await restored.sessions.recover(older)
+                assert restored._sessions[SID].operation is held
+                assert peer.wallet.lookups.count(first.operation_ref) == lookups
+                assert restored._unconfirmed.get(first.operation_ref) == held.result, (
+                    "the wallet check was dropped with no wallet answer"
+                )
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_an_unresolved_capture_of_a_closed_session_is_reconciled_then_retires(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            provider = peer.provider
+            sid, _ = await opened(peer, 1)
+            session = provider._sessions[sid]
+            prepared = provider.contract.settle(
+                session.opening.descriptor, 1, 1, SIGNER.sign_voucher(DOMAIN, sid, 1)
+            )
+            session.operation = runtime._PendingOperation(
+                prepared,
+                "settle:retire",
+                OperationResult("settle:retire", OperationState.UNKNOWN),
+                {sid: 0},
+            )
+            # Its wallet never submitted it, as after a crash before the handoff.
+            peer.wallet.reconcile = lambda *, operation_ref: OperationResult(
+                operation_ref, OperationState.FAILED
+            )
+            peer.facts.close(sid)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert session.operation.result.state is OperationState.FAILED
+            peer.clock.now += DAY
+            await passes(peer)
+            assert sid not in provider._sessions
+            assert not peer.wallet.calls
+
+    asyncio.run(scenario())
+
+
+def test_a_confirmed_close_reads_its_unread_result_again_then_retires(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            peer.facts.reader.closing = unavailable
+            with pytest.raises(ChainEvidenceError):
+                await peer.provider.sessions.close(SID)
+            session = peer.provider._sessions[SID]
+            assert session.operation.result.state is OperationState.CONFIRMED
+            assert session.close_result is None
+            peer.facts.reader.closing = peer.facts.closing
+            for _ in range(50):
+                if session.close_result is not None:
+                    break
+                await asyncio.sleep(0.02)
+            assert session.close_result is not None, "a confirmed close never read its result"
+            assert session.close_result.capture_amount == 20
+            assert len(peer.wallet.calls) == 1  # Never a second close.
+            peer.provider._detach(session.owner)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            assert SID not in peer.provider._sessions
+
+    asyncio.run(scenario())
+
+
+class RefusedRenewal(Work):
+    """Asks for more coverage than the deposit holds, or none, then fails with
+    a host error of its own, as a host whose renewal was refused does."""
+
+    def __init__(self, renew):
+        super().__init__()
+        self.renew = renew
+
+    async def execute(self, request, context, reports, stop):
+        self.calls.append(context)
+        if self.renew:
+            # 200,000 more output tokens at one unit each exceed the deposit.
+            renewal = await reports.require_coverage(context, TokenCounts(0, 0, 200000))
+            assert not renewal.granted
+        raise RuntimeError("host stream failed")
+        yield b""
+
+
+@pytest.mark.parametrize(
+    ("renew", "code", "reason"),
+    (
+        (True, PaymentCode.INSUFFICIENT_DEPOSIT, None),
+        # An arbitrary host error stays sanitized.
+        (False, PaymentCode.SESSION_NOT_READY, "STATE_UNAVAILABLE"),
+    ),
+)
+def test_a_host_error_after_a_refused_renewal_ends_the_run_with_that_refusal(renew, code, reason):
+    async def scenario():
+        async with serving(work=RefusedRenewal(renew)) as peer:
+            await peer.attach(voucher=1010)
+            with pytest.raises(grpc.aio.AioRpcError) as ended:
+                await peer.complete()
+            failure = parse_payment_error(ended.value.code(), ended.value.trailing_metadata())
+            assert (failure.code, failure.reason) == (code, reason)
+            assert failure.run_id == b"\x02" * 32
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", (True, 3599, 7 * 86400 + 0.5, float("nan"), "86400"))
+def test_closed_retention_policy_rejects_invalid_values(value):
+    async def check():
+        with pytest.raises(ValidationError):
+            async with serving(closed_retention=value):
+                pytest.fail("invalid local policy started a listener")
+
+    asyncio.run(check())
+
+
+def test_closed_retention_policy_is_explicit_and_applied(monkeypatch):
+    from mppi_provider import Hooks
+
+    retired = []
+
+    async def scenario():
+        async with serving() as peer:
+            assert peer.provider._closed_retention == 86400
+        async with serving(closed_retention=7 * 86400) as peer:
+            assert peer.provider._closed_retention == 7 * 86400
+        hooks = Hooks(on_session_retired=retired.append)
+        async with many(monkeypatch, closed_retention=3600, hooks=hooks) as peer:
+            sid, _ = await opened(peer, 1)
+            peer.facts.close(sid)
+            await passes(peer)
+            peer.clock.now += 3600
+            await passes(peer)
+            assert sid not in peer.provider._sessions
+            for _ in range(100):
+                if retired:
+                    break
+                await asyncio.sleep(0.01)
+            assert retired == [sid]
+
+    asyncio.run(scenario())
+
+
+async def forgotten(peer):
+    """The wallet call maintenance started to forget references, if any, ended."""
+    for _ in range(500):
+        task = peer.provider._retiring
+        if task is None or task.done():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the wallet never finished forgetting")
+
+
+def test_a_reference_retires_from_the_wallet_once_every_session_it_covers_retired(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch) as peer:
+            provider, wallet = peer.provider, peer.wallet
+            retired, times, refusing, losing, attempts = [], [], [], [], []
+
+            def retire(*, operation_refs, at):
+                attempts.append(at)
+                if refusing:
+                    raise OSError("journal held elsewhere")
+                retired.append(set(operation_refs))
+                times.append(at)
+
+            def execute(call, *, operation_ref):
+                # It never reaches a wallet service, unless its outcome is lost.
+                wallet.calls.append((call, operation_ref))
+                state = OperationState.UNKNOWN if losing else OperationState.FAILED
+                return OperationResult(operation_ref, state)
+
+            wallet.retire, wallet.execute = retire, execute
+            wallet.reconcile = lambda *, operation_ref: OperationResult(
+                operation_ref, OperationState.UNKNOWN
+            )
+            first, second, stuck = [(await opened(peer, n))[0] for n in (1, 2, 3)]
+            for sid in (first, second, stuck):
+                provider._sessions[sid].voucher = pb.Voucher(
+                    session_id=sid, cumulative=0, signature=SIGNER.sign_voucher(DOMAIN, sid, 0)
+                )
+            # Two captures of the first session: the earlier one is superseded.
+            earlier = await provider.sessions.settle(first)
+            later = await provider.sessions.settle(first)
+            assert earlier.operation_ref != later.operation_ref
+            other = await provider.sessions.settle(second)
+            # The stuck session's capture is lost, so it stays unresolved.
+            losing.append(True)
+            lost = await provider.sessions.settle(stuck)
+            losing.clear()
+            assert lost.state is OperationState.UNKNOWN
+            # A batch reference covering the first two sessions, as a batch
+            # collection retains it.
+            provider._references["settleBatch:shared"] = {first: None, second: None}
+
+            # The first session retires: its own captures go, from the time it
+            # retired (this clock is also the runtime's wall clock), and the
+            # batch stays.
+            peer.facts.close(first)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            await forgotten(peer)
+            assert first not in provider._sessions
+            assert retired == [{earlier.operation_ref, later.operation_ref}]
+            assert times == [peer.clock.now]
+
+            # A wallet that cannot forget them now keeps them for a later pass,
+            # at most once per settlement interval.
+            refusing.append(True)
+            peer.facts.close(second)
+            peer.facts.close(stuck)
+            await passes(peer)
+            peer.clock.now += DAY
+            await passes(peer)
+            await forgotten(peer)
+            assert second not in provider._sessions and len(retired) == 1
+            refusing.clear()
+            tried = len(attempts)
+            for _ in range(3):
+                await passes(peer)
+            await forgotten(peer)
+            assert len(attempts) == tried, "a refused retire spins"
+            peer.clock.now += provider.config.settlement.interval_ms / 1000
+            await passes(peer)
+            await forgotten(peer)
+            assert retired[1:] == [{other.operation_ref, "settleBatch:shared"}]
+
+            # An unresolved capture keeps its session, so its record stays.
+            for _ in range(3):
+                peer.clock.now += DAY
+                await passes(peer)
+            await forgotten(peer)
+            assert stuck in provider._sessions and len(retired) == 2
+            assert list(provider._references) == [lost.operation_ref]
+
+    asyncio.run(scenario())
+
+
+def test_references_due_within_one_second_share_one_retire_call():
+    """References due within the same second share one call, at the latest of
+    their times, and those due in a later second another: for any wallet never
+    before a reference is due, and less than a second after (the Circle adapter
+    keeps whole seconds, so there each gets the mark its own time would)."""
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            second = 1_900_000_000.0
+            peer.provider._retirable.extend(
+                [
+                    ("settle:a", second + 0.2),
+                    ("settle:b", second + 0.7),
+                    ("settle:c", second + 1.0),
+                    ("settle:d", second + 1.5),
+                ]
+            )
+            await handed(peer.wallet, 2)
+            await asyncio.sleep(0.2)
+            assert peer.wallet.retired == [
+                (("settle:a", "settle:b"), second + 0.7),
+                (("settle:c", "settle:d"), second + 1.5),
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_each_rise_of_the_wallets_capacity_is_reported_once(monkeypatch):
+    from mppi_provider import HookError, Hooks
+
+    errors = []
+
+    async def scenario():
+        async with many(monkeypatch, hooks=Hooks(on_error=errors.append)) as peer:
+            await passes(peer)
+            peer.wallet.near_capacity = True
+            await passes(peer)
+            await passes(peer)
+            peer.wallet.near_capacity = False
+            await passes(peer)
+            peer.wallet.near_capacity = True
+            await passes(peer)
+            alert = HookError(
+                "wallet", "RESOURCE_EXHAUSTED", detail="wallet: operation records near capacity"
+            )
+            assert await delivered(errors, 2) == [alert, alert]
+            await asyncio.sleep(0.1)
+            assert len(errors) == 2
+
+    asyncio.run(scenario())
+
+
+def test_a_batch_reference_is_kept_for_every_session_it_covers_even_one_not_yet_restored():
+    async def scenario():
+        async with serving() as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            other, _ = second_session(peer)
+            batch = await peer.provider.sessions.settleBatch((other, SID, other))
+            covered = dict.fromkeys((SID, other))
+            assert peer.provider._references[batch.operation_ref] == covered
+            # After a restart, the first member restored brings the reference
+            # with both sessions, so it waits for the one not restored yet.
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(evidence)
+                assert other not in restored._sessions
+                assert restored._references[batch.operation_ref] == covered
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+class Marking(Wallet):
+    """Records each retire call, and keeps the earliest time each reference
+    may be forgotten from, as a durable wallet does."""
+
+    def __init__(self):
+        super().__init__()
+        self.retired, self.marks = [], {}
+
+    def retire(self, *, operation_refs, at):
+        refs = tuple(operation_refs)
+        self.retired.append((refs, at))
+        for reference in refs:
+            self.marks[reference] = min(at, self.marks.get(reference, at))
+
+    def save(self, now):
+        """What its next save forgets once ``now`` has come."""
+        self.marks = {reference: at for reference, at in self.marks.items() if at > now}
+
+
+class Pausing(Marking):
+    """Marking, whose next retire call waits until released, as a slow
+    wallet's call is under way."""
+
+    def __init__(self):
+        super().__init__()
+        self.pause = False
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def retire(self, *, operation_refs, at):
+        if self.pause:
+            self.pause = False
+            self.entered.set()
+            self.release.wait(5)
+        super().retire(operation_refs=operation_refs, at=at)
+
+
+async def handed(wallet, count):
+    """The first ``count`` retire calls, once maintenance made them."""
+    for _ in range(300):
+        if len(wallet.retired) >= count:
+            return wallet.retired[:count]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{len(wallet.retired)} of {count} retire calls")
+
+
+async def captured_twice(peer):
+    """Two confirmed captures of the first session, the second after more usage."""
+    first = await peer.provider.sessions.settle(SID)
+    await peer.complete(peer.request(b"\x03" * 32))
+    before = time.time()
+    second = await peer.provider.sessions.settle(SID)
+    assert first.state is second.state is OperationState.CONFIRMED
+    return first, second, before, time.time()
+
+
+def test_a_reference_superseded_by_a_later_confirmed_collection_is_handed_over_due_a_day_later():
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            first, second, before, after = await captured_twice(peer)
+            # Handed over at once, due closed_retention after it was superseded.
+            [(references, at)] = await handed(peer.wallet, 1)
+            assert references == (first.operation_ref,)
+            assert before + DAY <= at <= after + DAY
+            assert list(peer.provider._references) == [second.operation_ref]
+
+    asyncio.run(scenario())
+
+
+def test_a_restart_before_a_superseded_reference_falls_due_keeps_its_mark():
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            first, second, _, _ = await captured_twice(peer)
+            await handed(peer.wallet, 1)
+            at = peer.wallet.marks[first.operation_ref]
+            # The process stops before the mark falls due; the next one recovers
+            # the session from its current checkpoint, which names only the
+            # later capture.
+            evidence = await peer.provider.sessions.checkpoint(SID)
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                await restored.sessions.recover(evidence)
+                await asyncio.sleep(0.2)  # Several maintenance passes.
+                assert list(restored._references) == [second.operation_ref]
+                assert not restored._retirable
+                assert len(peer.wallet.retired) == 1, "the reference was learned again"
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+            # The wallet kept the mark it was given before the restart, so its
+            # record still goes when that time comes. (The Circle adapter keeps
+            # it in its journal: the next test.)
+            peer.wallet.save(at - 1)
+            assert first.operation_ref in peer.wallet.marks
+            peer.wallet.save(at)
+            assert first.operation_ref not in peer.wallet.marks
+
+    asyncio.run(scenario())
+
+
+class CircleCli:
+    """Circle CLI 1.1.4's JSON output for the operator's agent wallet, as
+    mppi-protocol's adapter tests answer it, each execute with its own
+    transaction id and hash."""
+
+    def __init__(self):
+        self.transactions = []
+
+    def __call__(self, args):
+        if args == ["--version"]:
+            return b"1.1.4\n"
+        assert args[-2:] == ["--output", "json"]
+        wallet = "0x" + OPERATOR.hex()
+        if args[:2] == ["wallet", "list"]:
+            data = {"wallets": [{"type": "agent", "address": wallet, "blockchain": "ARC-TESTNET"}]}
+        elif args[:2] == ["wallet", "execute"]:
+            n = len(self.transactions) + 1
+            data = {
+                "id": f"{n:08x}-1111-4111-8111-111111111111",
+                "idempotencyKey": args[args.index("--idempotency-key") + 1],
+                "state": "CONFIRMED",
+                "blockchain": "ARC-TESTNET",
+                "txHash": "0x" + bytes([0xD0 + n]).hex() * 32,
+                "sourceAddress": wallet,
+                "destinationAddress": wallet,
+                "operation": "CONTRACT_EXECUTION",
+                "transactionType": "OUTBOUND",
+                "abiFunctionSignature": args[2],
+                "abiParameters": args[3:6],
+                "contractAddress": wallet,
+                "createDate": "2026-09-27T00:00:00Z",
+            }
+            self.transactions.insert(0, data)
+        elif args[:2] == ["transaction", "list"]:
+            data = {"transactions": self.transactions}
+        else:
+            raise AssertionError(args)
+        return json.dumps({"data": data}).encode()
+
+
+class WallClock:
+    """The adapter's clocks: a wall clock the test sets, a monotonic one that
+    stands still."""
+
+    def __init__(self):
+        self.now = time.time()
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return 1000.0
+
+
+def test_a_superseded_reference_marked_in_the_circle_journal_is_forgotten_after_a_restart(
+    tmp_path, monkeypatch
+):
+    # The runtime collects through the real Circle adapter, which drives the
+    # fake CLI on its own journal and reads the test's clock.
+    clock, cli, path = WallClock(), CircleCli(), tmp_path / "wallet-operations.json"
+    monkeypatch.setattr(circle, "time", clock)
+    registry = b"\x97" * 20
+    pinned = (DOMAIN.verifying_contract, b"\x98" * 20, registry, b"\x96" * 20)
+    pins = (CodePin(address, b"\x01" * 32) for address in pinned)
+    profile = DeploymentProfile(DOMAIN, registry, *pins)
+
+    def adapter(**options):
+        # It pins no account code, so it never reads the chain.
+        wallet = CircleAgentWallet(
+            chain=ChainReader(None, profile), address=OPERATOR, checkpoint_path=path, **options
+        )
+        wallet._run = cli
+        return wallet
+
+    def journal():
+        return json.loads(path.read_text())["operations"]
+
+    async def scenario():
+        async with serving(wallet=adapter()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            first, second, before, after = await captured_twice(peer)
+            # The first capture is handed over due a day later, and the
+            # adapter keeps that time in its journal.
+            for _ in range(300):
+                if (mark := journal()[first.operation_ref]["retire_at"]) is not None:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("the first capture was never marked")
+            assert int(before + DAY) <= mark <= int(after + DAY)
+            assert journal()[second.operation_ref]["retire_at"] is None
+            evidence = await peer.provider.sessions.checkpoint(SID)
+        # The process stopped before the mark fell due. The next one opens a
+        # new adapter on the same journal.
+        restored = replacement(peer, wallet=adapter(require_existing=True))
+        # Once the adapter's clock reaches the mark, recovering the session from
+        # its current checkpoint, which names only the later capture, looks
+        # that capture up in the adapter, whose save forgets the first.
+        clock.now = float(mark)
+        await restored.start()
+        try:
+            await restored.sessions.recover(evidence)
+            await asyncio.sleep(0.2)  # Several maintenance passes.
+            assert list(restored._references) == [second.operation_ref]
+            assert not restored._retirable
+        finally:
+            await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+        assert list(journal()) == [second.operation_ref]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("retention", [DAY, 3600.0])
+def test_a_recovery_from_an_older_checkpoint_withdraws_the_mark_of_the_reference_it_names(
+    tmp_path, monkeypatch, retention
+):
+    """A host checkpoint taken before a later confirmed collection superseded
+    its capture names that capture again when the session is recovered from
+    it: the wallet lookup withdraws the capture's retirement mark, so the
+    session's checkpoint still recovers after the time it was marked for, and
+    a collection that supersedes it again hands it over again."""
+    clock, cli, path = WallClock(), CircleCli(), tmp_path / "wallet-operations.json"
+    monkeypatch.setattr(circle, "time", clock)
+    registry = b"\x97" * 20
+    pinned = (DOMAIN.verifying_contract, b"\x98" * 20, registry, b"\x96" * 20)
+    pins = (CodePin(address, b"\x01" * 32) for address in pinned)
+    profile = DeploymentProfile(DOMAIN, registry, *pins)
+
+    def adapter(**options):
+        wallet = CircleAgentWallet(
+            chain=ChainReader(None, profile), address=OPERATOR, checkpoint_path=path, **options
+        )
+        wallet._run = cli
+        return wallet
+
+    def journal():
+        return json.loads(path.read_text())["operations"]
+
+    async def marked(reference):
+        for _ in range(300):
+            if (mark := journal()[reference]["retire_at"]) is not None:
+                return mark
+            await asyncio.sleep(0.01)
+        raise AssertionError("never marked")
+
+    # The session at each block, as an archive read at that block shows it.
+    history = {}
+
+    def archive(facts):
+        facts.reader.session = lambda sid, block: history[block.observation.block_number]
+
+        def reconcile(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+            # Reading a receipt leaves the chain as it is.
+            observation = facts.block(facts.height).observation
+            return OperationResult(
+                operation_ref, OperationState.CONFIRMED, wallet_operation_id, tx_hash, observation
+            )
+
+        facts.reader.reconcile = reconcile
+
+    async def scenario():
+        async with serving(wallet=adapter(), closed_retention=retention) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            first = await peer.provider.sessions.settle(SID)
+            history[peer.facts.height] = peer.facts.state
+            await peer.complete(peer.request(b"\x03" * 32))
+            # The host's last saved checkpoint names the first capture.
+            older = await peer.provider.sessions.checkpoint(SID)
+            peer.facts.height += 1
+            second = await peer.provider.sessions.settle(SID)
+            history[peer.facts.height] = peer.facts.state
+            assert first.state is second.state is OperationState.CONFIRMED
+            # The second supersedes the first, which is handed over due
+            # `retention` later and marked in the journal.
+            mark = await marked(first.operation_ref)
+            # The process stops before the host saves a checkpoint naming the
+            # second capture.
+        facts = peer.facts
+        restored = replacement(
+            peer, wallet=adapter(require_existing=True), closed_retention=retention
+        )
+        archive(facts)
+        await restored.start()
+        try:
+            # The next process recovers the session from that older checkpoint;
+            # its lookup of the first capture withdrew the mark.
+            await restored.sessions.recover(older)
+            assert journal()[first.operation_ref]["retire_at"] is None
+            # Another process's save after the time it was marked for keeps it.
+            clock.now = float(mark)
+            adapter(require_existing=True).retire(operation_refs=(), at=clock.now)
+            assert first.operation_ref in journal()
+            current = await restored.sessions.checkpoint(SID)
+            assert current.operation.result.operation_ref == first.operation_ref
+        finally:
+            await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+        # So the session's current checkpoint, which names it, still recovers.
+        again = replacement(peer, wallet=adapter(require_existing=True), closed_retention=retention)
+        archive(facts)
+        clock.now = time.time()
+        await again.start()
+        try:
+            await again.sessions.recover(current)
+            # A later confirmed collection supersedes the first capture again:
+            # it is handed over again, and forgotten once due.
+            restore_reader(facts)
+            facts.reader.reconcile = facts.reconcile
+            for run in again._sessions[SID].runs.values():
+                run.accounting = RunAccounting(TokenCounts(40, 0, 40), 0, RunStatus.COMPLETED)
+            before = time.time()
+            third = await again.sessions.settle(SID)
+            assert third.state is OperationState.CONFIRMED
+            due = await marked(first.operation_ref)
+            assert int(before + retention) <= due
+            clock.now = float(due)
+            adapter(require_existing=True).retire(operation_refs=(), at=clock.now)
+            # The second capture, which the recovered runtimes never learned,
+            # stays.
+            assert set(journal()) == {second.operation_ref, third.operation_ref}
+        finally:
+            await again.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+class Withdrawing(Marking):
+    """Marking, whose lookup of a reference withdraws its mark, as every
+    wallet must (docs/sdk-interfaces.md, Wallet requirements)."""
+
+    def reconcile(self, *, operation_ref):
+        self.marks.pop(operation_ref, None)
+        return super().reconcile(operation_ref=operation_ref)
+
+
+@pytest.mark.parametrize("retention", [DAY, 3600.0])
+def test_a_recovery_from_an_older_checkpoint_asks_the_wallet_about_the_reference_it_names(
+    retention,
+):
+    """The runtime's half of the test above, with the suites' generic fake
+    wallet rather than the Circle adapter. Recovering a session from a
+    checkpoint taken before a later confirmed collection superseded its
+    capture looks that capture up in the wallet, so a wallet that withdraws a
+    reference's mark on lookup, as every wallet must, keeps it past the time
+    it was marked for; a collection that supersedes it again hands it over
+    again, and the later capture, never learned again, is never handed over."""
+    # The session at each block, as an archive read at that block shows it.
+    history = {}
+
+    def archive(facts):
+        facts.reader.session = lambda sid, block: history[block.observation.block_number]
+
+        def reconcile(operation, *, operation_ref, tx_hash, wallet_operation_id=None):
+            observation = facts.block(facts.height).observation
+            return OperationResult(
+                operation_ref, OperationState.CONFIRMED, wallet_operation_id, tx_hash, observation
+            )
+
+        facts.reader.reconcile = reconcile
+
+    async def scenario():
+        wallet = Withdrawing()
+        async with serving(wallet=wallet, closed_retention=retention) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            first = await peer.provider.sessions.settle(SID)
+            history[peer.facts.height] = peer.facts.state
+            await peer.complete(peer.request(b"\x03" * 32))
+            # The host's last saved checkpoint names the first capture.
+            older = await peer.provider.sessions.checkpoint(SID)
+            peer.facts.height += 1
+            second = await peer.provider.sessions.settle(SID)
+            history[peer.facts.height] = peer.facts.state
+            assert first.state is second.state is OperationState.CONFIRMED
+            # The second supersedes the first, which is handed over due
+            # `retention` later and marked.
+            [(references, _)] = await handed(wallet, 1)
+            assert references == (first.operation_ref,)
+            assert first.operation_ref in wallet.marks
+            # The process stops before the host saves a checkpoint naming the
+            # second capture.
+        facts = peer.facts
+        restored = replacement(peer, closed_retention=retention)
+        archive(facts)
+        await restored.start()
+        try:
+            # The next process recovers the session from that older
+            # checkpoint; its lookup of the first capture withdrew the mark:
+            # the wallet keeps the record past the time it was marked for.
+            await restored.sessions.recover(older)
+            assert first.operation_ref not in wallet.marks
+            current = await restored.sessions.checkpoint(SID)
+            assert current.operation.result.operation_ref == first.operation_ref
+        finally:
+            await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+        # So the session's current checkpoint, which names it, still recovers.
+        again = replacement(peer, closed_retention=retention)
+        archive(facts)
+        await again.start()
+        try:
+            await again.sessions.recover(current)
+            # A later confirmed collection supersedes the first capture again:
+            # it is handed over again, due `retention` after that collection.
+            restore_reader(facts)
+            facts.reader.reconcile = facts.reconcile
+            for run in again._sessions[SID].runs.values():
+                run.accounting = RunAccounting(TokenCounts(40, 0, 40), 0, RunStatus.COMPLETED)
+            before = time.time()
+            third = await again.sessions.settle(SID)
+            after = time.time()
+            assert third.state is OperationState.CONFIRMED
+            [_, (references, at)] = await handed(wallet, 2)
+            assert references == (first.operation_ref,)
+            assert before + retention <= at <= after + retention
+            assert all(second.operation_ref not in refs for refs, _ in wallet.retired)
+        finally:
+            await again.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+def test_a_reference_still_named_as_a_baseline_waits_and_a_batch_waits_for_every_session():
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=10000)
+            await peer.complete()
+            provider = peer.provider
+            other, _ = second_session(peer)
+            own = await provider.sessions.settle(SID)
+            # The batch confirms, but the first session's target did not rise:
+            # its capture stays its baseline, which its checkpoint still names.
+            batch = await provider.sessions.settleBatch((SID, other))
+            assert batch.state is OperationState.CONFIRMED
+            assert provider._sessions[SID].baseline.reference == own.operation_ref
+            await asyncio.sleep(0.2)
+            assert not peer.wallet.retired, "a named baseline was handed over"
+            # A later capture of the first session supersedes both for it; the
+            # batch still covers the other session, whose baseline it is.
+            await peer.complete(peer.request(b"\x03" * 32))
+            await provider.sessions.settle(SID)
+            [(references, _)] = await handed(peer.wallet, 1)
+            assert references == (own.operation_ref,)
+            # The other session's later capture supersedes the batch for it
+            # too: the batch is due a day after the later of the two.
+            for run in provider._sessions[other].runs.values():
+                run.accounting = RunAccounting(TokenCounts(40, 0, 40), 0, RunStatus.COMPLETED)
+            before = time.time()
+            await provider.sessions.settle(other)
+            after = time.time()
+            (references, at) = (await handed(peer.wallet, 2))[1]
+            assert references == (batch.operation_ref,)
+            assert before + DAY <= at <= after + DAY
+
+    asyncio.run(scenario())
+
+
+def test_a_final_record_refused_at_recovery_hands_its_references_to_retirement():
+    """A session final but not yet retired when its process stopped had its final
+    evidence refused after the restart, so its references were never learned and
+    never forgotten."""
+
+    async def scenario():
+        async with serving(wallet=Marking()) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            closed = await peer.provider.sessions.close(SID)
+            assert closed.state is OperationState.CONFIRMED
+            final = await peer.provider.sessions.checkpoint(SID)
+            # A batch it shared with a session this process has not seen yet.
+            other = replace(DESCRIPTOR, salt=b"o" * 32)
+            calls = peer.provider.contract
+            batch = calls.settle_batch(
+                [
+                    (DESCRIPTOR, 1, 1, SIGNER.sign_voucher(DOMAIN, SID, 1)),
+                    (other, 1, 1, SIGNER.sign_voucher(DOMAIN, session_id(DOMAIN, other), 1)),
+                ]
+            )
+            shared = OperationResult(
+                "settleBatch:shared",
+                OperationState.CONFIRMED,
+                None,
+                b"\xaa" * 32,  # The transaction the wallet's record of it names.
+                peer.facts.block(100).observation,
+            )
+            units = tuple((sid, 0) for sid in batch.session_ids)
+            final = replace(final, baseline=RecoveryOperation(batch, shared, units))
+            assert final.is_final()
+            restored = replacement(peer)
+            await restored.start()
+            try:
+                before = time.time()
+                with pytest.raises(_RpcFailure) as refused:
+                    await restored.sessions.recover(final)
+                after = time.time()
+                assert refused.value.payment.reason == "SESSION_CLOSED"
+                # Its close goes from now; the batch waits for the other session.
+                [(references, at)] = await handed(peer.wallet, 1)
+                assert references == (closed.operation_ref,)
+                assert before <= at <= after
+                covered = restored._references["settleBatch:shared"]
+                assert covered[SID] is not None and covered[session_id(DOMAIN, other)] is None
+            finally:
+                await restored.shutdown(asyncio.get_running_loop().time() + 0.2)
+
+    asyncio.run(scenario())
+
+
+async def delivered(records, count):
+    """The first ``count`` records the observer worker delivered."""
+    for _ in range(200):
+        if len(records) >= count:
+            return records[:count]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{len(records)} of {count} observer records delivered")
+
+
+def assert_whole(timing):
+    parts = timing.coverage_ms + timing.chain_ms + timing.wallet_ms
+    assert timing.waiting_ms >= 0 and parts + timing.waiting_ms == timing.total_ms
+
+
+def test_each_collection_reports_where_its_time_went():
+    """on_timing splits a settlement into this SDK's chain reads, the wallet's call
+    and the rest: here the wait for another wallet operation's turn."""
+    from mppi_provider import Hooks, OperationTiming
+
+    async def scenario():
+        records = []
+        async with serving(hooks=Hooks(on_timing=records.append)) as peer:
+            await peer.attach(voucher=1010)
+            await peer.complete()
+            execute, reconcile = peer.wallet.execute, peer.facts.reader.reconcile
+
+            def slow_execute(call, *, operation_ref):
+                time.sleep(0.05)  # The wallet service, until it returns.
+                return execute(call, operation_ref=operation_ref)
+
+            def slow_reconcile(*args, **kwargs):
+                time.sleep(0.03)  # The receipt proof.
+                return reconcile(*args, **kwargs)
+
+            peer.wallet.execute, peer.facts.reader.reconcile = slow_execute, slow_reconcile
+            async with peer.provider.sessions._operations:
+                settle = asyncio.create_task(peer.provider.sessions.settle(SID))
+                await asyncio.sleep(0.02)  # Another wallet operation's turn.
+            assert (await settle).state is OperationState.CONFIRMED
+            peer.provider._sessions.clear()
+            with pytest.raises(_RpcFailure):
+                await peer.provider.sessions.close(SID)
+            admission, settled, refused = await delivered(records, 3)
+        assert admission.operation == "admission"
+        assert isinstance(settled, OperationTiming)
+        assert (settled.operation, settled.state) == ("settle", "confirmed")
+        assert settled.coverage_ms == 0 and settled.wallet_ms >= 50
+        assert settled.chain_ms >= 30 and settled.waiting_ms >= 20
+        assert (refused.operation, refused.state) == ("close", None)
+        for timing in (settled, refused):
+            assert_whole(timing)
+
+
+# A run waiting for admission reads only its own session's state and the
+# runtime-wide state, so only a change to one of those wakes it: its session's
+# changes, shutdown and a change in chain readiness. One runtime-wide wake-up
+# made every run waiting in any session re-check on every change in every
+# session, about N squared checks for N waiting runs. These tests remove the
+# 50 ms re-check, so each check counted followed a wake-up, and each run
+# admitted was admitted by wake-ups alone.
+
+
+async def unpolled(peer, monkeypatch):
+    """A waiting run re-checks only when woken. Maintenance has already seen
+    chain readiness, so it wakes runs only when that readiness changes."""
+
+    async def wait_for(awaitable, timeout):
+        return await awaitable
+
+    patched = SimpleNamespace(**{**vars(asyncio), "wait_for": wait_for})
+    monkeypatch.setattr(runtime, "asyncio", patched)
+    await passes(peer)
+
+
+def counted(peer):
+    """Admission checks, by session: each begins at the gate."""
+    checks = {}
+    gate = peer.provider._gate
+
+    def counting(session, context=None):
+        run = session.runs.get(context.run_id) if context is not None else None
+        if run is not None and not run.admitted:
+            checks[session.sid] = checks.get(session.sid, 0) + 1
+        return gate(session, context)
+
+    peer.provider._gate = counting
+    return checks
+
+
+def waiting(peer, sid, n, output=1000):
+    """Run ``n`` of session ``sid`` waits for admission in its own task, as a
+    Complete does. 1,000 output tokens cost 1,010 with its input."""
+    session = peer.provider._sessions[sid]
+    catalog = peer.facts.config.catalog
+    context = RunContext(
+        sid, bytes([n]) * 32, session.generation, "example/model", catalog.rate_card_hash
+    )
+    run = runtime._Run(
+        context,
+        SIGNER.sign_run(DOMAIN, context),
+        runtime.PreparedRequest(b"{}", True),
+        catalog.rates_for("example/model"),
+    )
+    session.runs[context.run_id] = run
+    return asyncio.create_task(peer.provider._admit(session, run, TokenCounts(10, 0, output)))
+
+
+def signed(sid, amount):
+    return pb.Voucher(
+        session_id=sid, cumulative=amount, signature=SIGNER.sign_voucher(DOMAIN, sid, amount)
+    )
+
+
+async def settle():
+    """Every task that can make progress runs."""
+    for _ in range(500):
+        await asyncio.sleep(0)
+
+
+def test_admission_checks_grow_linearly_with_sessions_under_concurrent_load(monkeypatch):
+    runs = 10
+
+    async def scenario(sessions):
+        async with many(monkeypatch, cfg=config(wait=30000)) as peer:
+            await unpolled(peer, monkeypatch)
+            owners = [await owned(peer, n) for n in range(1, sessions + 1)]
+            checks = counted(peer)
+            tasks = [waiting(peer, sid, n) for sid, _, _ in owners for n in range(1, runs + 1)]
+            await settle()
+            for sid, _, attachment in owners:
+                await peer.provider._receive_voucher(attachment, signed(sid, 1010 * runs))
+                await settle()
+            async with asyncio.timeout(10):
+                await asyncio.gather(*tasks)  # Wake-ups alone admit every run.
+            total = sum(checks.values())
+            # Per session: one check each to start and one each when its voucher
+            # arrives, then at most one more each time an earlier run is admitted.
+            assert total <= sessions * (2 * runs + runs * (runs - 1) // 2), total
+            return total // sessions
+
+    per_session = [asyncio.run(scenario(sessions)) for sessions in (5, 10, 20)]
+    # Each session's runs take as many checks however many sessions wait.
+    assert per_session == [per_session[0]] * 3, f"checks per session: {per_session}"
+
+
+@pytest.mark.parametrize("change", ("voucher", "final report", "Control lost", "reattached"))
+def test_a_change_wakes_only_its_own_sessions_waiting_runs(change, monkeypatch):
+    async def scenario():
+        async with many(monkeypatch, cfg=config(wait=30000)) as peer:
+            await unpolled(peer, monkeypatch)
+            (a, _, owner), (b, _, _) = await owned(peer, 1), await owned(peer, 2)
+            checks = counted(peer)
+            if change == "final report":
+                await peer.provider._receive_voucher(owner, signed(a, 1010))
+                await waiting(peer, a, 1)
+            # Two runs of A and one of B wait for coverage nobody has signed.
+            tasks = [waiting(peer, a, 2, 50000), waiting(peer, a, 3, 50000)]
+            tasks.append(waiting(peer, b, 2, 50000))
+            await settle()
+            before = (checks[a], checks[b])
+            if change == "voucher":
+                await peer.provider._receive_voucher(owner, signed(a, 2020))
+            elif change == "final report":
+                context = peer.provider._sessions[a].runs[b"\x01" * 32].context
+                await peer.provider.report_terminal(
+                    context, TokenCounts(10, 0, 500), RunStatus.COMPLETED
+                )
+            elif change == "Control lost":
+
+                async def ended():
+                    return
+                    yield
+
+                await peer.provider._receive_control(owner, ended())
+            else:
+                await reattach(peer, a, runtime._Attachment(runtime.ByteQueue()))
+            await settle()
+            assert checks[a] > before[0], "A's runs re-check"
+            assert checks[b] == before[1], f"{change} woke B's run"
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+class FailingCoverage(Work):
+    async def coverage(self, request, context):
+        raise RuntimeError("tokenizer at /srv/host-secret failed")
+
+
+def test_a_host_coverage_error_reaches_the_agent_without_its_text():
+    """Only UpstreamFailure is the host's own refusal; any other error is the
+    runtime's STATE_UNAVAILABLE, as in the Rust runtime, never its message."""
+
+    async def scenario():
+        async with serving(work=FailingCoverage()) as peer:
+            await peer.attach()
+            with pytest.raises(grpc.aio.AioRpcError) as failure:
+                await peer.complete()
+            error = failure.value
+            failed = parse_payment_error(error.code(), error.trailing_metadata())
+            assert failed is not None and failed.reason == "STATE_UNAVAILABLE"
+            text = (error.details() or "") + repr(error.trailing_metadata())
+            assert "host-secret" not in text and "RuntimeError" not in text
+            assert peer.work.calls == [] and peer.wallet.calls == []
+
+
+def test_maintenance_wakes_every_waiting_run_only_when_chain_readiness_changes(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch, cfg=config(wait=30000)) as peer:
+            await unpolled(peer, monkeypatch)
+            sids = [(await owned(peer, n))[0] for n in (1, 2)]
+            checks = counted(peer)
+            tasks = [waiting(peer, sid, 1, 50000) for sid in sids]
+            await settle()
+            before = dict(checks)
+            await passes(peer)
+            assert checks == before, "an unchanged pass wakes no run"
+            peer.facts.stale = True
+            async with asyncio.timeout(1):
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            assert [result.payment.reason for result in results] == ["CHAIN_STATE_STALE"] * 2
+
+    asyncio.run(scenario())
+
+
+class SlowCoverage(Work):
+    async def coverage(self, request, context):
+        await asyncio.sleep(0.03)  # The host's own counting, such as tokenizing.
+        return await super().coverage(request, context)
+
+
+def test_an_admission_reports_its_coverage_and_its_wait():
+    from mppi_provider import Hooks
+
+    async def scenario():
+        records = []
+        hooks = Hooks(on_timing=records.append)
+        async with serving(work=SlowCoverage(), cfg=config(wait=150), hooks=hooks) as peer:
+            await peer.attach()
+            completion = asyncio.create_task(peer.complete())
+            assert (await asyncio.wait_for(peer.control.read(), 1)).HasField("low_credit")
+            await asyncio.sleep(0.05)  # The agent's voucher round trip.
+            await peer.control.write(pb.ControlMessage(voucher=peer.voucher(1010)))
+            assert (await completion)[-1].terminal.status == pb.RUN_STATUS_COMPLETED
+            # Nothing covers the next run: its authorization wait ends it.
+            with pytest.raises(grpc.aio.AioRpcError):
+                await peer.complete(peer.request(b"\x03" * 32))
+            admitted, refused = await delivered(records, 2)
+        assert (admitted.operation, admitted.state) == ("admission", "admitted")
+        assert admitted.coverage_ms >= 30 and admitted.waiting_ms >= 50
+        assert (refused.operation, refused.state) == ("admission", None)
+        assert refused.coverage_ms >= 30 and refused.waiting_ms >= 150
+        for timing in (admitted, refused):
+            assert timing.chain_ms == timing.wallet_ms == 0
+            assert_whole(timing)
+
+    asyncio.run(scenario())
+
+
+def test_a_steps_measured_parts_never_add_up_to_more_than_its_total():
+    """Parts of 36.7, 27.7 and 58.7 ms in a step of 123.2 ms: each rounded to
+    nearest, they would sum to 124, more than the step's 123."""
+    timing = runtime._Timing("settle", time.monotonic() - 0.1232)
+    timing.parts.update(coverage=0.0367, chain=0.0277, wallet=0.0587)
+    record = timing.report("confirmed")
+    assert (record.coverage_ms, record.chain_ms, record.wallet_ms) == (36, 27, 58)
+    assert record.total_ms == 123 and record.waiting_ms == 2
+
+
+def test_shutdown_wakes_every_sessions_waiting_run(monkeypatch):
+    async def scenario():
+        async with many(monkeypatch, cfg=config(wait=30000)) as peer:
+            await unpolled(peer, monkeypatch)
+            sids = [(await owned(peer, n))[0] for n in (1, 2)]
+            tasks = [waiting(peer, sid, 1, 50000) for sid in sids]
+            await settle()
+            await peer.provider.shutdown(asyncio.get_running_loop().time() + 1)
+            async with asyncio.timeout(1):
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            assert [result.payment.reason for result in results] == ["CONTROL_NOT_READY"] * 2
 
     asyncio.run(scenario())

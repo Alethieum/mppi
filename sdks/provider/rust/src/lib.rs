@@ -24,7 +24,7 @@ pub mod follower;
 pub mod http;
 pub mod interfaces;
 mod json;
-mod local_state;
+pub mod local_state;
 pub mod onboarding;
 pub mod operations;
 pub mod provider_update;

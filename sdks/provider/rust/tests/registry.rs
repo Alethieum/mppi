@@ -350,23 +350,39 @@ async fn identity_and_agent_wallet_recheck_chain_and_complete_canonical_block() 
             "accepted changed {field}"
         );
     }
+    // A reader checks the RPC's chain id with its first read, then never again.
     for method in ["eth_chainId", "eth_getBlockByNumber"] {
-        let (rpc, reader, block) = setup(U256::MAX).await;
+        let (rpc, _, block) = setup(U256::MAX).await;
         rpc.reply(METADATA, dynamic(b""));
         *rpc.failure.lock().unwrap() = Some(method);
-        assert_eq!(
-            reader.identity(U256::MAX, &block, true).await.unwrap_err(),
-            ChainError::Unavailable
-        );
-        assert_eq!(
-            reader.agent_wallet(U256::MAX, &block).await.unwrap_err(),
-            ChainError::Unavailable
-        );
+        for _ in 0..2 {
+            let reader = ChainReader::new(rpc.clone(), RegistryRpc::profile());
+            assert_eq!(
+                reader.identity(U256::MAX, &block, true).await.unwrap_err(),
+                ChainError::Unavailable
+            );
+            assert_eq!(
+                reader.agent_wallet(U256::MAX, &block).await.unwrap_err(),
+                ChainError::Unavailable
+            );
+        }
     }
     let (rpc, reader, block) = setup(U256::MAX).await;
+    rpc.reply(METADATA, dynamic(b""));
     *rpc.chain.lock().unwrap() = json!("0x1");
-    assert!(reader.identity(U256::MAX, &block, true).await.is_err());
-    assert!(reader.agent_wallet(U256::MAX, &block).await.is_err());
+    reader.identity(U256::MAX, &block, true).await.unwrap();
+    reader.agent_wallet(U256::MAX, &block).await.unwrap();
+    let fresh = ChainReader::new(rpc.clone(), RegistryRpc::profile());
+    assert!(fresh.identity(U256::MAX, &block, true).await.is_err());
+    assert!(fresh.agent_wallet(U256::MAX, &block).await.is_err());
+    let chain_reads = rpc
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| m == "eth_chainId")
+        .count();
+    assert_eq!(chain_reads, 3);
 }
 
 #[tokio::test]

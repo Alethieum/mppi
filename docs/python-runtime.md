@@ -44,8 +44,12 @@ sequenceDiagram
 
 An existing covering voucher skips the request-start coverage exchange. Funding
 shortage never triggers an automatic deposit. The provider supplies counts and
-terminates its jobs when further coverage is denied. Missing final usage leaves
-the reservation unresolved.
+terminates its jobs when further coverage is denied: it reports the terminal
+and ends the stream. An exception other than `UpstreamFailure` after that
+denial ends the request with the denial itself, such as `INSUFFICIENT_DEPOSIT`;
+an `UpstreamFailure` still delivers its JSON error, as at any other time.
+Without a denial, such exceptions are sanitized to `STATE_UNAVAILABLE`. Missing
+final usage leaves the reservation unresolved.
 
 ### Provider composition
 
@@ -54,6 +58,12 @@ coverage=..., execution=...)` on the serving event loop. It verifies the saved
 configuration, deployment and existing operator, then constructs the wallet,
 chain follower and contract calls. It starts no listener or inference job.
 See the [provider quickstart](provider-quickstart.md#4-attach-the-sdk-to-your-application).
+`Mppi.from_config(..., wallet=operator_wallet)` composes another
+`TransactionWallet` instead, such as one whose operator key an HSM or KMS holds.
+Setup refuses it before any chain read unless its address is the saved operator,
+then verifies the deployment and USDC domain as above. It cannot check that
+wallet's own account, network or access; the wallet must meet the
+[wallet requirements](sdk-interfaces.md#wallet-requirements).
 
 For custom capabilities, construct the runtime explicitly:
 
@@ -76,20 +86,27 @@ readiness = await sdk.start()
 ```
 
 These are integration objects supplied by the host. `coverage(request, context)`
-returns `TokenCounts` before any paid execution. The execution async iterator
-receives `(request, context, runs, stop_requested)`, yields original JSON bytes,
-and explicitly calls `runs.report_usage` and `runs.report_terminal`. For another
-execution interval it calls `runs.require_coverage(context, remaining_tokens)`
-and proceeds only after a granted result. `remaining_tokens` is a complete
-desired remaining bound; already reserved cost is retained until consumed or
-released by a definitive final report. The stop event requests termination; it
-does not assert the job has stopped.
+returns `TokenCounts` before any paid execution. It is also each request's
+preflight: it runs once the signed request has passed its checks, before any
+authorization wait, voucher or reservation. Raise
+`UpstreamFailure(json_body, http_status=...)` to refuse a request with your
+JSON error and `FAILED_PRECONDITION`; the run is not admitted. The execution
+async iterator receives `(request, context, runs, stop_requested)`, yields
+original JSON bytes, and explicitly calls `runs.report_usage` and
+`runs.report_terminal`. For another execution interval it calls
+`runs.require_coverage(context, remaining_tokens)` and proceeds only after a
+granted result. `remaining_tokens` is a complete desired remaining bound;
+already reserved cost is retained until consumed or released by a definitive
+final report. The stop event requests termination; it does not assert the job
+has stopped.
 
 The host configures its server with `GRPC_OPTIONS` to enforce decompressed
 message limits, publishes `sdk.discovery(path)` through its HTTP stack, and owns
-listener startup/TLS. `sdk.shutdown(deadline)` uses an absolute monotonic deadline,
-stops grants and returns unresolved run/session/operation evidence. It does not
-stop the host's gRPC server or close escrow.
+listener startup/TLS. Its own services, such as an estimate endpoint, register
+on the same server, and its HTTP routes sit beside the discovery documents.
+`sdk.shutdown(deadline)` uses an absolute monotonic deadline, stops grants and
+returns unresolved run/session/operation evidence. It does not stop the host's
+gRPC server or close escrow.
 
 One `Mppi` instance owns live payment state for its sessions. A provider must
 coordinate its workers around that authoritative state. Separate frontend and
@@ -101,8 +118,75 @@ session. `await sdk.sessions.checkpoint(session_id)` returns detached
 `await sdk.sessions.recover(evidence)` verifies complete supplied history and
 canonical chain evidence before installing it. The SDK supplies no persistence
 backend. Missing or contradictory evidence fails without replacing live state.
+A refusal for missing or unavailable evidence raises `STATE_UNAVAILABLE`, and
+the error's message names the check that failed in the SDK's own words, such as
+`SESSION_NOT_READY: a catalog has no publication evidence`; a failed wallet
+lookup adds the error's class, as in `(TimeoutError)`. A refusal for evidence
+that contradicts itself, the chain, the wallet or a session the runtime already
+holds raises `INCONSISTENT_STATE` and names its check the same way, such as
+`SESSION_NOT_READY: the checkpoint block contradicts the chain or the opening`.
+A check of several conditions has one label, and the Rust runtime gives each
+check both runtimes make the same label. Its wallet-lookup label does not add
+the error's class, and these refusals keep the classification each runtime
+had in 0.1.2:
+- an invalid run or voucher signature raises `ValidationError`
+  (`INVALID_VALUE`) here, its message naming the check, where Rust refuses
+  `INCONSISTENT_STATE`;
+- evidence lacking a run the held session has is `INCONSISTENT_STATE` here,
+  labelled `the evidence is older than the held session or contradicts it`,
+  where Rust refuses `STATE_UNAVAILABLE`, `the evidence lacks a run the held
+  session has`;
+- a checkpoint block no longer canonical, and an unattached checkpoint holding
+  accounting history, are `INCONSISTENT_STATE` here, where Rust returns a chain
+  error and gRPC `INVALID_ARGUMENT`;
+- evidence over the resource limits raises `ValidationError` here, where Rust
+  returns `RESOURCE_EXHAUSTED`, and run history whose counts do not add up is
+  refused here under the label of the run concerned, where Rust returns
+  `INVALID_ARGUMENT`.
+
+`checkpoint` names its refusals the same way. Log the message; the payment
+failure is what to act on.
+Each `recover` restores one session, so a host can start without a refused
+session and retry it later. Recovery reads all its evidence first, including
+the wallet's lookup of each saved transaction, and only then takes the
+runtime's locks to check the evidence against what the runtime holds and
+install it. A host can therefore recover many sessions at once, for example
+with `asyncio.gather`, while collections continue; a change made while a
+recovery reads is checked like one made before it. The wallet's `reconcile`
+may then run in several worker threads at the same time. Each recovery watches
+its session through the chain follower, and watches that wait behind a refresh
+are read together by the next one, so many recoveries take a few refreshes
+rather than one each.
+With the Circle adapter, an answer from Circle that the adapter's journal could
+not take is returned `UNKNOWN` with its transaction id and hash, and kept only
+in that adapter's memory until its next journal step writes it
+([Circle Agent Wallet adapter](python-onboarding.md#circle-agent-wallet-adapter)).
+If the process stops first, the journal row holds no transaction id or hash,
+the adapter's lookup of that reference is `UNKNOWN` without a hash, and
+recovery of a checkpoint holding the hash raises `INCONSISTENT_STATE`
+(`SESSION_NOT_READY: the wallet's record of a saved transaction differs from
+the evidence`), since recovery needs the wallet's own record of the
+transaction to show it. The restarted adapter never writes it. Circle's
+documentation describes no lookup of a transaction by the idempotency key the
+adapter sends, `circle transaction list` prints a wallet's transactions without
+their idempotency keys, and MPPI documents no procedure for writing a
+transaction id and hash into the adapter's journal: there is no documented
+remedy.
+A restored `FAILED` result with no transaction hash and no wallet operation
+id, the wallet's attestation that submission never began, stays `FAILED`: the
+session's next settlement prepares a new reference, and a close continues
+under its own, as before the restart.
 Recovery never restarts execution or restores an old Control stream's authority.
 Unresolved runs retain their reservations until definitive provider reports.
+
+An admitted run that your host never dispatched before a crash has no meter and
+no final, so it stays unresolved and blocks its session: its reattachment is
+refused `STATE_UNAVAILABLE`. If your own records prove nothing reached the
+inference backend, report it `CANCELLED` at zero with
+`await sdk.runs.report_terminal(run.context, TokenCounts(0, 0, 0), RunStatus.CANCELLED)`,
+where `run` is its `RecoveryRun` in the evidence; the session then reattaches
+with that outcome. A run that may have done billable work stays unresolved for
+the operator.
 
 A reconnect may name a pending run this provider never held: the agent records
 a run before its Complete arrives. When every admission is known, the snapshot
@@ -114,6 +198,82 @@ admitted and served. Use `recover_current` only if your host checkpoints durably
 after every admission and before dispatch, and never restores a checkpoint
 older than its newest.
 
+**When to checkpoint.** The runtime has no persistence callback and never waits
+for your storage. Meters, Receipts, snapshots and close results reach the agent
+before your next checkpoint can hold them. If a crash restores a checkpoint
+older than what the agent last saw, its reattachment is refused
+`STATE_UNAVAILABLE`: the agent names a later Meter sequence than the checkpoint
+holds. Nothing is paid wrongly, and the agent keeps its exits (`requestClose`
+then `withdraw`, or the idle release), but you can collect only up to the
+voucher that checkpoint holds and lose cooperative close for that session.
+Checkpoint inside your execution provider after admission and before dispatch,
+again when you record each final report, and restore only your newest
+checkpoint.
+
+A closed session is terminal on chain: the contract refuses every payment on
+it. Once the runtime holds nothing more to do for one (no run active or
+preparing, every retained operation resolved, a confirmed close of its own
+with its `CloseResult`, and not inconsistent), it retires the session after
+`closed_retention` seconds, unless a live attachment owns it. Pass
+`closed_retention=` to `Mppi` or `Mppi.from_config`: 86,400 (24 hours) by
+default, 3,600 to 604,800. A close another exit completed, `withdraw` or
+`releaseIdle`, needs no `CloseResult`. Within the window an agent can reattach
+to read the final state or retry a lost `CloseResult`, and the host can take a
+final checkpoint. Afterwards `get` and `checkpoint` raise `STATE_UNAVAILABLE`;
+`Hooks(on_session_retired=...)` observes the retirement. No session count is
+limited.
+
+Retirement also bounds the wallet's records. The runtime remembers each
+operation reference it prepared or restored, and when each session it covers
+stops needing it: when the session retires here, or `closed_retention` seconds
+after a later confirmed collection of the session, a capture or close under
+another reference, leaves the reference named in neither the session's
+operation nor its baseline. Once no covered session needs a reference,
+maintenance passes it at once to the wallet's `retire(operation_refs=...,
+at=...)`, with `at` the latest of those times in Unix seconds, from which the
+wallet may forget it, even a day ahead. A wallet that forgets keeps `at`
+durably, so a restart before then loses nothing, and withdraws it on a
+`reconcile` of the reference, or when its record of the reference gains a
+transaction hash, since a recovery from an older checkpoint may present the
+reference again
+([wallet requirements](sdk-interfaces.md#wallet-requirements)). Calls go
+one at a time, one for each whole second of `at` (rounded down), with the
+latest `at` of that second, so none is forgotten before it is due (the Circle
+adapter keeps whole seconds); after the wallet raises, the rest wait at least
+one settlement interval. A
+checkpoint taken more than `closed_retention` before a later confirmed
+collection may name a record the wallet has forgotten, and its recovery is
+refused. A reference this process never learned, such as one superseded and not
+yet passed when the process stopped, is never passed, and its record stays. No
+wallet call precedes a hand-over, except for a reference whose record no wallet
+answer in this process has matched: one restored without a transaction hash, or
+kept against a wallet answer that disagreed with it. Maintenance asks the
+wallet about such a reference first and passes it only if the wallet's record
+of it agrees; otherwise its record stays. A recovery that installs a session
+takes the references it names off the retirement queue, and a `retire` call
+skips each one a session needs again when it checks, just before calling the
+wallet. One a recovery names while that wallet call runs can still be marked,
+and a later recovery from a checkpoint naming it is refused once the wallet has
+forgotten it. Both members are optional: the
+runtime calls `retire` and reads a `near_capacity` property only when the
+wallet has them. When `near_capacity` turns true, maintenance reports one
+`on_error` `HookError` with operation `"wallet"` and code `"RESOURCE_EXHAUSTED"`.
+Close long-lived sessions before the wallet refuses new operations.
+
+The runtime never reinstalls a closed session. A `SessionOpen` for one it does
+not hold is refused `SESSION_CLOSED`. `recover` and `recover_current` refuse
+evidence that `RecoveryEvidence.is_final()` reports final once the chain shows
+the session closed: it records no reservation and no unresolved operation, and
+is not inconsistent. Pass such records to `recover` at startup all the same; do
+not skip them. The refusal hands to retirement, as if the session retired
+then, each operation reference they name whose own record in the wallet names
+the same transaction hash as the saved record, or, like it, none, and the same
+wallet operation id when the saved record names one. The runtime asks the wallet
+first and keeps any other reference, which stays for the wallet's own
+reconciliation, so a mixed-up record cannot have another session's record
+forgotten. Closed evidence with
+unresolved work still recovers, and retires once that work resolves.
+
 Before the first authenticated attachment, a known unused opening can be
 exported and recovered at generation zero in private `RecoveryEvidence`.
 It has no accepted voucher, usage, runs or reservations and is never ready.
@@ -122,11 +282,47 @@ not prove it unused. Recovery preserves close intent and operation identity.
 Only fresh authentication creates generation one, and ordinary Control snapshots
 continue to require a positive generation.
 
+`Hooks(on_timing=...)` receives an `OperationTiming` for each request's
+admission and each `settle`, `settleBatch` or `close` call, including the
+background collector's: its time split into the coverage callback, chain reads,
+the wallet's call and waiting. See [lifecycle hooks](lifecycle-hooks.md).
+
 `settleBatch(session_ids)` captures cumulative actual usage for the ordered
 session list. It simulates the exact sender and calldata before submission,
 preserves operation references through uncertainty and verifies outcomes per
 item. The background collector groups due sessions and can split a group after
 a pre-submission simulation failure. No split retries an unknown submission.
+Every batch fits the wallet's optional `max_call_bytes` attribute, the largest
+calldata it accepts in one call: 61,440 bytes when the wallet states none, the
+Circle adapter's bound. A batch's calldata is 260 bytes plus 448 per session,
+so by default at most 136 sessions; the collector takes the rest of the due
+sessions in further batches of the same pass, and a `settleBatch` call over the
+bound raises `ValidationError` before any intent is recorded. A wallet whose
+real limit is gas rather than bytes states a smaller size. `Mppi` refuses a
+bound that is not an integer of at least one settlement call, 452 bytes.
+`sessions.close(session_id)` accepts close intent once: it stops the session's
+runs and sends their owner one `Drain`, and the close waits until those runs
+end. A later `close` call, the agent's `CloseRequest` or a maintenance pass
+only continues the close, and maintenance reconciles a submitted close on
+every pass until it resolves. A failed transaction does not end close intent:
+when the wallet attests that submission never began (`FAILED` without a
+transaction hash), the runtime prepares the close again from current chain
+state under the same operation reference, on the next `close` call and in the
+background at most once per settlement interval. A close mined and reverted
+(`FAILED` with a transaction hash) changed no state, but its reference stays
+bound to that transaction: the runtime prepares it again under a successor
+reference, the close reference with its retry count after a dot
+(`close:<id>.1`, then `.2`), at most once per settlement interval, on a `close`
+call or in the background. The session's close reference then names the new
+one, so its checkpoint recovers; a runtime restored from an older checkpoint
+derives the same successor, and the wallet's binding of it continues that
+retry. The runtime simulates each successor from the provider wallet first, as
+it does a batch: if the simulation fails, nothing is recorded or sent, the
+`close` call raises the simulation's error, and the next attempt waits a
+settlement interval.
+A `settle`, `settleBatch` or `close` call cancelled before its wallet call began
+leaves no intent; once that call may have begun, its result stays `UNKNOWN` and
+is only reconciled under its reference.
 
 ### Agent composition
 
@@ -187,15 +383,21 @@ record naming its kind and reason; the attachment and every run continue. A
 Receipt is checked against its retained run and accepted prices, as its
 Terminal is, with no chain read. Its settled total and observation are the
 provider's report: the agent proves the settled total at a cooperative close
-and reads it at every attachment. A rejected `Meter` stops the session
-cursor: Control stays open so active runs finish (closing it would make the
-provider cancel them), no new run starts, and the next request re-syncs once
+and reads it at every reattachment. A new session's first attachment, in the
+call that opened it, instead checks the provider's snapshot against the
+session's opening, which proved its deposit with nothing settled, and reads no
+chain, unless a refresh had already accepted a block after the opening's. A
+first attachment made by a later call or process reads the session at the
+provider's block. A rejected `Meter` stops the session cursor: Control stays
+open so active runs finish (closing it would make the provider cancel them),
+no new run starts, and the next request re-syncs once
 no stream is live, or after 60 s, when a stream still live is ended. A run registered but never sent is recorded `NOT_ADMITTED`
 locally and is never named pending at a reattach.
 
 Reuse the checkpoint path and recoverable signer credential across restarts.
 The agent uses an exclusive local file lock and atomic, mode-0600 checkpoints
-on macOS/Linux. It stores signed payment intents and accounting, not private
+on macOS/Linux; a second client waits up to one second for the lock, then
+refuses the checkpoint as in use. It stores signed payment intents and accounting, not private
 keys or prompts. Its size stays bounded in a long session: a run is forgotten
 once its final and final Meter are applied, its stream has ended and its
 Receipt was verified (or a snapshot resolved it, the session closed, or 1,024
@@ -214,12 +416,28 @@ Observed catalog changes do not imply acceptance: call `accept_catalog(hash)`
 explicitly for subsequent runs. Historical runs retain their original prices.
 An explicit open can continue an original, never-submitted opening intent using
 its retained authorization. Once submission is uncertain, reconcile its original
-reference; recovery never creates a replacement deposit.
+reference; recovery never creates a replacement deposit. When the wallet names
+no transaction for an uncertain opening, reconciling reads whether its session
+is funded; if it is, `ChainReader.opening_transaction` finds the transaction by
+its `SessionOpened` log, searched from the block the intent was made at over at
+most 9,999 blocks, and that transaction's receipt must prove the opening before
+it is `CONFIRMED`. Otherwise it stays as the wallet reported it, `PENDING` or
+`UNKNOWN`.
 
 `client.sessions.open` supports explicit positive pre-warming. `topUp` uses raw
 positive USDC base units. `sessions.close` requests cooperative close; transaction
 exits retain `requestClose`, `withdraw` and `releaseIdle`. Inspect operation
-states and reconcile original references after uncertainty. An
+states and reconcile original references after uncertainty. An exit that
+`FAILED` is sent again when called again, as a new attempt under the next
+reference: `withdraw-<session id hex>` is followed by
+`withdraw-<session id hex>.1`, then `.2`, and likewise for `releaseIdle` and
+`requestClose`. One still `PENDING` or `UNKNOWN` is reconciled instead, since
+it could still land, and its outcome stands until it shows `FAILED`; a
+confirmed one is final. Earlier attempts stay in the journal, and the latest
+attempt of each kind is the one retirement reads. An exit a `0.1.5` journal
+holds failed is retried the same way after the upgrade. An attempt whose
+journal save fails before the wallet is called is dropped, so nothing unsent
+is kept and the exit can be called again. An
 `OperationResult` keeps the kind of error a wallet call raised as `cause`
 (SDK-written, never remote text), and the same goes to `on_error`. A wallet
 adapter raises `NotSubmittedError` only when its own durable record proves the
@@ -239,9 +457,9 @@ preserving unresolved evidence. Neither implicitly closes escrow.
 Restored session inspection, reconciliation and wallet-only exits use retained
 local evidence and the chain without requiring the provider endpoint. Cooperative
 close first establishes authenticated Control. A canonical close above validated
-usage raises `CloseAccountingError` with its confirmed operation result; the
-client retains that evidence and never treats the discrepancy as a failed
-transaction to resubmit.
+usage raises `CloseAccountingError` with its confirmed operation result (`None`
+for a close the client did not make, below); the client retains that evidence
+and never treats the discrepancy as a failed transaction to resubmit.
 
 The client retains the provider's close report before proving it on chain. If
 that proof cannot be read yet, `sessions.close` returns `PENDING` with the close
@@ -255,10 +473,22 @@ A checkpoint holds one session at a time. Once the agent's own close is
 or `releaseIdle`), the next request or `sessions.open` retires that session and
 funds a new one with the same signer over a new Control stream. The checkpoint's
 last record for the closed session is kept beside it as
-`<checkpoint name>.<session id>.closed<suffix>`, and the checkpoint then drops
+`<checkpoint name>.<session id>.closed<suffix>` (a retried retirement replaces
+it, atomically, only with a record keeping all its evidence: each operation
+with its identifiers and final state, its close records, and how it was
+retired or a proof of the agent's own close), and the checkpoint then drops
 that session's ledger and operations, so `sessions.get`, `list`, `terms`, `run`
-and `reconcile` no longer know it. Retirement waits until a new session can be
-funded: without `agent_id` or an `initial_session_tokens` choice, opening raises
+and `reconcile` no longer know it. A `sessions.reconcile`, a top-up, or the
+proof of a close the provider reported (`sessions.close` or
+`reconcile("close-...")`) that starts while a retirement runs waits for it to
+end, then finds the session gone, or still retained if the retirement failed;
+one already under way when the retirement began finishes first. A call that
+takes the open lock (an exit, `sessions.close` sending a close request,
+`sessions.recover`, another opening) waits for the opening that retires it;
+an exit, a close request or a recovery then finds the session gone, before it
+acts on the next one.
+Retirement waits until a new session can be funded: without `agent_id` or an
+`initial_session_tokens` choice, opening raises
 before anything is dropped. Retirement waits for no stream: while a
 request on the closed session is still ending, opening raises `ClientError`.
 A close above validated usage is never retired; opening raises its
@@ -266,8 +496,47 @@ A close above validated usage is never retired; opening raises its
 session's state at or after the exit's block, where its settled total is final,
 is compared with validated usage the same way. That is current state, which a
 closed session never changes, so no node needs to keep the exit's block. A close
-still `PENDING`, a `requestClose` and a session closed by its provider or anyone
-else are not retired.
+of the agent's own that is still in flight is not retired: while a cooperative
+close it requested awaits its result, a close the provider reported awaits its
+proof before the client's chain evidence shows the session `Closed`, or its own
+exit is unresolved, `PENDING` or `UNKNOWN` with a transaction hash, opening
+raises `ClientError` ("session close is pending"). Opening first reconciles
+such an exit, after a restart too, so it moves on as the wallet and chain
+report it: `CONFIRMED` retires the session as above, `FAILED` leaves no close of
+the agent's own, and an exit still in flight keeps the rule until a later
+opening finds it resolved. Once that evidence shows the session `Closed`,
+opening also proves a reported close itself; proven, it is the agent's own
+close.
+
+A session closed by its provider or by anyone's `releaseIdle`, with no close of
+the agent's own to explain it, whatever close-pending state the provider
+reported, is retired only by `sessions.open`, the same way, and
+that call then funds a new session with the same signer. Its settled total is
+the session's own state in fresh evidence showing it `Closed`, final for either
+kind, compared with validated usage the same way; above it, `sessions.open`
+raises `CloseAccountingError` whose `operation` is `None`, since the client
+holds no transaction for a close it did not make. A request on such a session
+raises `PaymentError` with `SESSION_NOT_READY` / `SESSION_CLOSED` instead, once
+the client's chain evidence shows it closed, without reconnecting to the
+provider.
+
+The same rule applies when that evidence shows the session `Closed` and the
+agent cannot prove a close of its own: a reported close whose transaction is
+not that session's close, whose amounts differ or whose receipt cannot be read
+at that moment, or its own `withdraw` or `releaseIdle` left `UNKNOWN` with no
+transaction hash, as after a crash between saving it and the wallet call.
+Opening first asks the wallet for that exit's record: if the wallet holds a
+hash, the exit is traceable after all and is reconciled as above. On a closed
+session such an exit can only have reverted or been the close itself, so the
+settled total bounds it too, and after retirement the client never presents
+it again. An operation the client holds no hash for is never passed to the
+wallet's `retire`, so the wallet is never told it may forget its record, which
+may hold one. The
+archived record of a session retired this way holds
+`closed_by_other`: the `block` and `block_hash` whose `Closed` state proved the
+settled total, that total as `settled`, validated usage as `usage`, and in
+`superseded` the unresolved `"reported_close"` or exit reference, which stays in
+the record as it was.
 
 ### Many requests in one session
 
@@ -374,27 +643,39 @@ funded limit while refresh is pending; a denied grant still terminates the run.
 
 **Read cost.** Arc commits each block with final, irreversible settlement
 ([deterministic finality](https://docs.arc.io/arc/concepts/deterministic-finality)),
-so no earlier block is re-read. A refresh is one round trip: one JSON-RPC batch
-with the latest header, one Multicall3 `aggregate3` call reading the pause level,
-each watched provider's registry entry and each watched session, and the two
-implementation slots. The multicall's own block number, time and parent hash
-must match the header; views that ran at another block, as through an adapter
-that sends one call at a time, must match that block's header, read by number
-in one more round trip. The first refresh also checks the chain id, the pinned
-contracts' code and Multicall3's code; without verified Multicall3 code a
-refresh is two round trips. Opening, top-up and close are each proved by one
-transaction receipt holding the contract's own event; a mined transaction
-without that event is a definite failure, never unknown. A settlement also
-reads the session at its block. JSON-RPC batches do not reduce what most paid
-plans count.
+so no earlier block is re-read. A refresh sends the latest header, Multicall3
+`aggregate3` calls reading the pause level, each watched provider's registry
+entry and each watched session, at most 512 views and one registry entry per
+call, and the two implementation slots, in JSON-RPC batches of at most 32 calls
+and 1 MiB: one round trip up to about 2,300 watched sessions, and one more for
+each further batch. `follow(funding=(agent_id, wallet))` adds, until
+`unwatch_funding()`, the registry's binding for that id to the first multicall
+and the wallet's code to the batch (`ChainSnapshot.funding`). The agent watches
+them while it opens a session, so in a fresh process an opening from a wallet
+without code reads the chain twice, the snapshot and the receipt, and one from
+a smart account once more, for its code and `isValidSignature` at the
+snapshot's block (`ChainReader.funding_signature`). Each multicall's own block number, time and
+parent hash must match the header; one that ran at another block, in a later
+batch or through an adapter that sends one call at a time, is read again pinned
+to the header's block, with that header read by number: one more round trip per
+batch of them. Views from two blocks never form a snapshot. The first refresh
+also checks the chain id, the pinned contracts' code and Multicall3's code;
+without verified Multicall3 code a refresh is the head and then the reads pinned
+to it, two round trips while they fit one batch. Opening, top-up and close are
+each proved by one transaction receipt holding the contract's own event; a mined
+transaction without that event is a definite failure, never unknown. A
+settlement also reads the session at its block. JSON-RPC batches do not reduce
+what most paid plans count.
 
-A failed refresh is repeated once, 250 ms later, before it fails closed, and
-`last_refresh_failure` keeps the last failure's error class, SDK reason and
-monotonic time. A load-balanced RPC may serve backends at slightly different
+A failed refresh is repeated once, after a random share of 250 ms, before it
+fails closed, and `last_refresh_failure` keeps the last failure's error class,
+SDK reason and monotonic time. A load-balanced RPC may serve backends at slightly different
 heights ([Arc RPC endpoints](https://docs.arc.io/arc/references/rpc-endpoints)):
-a head or block behind accepted evidence is `ChainLagError`, not a regression.
-If it persists, the accepted snapshot stays and ages as usual, so freshness is
-never extended. A different block at an accepted height still fails.
+a head or block behind accepted evidence, or one a backend has not imported yet
+(-32014 once the reader's repeats are spent), is `ChainLagError`, not a
+regression. If it persists, the accepted snapshot stays and ages as usual, so
+freshness is never extended. A different block at an accepted height still
+fails.
 
 `snapshot()` returns fresh evidence or fails; `current` exposes the last evidence
 for accounting even when stale. `readiness(session_id)` checks positive existence,
@@ -407,7 +688,15 @@ evidence contradicting the pinned deployment or accepted evidence
 (`ChainContradictionError`: another chain id, deployed code, implementation or
 signing domain, or a changed or regressed block or session) holds it at
 `INCONSISTENT_STATE` until a later refresh is accepted; unavailable, rate-limited,
-lagging or timed-out reads never do. The agent refreshes before
+lagging or timed-out reads never do. `confirm(session_id, state, observation)`
+records a session state proven from a receipt, such as the agent's own opening,
+top-up or close, without a refresh; `observation` is the receipt's block. A
+refresh behind that block, or one that read before the session was watched, is
+lag: the accepted evidence, the proven state included, stays. The first refresh
+at or after it replaces the proven state. Once refreshes have stayed behind that
+block for longer than `max_age_ms`, `confirmed_readiness` reports the proven
+session `STATE_UNAVAILABLE` until a refresh reaches it, so a block no backend
+reaches cannot keep it ready; lag never holds it at `INCONSISTENT_STATE`. The agent refreshes before
 opening, attachment, top-up and close when its evidence is older than
 `max_age_ms`, and `on_refresh_failure` reports a failed background refresh. A pending transaction extends no
 deposit or deadline. The observer requires an RPC supporting EIP-1898 canonical
@@ -521,24 +810,30 @@ structured evidence, only the supplied reference can be preserved. The session
 runtime must retain prior confirmed results and reject observation regressions.
 
 `ChainReader(rpc, profile)` performs synchronous, block-pinned reads. Invoke it
-outside the gRPC I/O loop. `HttpJsonRpc` is a bounded read-only adapter: no wallet
-submissions or redirects. Its methods only read, so it repeats a transient
-failure up to twice, 250 ms and then 1 s later: HTTP 408, 425, 429, 500, 502,
-503 or 504, a refused or dropped connection, a timeout, or JSON-RPC error -32005
-or -32007 (rate limits) or -32014 (a backend that has not imported the block
-yet), including one entry of a batch. Any other failure is not repeated. Repeats
-start within one transport timeout plus those delays of the first attempt, so a
-timed-out attempt is repeated once; by default each attempt is bounded at 5 s.
-It keeps connections alive and sends the reads one step needs as one JSON-RPC
-batch of at most 32 calls; an endpoint that answers a batch with a single object,
-or refuses a batch request and then serves a single call, is read one call at a
-time. TLS verifies certificate and host;
-`HttpTransport(ca_file=...)` can trust a provider's private CA. Its timeout bounds
-individual blocking I/O operations, not an entire SDK operation's lifetime.
+outside the gRPC I/O loop. `HttpJsonRpc` is a bounded read-only adapter: no
+wallet submissions or redirects. Its methods only read, so it repeats a
+transient failure up to twice, after a random delay of up to 250 ms and then up
+to 1 s: HTTP 408, 425, 429, 500, 502, 503 or 504, a refused or dropped
+connection, a timeout, or JSON-RPC error -32005 or -32007 (rate limits) or
+-32014 (a backend that has not imported the block yet), including one entry of a
+batch. A refusal's `Retry-After`, in seconds or as an HTTP date, is waited
+before that delay; `TransportError.retry_after` keeps it. Any other failure is
+not repeated. Repeats start within one transport timeout plus 1.25 s of the
+first attempt: a wait that would end later is not begun, and the read fails at
+once. By default each attempt is bounded at 5 s, so a timed-out attempt is
+repeated once. It keeps connections alive and sends the reads one step needs as
+JSON-RPC batches of at most 32 calls and 1 MiB, one after another; a call longer
+than 1 MiB is refused before anything is sent, and a repeat sends only the calls
+not yet answered. An endpoint that answers a batch with a single object, or
+refuses a batch request and then serves a single call, is read one call at a
+time. TLS verifies certificate and host; `HttpTransport(ca_file=...)` can trust
+a provider's private CA. Its timeout bounds individual blocking I/O operations,
+not an entire SDK operation's lifetime.
 
 `DeploymentProfile` requires explicit Arc chain/proxy/registry identity and
 runtime-code pins for both proxies and implementations. Built-in setup loads
-the packaged official testnet pins; explicit composition supplies its own profile.
+the packaged official profile of the selected network, mainnet or testnet;
+explicit composition supplies its own profile.
 `verify_deployment(block)` checks code hashes, ERC-1967 slots and
 MPPI signing domain. Manifest provenance, initialization and governance checks
 remain deployment release responsibilities. A caller-supplied profile is not
@@ -555,6 +850,13 @@ nonpayable operation at a canonical block hash and estimates gas at that block's
 number, then rechecks its hash. `SimulationEvidence` reports the observed block,
 estimate and block gas limit. Simulation is advisory; it never submits a wallet
 transaction or replaces canonical confirmation.
+
+`opening_transaction(session_id, first, last)` is one `eth_getLogs` filtered by
+the proxy and the `SessionOpened` event's indexed session id, over at most
+9,999 blocks from `first`, the chunk Arc's endpoints serve
+([RPC endpoints](https://docs.arc.io/arc/references/rpc-endpoints)). It returns
+the transaction hash it names, or `None`; that is a lead, which `reconcile`
+then proves.
 
 `reconcile(operation, operation_ref=..., tx_hash=..., wallet_operation_id=...)`
 never submits a transaction. It returns the shared `OperationResult`:

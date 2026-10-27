@@ -446,8 +446,9 @@ async fn every_log_inclusion_field_and_canonical_abi_is_checked() {
         OperationState::Unknown
     );
     rpc.logs(vec![settled(&d, 5420000, 5420000, 0)]);
+    // The block read with the receipt's state reports another hash.
     rpc.block_reads.store(0, Ordering::SeqCst);
-    *rpc.reorg_after.lock().unwrap() = Some(1);
+    *rpc.reorg_after.lock().unwrap() = Some(0);
     assert_eq!(
         reconcile(&reader, &operation).await.state(),
         OperationState::Unknown
@@ -537,20 +538,31 @@ async fn opening_checks_full_descriptor_and_accepts_later_same_block_activity() 
 
 #[tokio::test]
 async fn deployment_pins_slots_signing_domain_and_canonicality_are_enforced() {
-    let (rpc, reader) = setup();
-    let block = reader.block(None).await.unwrap();
-    reader.verify_deployment(&block).await.unwrap();
+    // Code at a pinned address cannot change once deployed (EIP-6780), so each
+    // reader checks it once; implementation slots and the domain every time.
     for byte in [0x99, 0x98, 0x97, 0x96] {
+        let (rpc, reader) = setup();
+        let block = reader.block(None).await.unwrap();
         rpc.code
             .lock()
             .unwrap()
             .insert(hx(Address::repeat_byte(byte)), "0x6001".into());
         assert!(reader.verify_deployment(&block).await.is_err());
-        rpc.code
-            .lock()
-            .unwrap()
-            .insert(hx(Address::repeat_byte(byte)), "0x6000".into());
     }
+    let (rpc, reader) = setup();
+    let block = reader.block(None).await.unwrap();
+    reader.verify_deployment(&block).await.unwrap();
+    reader.verify_deployment(&block).await.unwrap();
+    let calls = rpc.calls.lock().unwrap().clone();
+    let count = |method| calls.iter().filter(|(m, _)| m == method).count();
+    assert_eq!(
+        (
+            count("eth_chainId"),
+            count("eth_getCode"),
+            count("eth_getStorageAt")
+        ),
+        (1, 4, 4)
+    );
     for byte in [0x99, 0x97] {
         let key = hx(Address::repeat_byte(byte));
         let previous = rpc
@@ -816,6 +828,43 @@ async fn uncertain_wallet_submission_is_only_looked_up_never_resubmitted() {
     assert_eq!(result.state(), OperationState::Unknown);
     assert!(result.tx_hash().is_none());
     assert!(result.wallet_operation_id().is_none());
+}
+
+#[tokio::test]
+async fn a_wallet_cause_is_kept_but_never_compared() {
+    let (_, reader) = setup();
+    let d = descriptor();
+    let operation = calls().settle(&d, 5510000, 5420000, &[1; 65]).unwrap();
+    let plain = OperationResult::new(
+        "original",
+        OperationState::Unknown,
+        None,
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    assert!(plain.clone().with_cause("").is_err());
+    let wallet = Wallet {
+        address: d.operator,
+        response: Mutex::new(Ok(plain
+            .clone()
+            .with_cause("Unavailable (TIMEOUT)")
+            .unwrap())),
+        executions: AtomicUsize::new(0),
+        lookups: AtomicUsize::new(0),
+    };
+    for result in [
+        submit_operation(&wallet, &operation, "original", &reader)
+            .await
+            .unwrap(),
+        reconcile_operation(&wallet, &operation, "original", &reader)
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(result.cause(), Some("Unavailable (TIMEOUT)"));
+        assert_eq!(result, plain);
+    }
 }
 
 #[tokio::test]

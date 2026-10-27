@@ -7,9 +7,9 @@ their shared protocol dependency. Rust and Solidity have their own manifests.
 ## Toolchain
 
 The local validation profile uses Python 3.13.7, uv 0.10.12, Rust 1.95.0,
-Buf 1.73.0 and Foundry 1.8.3. Solidity is pinned to 0.8.37 in
-`contracts/foundry.toml`. Python dependencies are locked in `uv.lock`;
-Rust dependencies are locked in `sdks/provider/rust/Cargo.lock`.
+cargo-audit 0.22.2, Buf 1.73.0 and Foundry 1.8.3. Solidity is pinned to
+0.8.37 in `contracts/foundry.toml`. Python dependencies are locked in
+`uv.lock`; Rust dependencies are locked in `sdks/provider/rust/Cargo.lock`.
 
 Install those tools, then:
 
@@ -31,10 +31,17 @@ explicitly. Runtime protobuf is separately pinned to 7.36.2.
 
 The check command verifies generated files, protobuf lint/format, Python
 lint/format/types/tests, Rust format/lint/tests, Solidity format/tests and ABI drift,
-independent Python and Rust package builds, installed wheel imports and the
-locked Python runtime dependencies against published vulnerability advisories.
+independent Python and Rust package builds, installed wheel imports, and the
+locked Python runtime and Rust dependencies against published vulnerability
+advisories. cargo-audit fetches the RustSec advisory database on each run and
+fails if it cannot. A vulnerability fails the check; unmaintained, unsound and
+yanked crates are listed (cargo-audit 0.22.2 source, `src/auditor.rs`
+`Auditor::new` and `src/presenter.rs` `should_exit_with_failure`:
+<https://github.com/rustsec/rustsec/tree/cargo-audit/v0.22.2/cargo-audit>).
+An advisory accepted after review is ignored in
+`sdks/provider/rust/.cargo/audit.toml`, with its reason and review date.
 It exits on failure. `--report /path/to/results.json` records each executed
-check and its exit status. Dependency downloads and the advisory query need
+check and its exit status. Dependency downloads and the advisory queries need
 network access; no hosted CI service is required.
 
 ## Regeneration
@@ -67,5 +74,6 @@ payments and does not establish deployment acceptance.
 Verified against [uv workspaces](https://docs.astral.sh/uv/concepts/projects/workspaces/),
 [Buf local generation](https://buf.build/docs/generate/usage/),
 [gRPC Python generation](https://grpc.io/docs/languages/python/quickstart/),
-[Cargo packaging](https://doc.rust-lang.org/cargo/commands/cargo-package.html)
+[Cargo packaging](https://doc.rust-lang.org/cargo/commands/cargo-package.html),
+[cargo-audit 0.22.2](https://github.com/rustsec/rustsec/blob/cargo-audit/v0.22.2/cargo-audit/README.md)
 and [Foundry tests](https://getfoundry.sh/forge/tests/overview/).

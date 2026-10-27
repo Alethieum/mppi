@@ -148,6 +148,7 @@ struct State {
     simulation: Option<(Vec<u8>, Address, Vec<u8>)>,
     workflow_simulation: bool,
     fail: Option<&'static str>,
+    cause: ChainError,
     bad_code: bool,
     calls: Vec<(String, Value)>,
     replies: HashMap<Vec<u8>, Vec<u8>>,
@@ -169,6 +170,7 @@ impl MockRpc {
                 simulation: None,
                 workflow_simulation: false,
                 fail: None,
+                cause: ChainError::Unavailable,
                 bad_code: false,
                 calls: vec![],
                 replies: HashMap::new(),
@@ -185,7 +187,7 @@ impl Rpc for MockRpc {
         let mut state = self.state.lock().unwrap();
         state.calls.push((method.into(), params.clone()));
         if state.fail == Some(method) {
-            return Err(ChainError::Unavailable);
+            return Err(state.cause);
         }
         match method {
             "eth_chainId" => Ok(json!(format!("0x{CHAIN:x}"))),
@@ -826,6 +828,8 @@ enum WalletMode {
     AlterHash,
     AlterHandle,
     PreSubmissionFailure,
+    /// Fails before its own record, which then has nothing to reconcile.
+    UnrecordedFailure,
     AttemptedUnknown,
 }
 fn call_bytes(raw: &[u8], index: usize) -> Vec<u8> {
@@ -926,6 +930,17 @@ impl TransactionWallet for SetupWallet {
             self.release.notified().await;
         }
         let mode = *self.mode.lock().unwrap();
+        if mode == WalletMode::UnrecordedFailure {
+            return Ok(OperationResult::new(
+                reference,
+                OperationState::Failed,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap());
+        }
         if mode != WalletMode::PreSubmissionFailure {
             self.submissions.lock().unwrap().push(reference.to_owned());
         }
@@ -990,13 +1005,22 @@ impl TransactionWallet for SetupWallet {
             )
             .unwrap());
         }
-        let known = self
-            .results
-            .lock()
-            .unwrap()
-            .get(reference)
-            .cloned()
-            .ok_or(WalletError)?;
+        let known = self.results.lock().unwrap().get(reference).cloned();
+        let known = match (known, mode) {
+            (Some(known), _) => known,
+            (None, WalletMode::UnrecordedFailure) => {
+                return Ok(OperationResult::new(
+                    reference,
+                    OperationState::Unknown,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )
+                .unwrap());
+            }
+            (None, _) => return Err(WalletError),
+        };
         if matches!(
             mode,
             WalletMode::OmitHash
@@ -1220,6 +1244,27 @@ async fn published_conflicts_cannot_be_silently_changed_by_onboard() {
 }
 
 #[tokio::test]
+async fn a_failed_chain_read_keeps_its_cause_without_remote_text() {
+    let (dir, rpc, registry, wallet) = workflow();
+    let cause = ChainError::Rpc(-32000);
+    rpc.edit(|s| {
+        s.fail = Some("eth_call");
+        s.cause = cause;
+    });
+    let mut options = dir.options();
+    options.adopted_identity = Some(U256::ZERO);
+    let error = onboard(&declarations(), wallet.clone(), registry, options)
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "provider registry identity is unavailable");
+    assert_eq!(
+        error.to_string(),
+        "provider registry identity is unavailable: chain RPC returned JSON-RPC error -32000"
+    );
+    assert_eq!(wallet.write_count(), 0);
+}
+
+#[tokio::test]
 async fn original_revert_is_not_retried_until_a_later_explicit_invocation() {
     let (dir, _, registry, wallet) = workflow();
     wallet.mode(WalletMode::Revert);
@@ -1247,8 +1292,16 @@ async fn original_revert_is_not_retried_until_a_later_explicit_invocation() {
 
 #[tokio::test]
 async fn sec03_onboarding_presubmission_failure_allows_explicit_repair_without_stalling() {
+    for mode in [
+        WalletMode::PreSubmissionFailure,
+        WalletMode::UnrecordedFailure,
+    ] {
+        onboarding_presubmission_failure_allows_repair(mode).await;
+    }
+}
+async fn onboarding_presubmission_failure_allows_repair(mode: WalletMode) {
     let (dir, rpc, registry, wallet) = workflow();
-    wallet.mode(WalletMode::PreSubmissionFailure);
+    wallet.mode(mode);
     let failed = onboard(
         &declarations(),
         wallet.clone(),
@@ -1481,8 +1534,16 @@ fn updating() -> (TestDir, Arc<MockRpc>, Arc<RegistryReader>, Arc<SetupWallet>) 
 
 #[tokio::test]
 async fn sec03_update_presubmission_failure_allows_explicit_repair_without_stalling() {
+    for mode in [
+        WalletMode::PreSubmissionFailure,
+        WalletMode::UnrecordedFailure,
+    ] {
+        update_presubmission_failure_allows_repair(mode).await;
+    }
+}
+async fn update_presubmission_failure_allows_repair(mode: WalletMode) {
     let (dir, rpc, registry, wallet) = updating();
-    wallet.mode(WalletMode::PreSubmissionFailure);
+    wallet.mode(mode);
     let changes = UpdateChanges::from_mapping(
         &json!({"models":{"upsert":[{"model":"example/model","rates":{"input":"999"}}]}}),
     )

@@ -19,6 +19,7 @@ from eth_abi import decode, encode
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 from mppi_protocol import chain as chain_module
+from mppi_protocol import follower as follower_module
 from mppi_protocol.capabilities import FundingAuthorization
 from mppi_protocol.catalog import parse_catalog
 from mppi_protocol.chain import (
@@ -28,12 +29,15 @@ from mppi_protocol.chain import (
     ChainReader,
     CodePin,
     DeploymentProfile,
+    FundingState,
     HttpJsonRpc,
 )
 from mppi_protocol.contract import ContractCalls
+from mppi_protocol.discovery import MAX_DOCUMENT_BYTES
 from mppi_protocol.errors import ValidationError
 from mppi_protocol.follower import ChainFollower
 from mppi_protocol.http import TransportError
+from mppi_protocol.signing import voucher_digest
 from mppi_protocol.types import (
     ConfirmedSettlementRef,
     Domain,
@@ -67,6 +71,7 @@ CATALOG = b'[{"input":"2","model":"example/model","output":"3"}]'
 SIGNATURE = b"\x01" * 64 + b"\x1b"
 MULTICALL3 = bytes.fromhex("ca11bde05977b3631167028862be2a173976ca11")
 MULTICALL3_RUNTIME = b"multicall3 test runtime"
+WALLET, AGENT_ID = b"\x5a" * 20, 43  # A funding wallet and the agent id binding it.
 
 
 @pytest.fixture
@@ -204,6 +209,7 @@ class EvidenceRpc:
         self.block_reads = 0
         self.reorg_after: int | None = None
         self.failure: Exception | None = None
+        self.logs_found: list[dict] = []  # What eth_getLogs answers.
 
     def call(self, method: str, params: list[object]) -> object:
         self.calls.append((method, copy.deepcopy(params)))
@@ -215,6 +221,8 @@ class EvidenceRpc:
         if method == "eth_getTransactionReceipt":
             assert params == [hx(TX)]
             return copy.deepcopy(self.receipt)
+        if method == "eth_getLogs":
+            return copy.deepcopy(self.logs_found)
         if method == "eth_getBlockByNumber":
             assert params in (
                 ["latest", False],
@@ -267,12 +275,16 @@ class EvidenceRpc:
             keccak(text="getLastBlockHash()")[:4]: bytes.fromhex(self.block["parentHash"][2:]),
         }
         answers = []
+        binding = abi_call("getAgentWallet(uint256)", ["uint256"], [AGENT_ID])
         for target, allow_failure, calldata in calls:
-            assert allow_failure is False  # One failing view fails the snapshot.
+            key = (target.lower(), "0x" + calldata.hex())
+            # One failing view fails the snapshot, except the funding binding.
+            assert allow_failure is (key == (hx(REGISTRY), binding))
             if target.lower() == hx(MULTICALL3):
                 answers.append((True, head[calldata]))
+            elif key not in self.responses and allow_failure:
+                answers.append((False, b""))  # The registry reverted.
             else:
-                key = (target.lower(), "0x" + calldata.hex())
                 answers.append((True, bytes.fromhex(self.responses[key][2:])))
         return hx(encode(["(bool,bytes)[]"], [answers]))
 
@@ -1079,6 +1091,7 @@ class RateLimitedTransport(EchoTransport):
 def test_rpc_retries_json_rpc_rate_limit_codes_only(monkeypatch) -> None:
     delays: list[float] = []
     monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(chain_module, "_jitter", lambda: 1.0)  # Each delay's ceiling.
     # EIP-1474 -32005 "Limit exceeded"; QuickNode's -32007 per-second limit.
     transport = RateLimitedTransport([-32005, -32007])
     rpc = HttpJsonRpc("https://rpc.example/private-api-key", transport)
@@ -1096,12 +1109,13 @@ def test_rpc_retries_json_rpc_rate_limit_codes_only(monkeypatch) -> None:
 
 
 def test_rpc_retries_start_within_one_transport_timeout_and_their_delays(monkeypatch) -> None:
-    # Each attempt here takes the whole 1 s timeout and fails transiently. The
-    # first repeat starts at 1.25 s, inside 1 s + 1.25 s; the next would start
-    # at 3.25 s, outside it. So a timed-out read is repeated once.
+    # Each attempt here takes the whole 1 s timeout and fails transiently. With
+    # each delay at its ceiling, the first repeat starts at 1.25 s, inside
+    # 1 s + 1.25 s; the next would start at 3.25 s, outside it.
     clock = [0.0]
     delays: list[float] = []
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(chain_module, "_jitter", lambda: 1.0)
 
     def sleep(delay: float) -> None:
         delays.append(delay)
@@ -1257,6 +1271,38 @@ def test_a_follower_refresh_is_one_round_trip(context) -> None:
     )
 
 
+def test_an_unwatched_session_leaves_the_next_refresh(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    sid = descriptor_id(DESCRIPTOR)
+    follower = ChainFollower(
+        reader, max_age_ms=60_000, collection_margin_ms=1000, wall_clock=lambda: TIMESTAMP + 1
+    )
+
+    def session_reads() -> int:
+        """getSession views in the last refresh's Multicall3 aggregate3."""
+        data = [
+            params[0]["data"]
+            for method, params in rpc.calls
+            if method == "eth_call" and params[0]["to"] == hx(MULTICALL3)
+        ][-1]
+        (calls,) = decode(["(address,bool,bytes)[]"], bytes.fromhex(data[10:]))
+        selector = keccak(text="getSession(bytes32)")[:4]
+        return sum(calldata[:4] == selector for _, _, calldata in calls)
+
+    async def scenario() -> None:
+        await follower.start()
+        await follower.watch_session(sid)
+        assert session_reads() == 1 and sid in follower.current.sessions
+        follower.unwatch_session(sid)
+        assert sid in follower.current.sessions  # Accepted evidence is kept.
+        await follower.refresh()
+        assert session_reads() == 0 and sid not in follower.current.sessions
+        await follower.stop()
+
+    asyncio.run(scenario())
+
+
 class TimesOutOnce:
     """A JSON-RPC transport over the evidence fake whose first request times out:
     it spends the whole attempt timeout on ``clock`` before failing."""
@@ -1337,63 +1383,149 @@ def test_a_snapshot_is_one_round_trip_anchored_to_the_header_it_ran_at(context) 
     assert states[sid].exists
     original = rpc.latest
 
-    def other_head(method, params):
-        # A load-balanced RPC answering the views at another block than the header.
-        if method == "eth_call":
-            rpc.block = dict(rpc.block, number=hex(BLOCK_NUMBER + 1))
-        return original(method, params)
-
-    rpc.latest = other_head
-    block, _, _, _ = reader.latest(sessions=(sid,))
-    # Anchored to the block the views ran at: its header, read by number.
-    assert block.observation.block_number == BLOCK_NUMBER + 1 and trips.trips == 3
-    assert rpc.calls[-1] == ("eth_getBlockByNumber", [hex(BLOCK_NUMBER + 1), False])
-
     def another_block(method, params):
-        # That number's header has another parent than the block the views saw.
-        if method != "eth_call":
-            return original(method, params)
-        rpc.block = dict(rpc.block, number=hex(BLOCK_NUMBER + 2))
-        answer = original(method, params)
-        rpc.block = dict(rpc.block, parentHash=hx(b"\xee" * 32))
-        return answer
+        # Views at the header's height, in a block with another parent.
+        if method == "eth_call":
+            rpc.block = dict(rpc.block, parentHash=hx(b"\xee" * 32))
+        return original(method, params)
 
     rpc.latest = another_block
     with pytest.raises(ChainEvidenceError, match="different blocks"):
         reader.latest(sessions=(sid,))
 
 
-def test_one_call_at_a_time_a_snapshot_anchors_to_the_block_its_views_ran_at(context) -> None:
-    reader, rpc, _ = context
-    registered(rpc)
+def test_one_call_at_a_time_views_that_ran_after_the_header_are_read_again_at_it() -> None:
+    node = Node()
 
     class OneCall:
-        """An adapter without ``call_many``: each read is its own request."""
+        """An adapter without ``call_many``: each read is its own request.
+        A block arrives between the header and the views."""
+
+        def __init__(self) -> None:
+            self.moved = False
 
         def call(self, method: str, params: list[object]) -> object:
-            return rpc.call(method, params)
+            answer = node.answer(method, params)
+            if params == ["latest", False] and not self.moved:
+                self.moved = True
+                node.head += 1
+            return answer
 
-    reader = ChainReader(OneCall(), reader.profile)
-    reader.latest()
-    original = rpc.latest
+    reader = ChainReader(OneCall(), node.profile())
+    sid = descriptor_id(DESCRIPTOR)
+    block, pause, _, states = reader.latest(sessions=(sid,))
+    assert block.observation.block_number == BLOCK_NUMBER
+    assert block.observation.block_hash == Node.hash(BLOCK_NUMBER) and pause is PauseLevel.NONE
+    assert states[sid].last_activity == node.activity(BLOCK_NUMBER)
+    assert [(at, pinned) for at, _, _, pinned in node.aggregates] == [
+        (BLOCK_NUMBER + 1, False),
+        (BLOCK_NUMBER, True),
+    ]
 
-    def new_block(method, params):
-        # A block arrives between the header and the views.
-        if method == "eth_call":
-            rpc.block = dict(
-                rpc.block,
-                number=hex(BLOCK_NUMBER + 1),
-                hash=hx(b"\xee" * 32),
-                parentHash=hx(BLOCK_HASH),
-                timestamp=hex(TIMESTAMP + 1),
-            )
-        return original(method, params)
 
-    rpc.latest = new_block
-    block, pause, _, _ = reader.latest()
-    assert block.observation.block_number == BLOCK_NUMBER + 1
-    assert block.observation.block_hash == b"\xee" * 32 and block.timestamp == TIMESTAMP + 1
-    assert pause is PauseLevel.NONE
+@pytest.mark.parametrize("code", [b"", b"\x60\x80"], ids=["no_code", "code"])
+@pytest.mark.parametrize("bound", [WALLET, bytes(20), None], ids=["bound", "cleared", "reverted"])
+def test_a_snapshot_reads_the_funding_binding_and_code_in_its_one_round_trip(
+    context, code, bound
+) -> None:
+    """An opening's funding check needs the registry's binding for its agent
+    id and whether the funding wallet has code. Both ride on the snapshot:
+    the binding in the multicall, allowed to fail since a registry reverting
+    for an unknown id binds none, and the code beside the implementation
+    slots."""
+    reader, rpc, _ = context
+    registered(rpc)
+    rpc.code[hx(WALLET)] = hx(code)
+    if bound is not None:
+        rpc.response(
+            REGISTRY, "getAgentWallet(uint256)", ["uint256"], [AGENT_ID], ["address"], [hx(bound)]
+        )
+    trips = Trips(rpc)
+    reader = ChainReader(trips, reader.profile)
+    sid = descriptor_id(DESCRIPTOR)
+    block, pause, _, states, state = reader._latest((), (sid,), (AGENT_ID, WALLET))
+    assert trips.trips == 1 and pause is PauseLevel.NONE and states[sid].exists
+    assert state == FundingState(
+        AGENT_ID, WALLET, bytes(20) if bound is None else bound, bool(code)
+    )
+    assert ("eth_getCode", [hx(WALLET), "latest"]) in rpc.calls
+    # Without it, the snapshot is as before.
+    assert reader.latest(sessions=(sid,))[0] == block and trips.trips == 2
+
+
+def test_without_multicall3_the_pinned_batch_reads_the_funding_evidence(context) -> None:
+    reader, rpc, _ = context
+    registered(rpc)
+    rpc.code[hx(MULTICALL3)] = hx(b"some other contract")
+    rpc.code[hx(WALLET)] = hx(b"\x60\x80")
+    rpc.response(
+        REGISTRY, "getAgentWallet(uint256)", ["uint256"], [AGENT_ID], ["address"], [hx(WALLET)]
+    )
+    reader.latest()  # Learns the code is not Multicall3's.
+    _, _, _, _, state = reader._latest((), (), (AGENT_ID, WALLET))
+    assert state == FundingState(AGENT_ID, WALLET, WALLET, True)
+    pinned = {"blockHash": hx(BLOCK_HASH), "requireCanonical": True}
+    assert ("eth_getCode", [hx(WALLET), pinned]) in rpc.calls
+
+
+class Answers:
+    """An HTTP transport answering each JSON-RPC call from the evidence fake."""
+
+    timeout_ms = 1_000
+
+    def __init__(self, rpc: EvidenceRpc) -> None:
+        self.rpc = rpc
+
+    def request(self, url: str, *, body: bytes | None = None) -> bytes:
+        assert body is not None
+        payload = json.loads(body)
+        calls = payload if isinstance(payload, list) else [payload]
+        reply = [
+            {
+                "jsonrpc": "2.0",
+                "id": call["id"],
+                "result": self.rpc.call(call["method"], call["params"]),
+            }
+            for call in calls
+        ]
+        return json.dumps(reply if isinstance(payload, list) else reply[0]).encode()
+
+
+def test_an_opening_s_transaction_is_found_by_its_session_log(context) -> None:
+    """For an opening its wallet reports with no transaction: one read-only
+    eth_getLogs, filtered by the proxy and the SessionOpened sessionId
+    topic, over at most 9,999 blocks, Arc's documented chunk."""
+    reader, rpc, _ = context
+    sid = descriptor_id(DESCRIPTOR)
+    log = event_log("SessionOpened", opened())
+    rpc.logs_found = [log]
+    http = ChainReader(HttpJsonRpc("https://rpc.example/private-key", Answers(rpc)), reader.profile)
+    assert http.opening_transaction(sid, BLOCK_NUMBER - 50, BLOCK_NUMBER + 20_000) == TX
+    ((query,),) = [params for method, params in rpc.calls if method == "eth_getLogs"]
+    assert query == {
+        "address": hx(PROXY),
+        "topics": [log["topics"][0], hx(sid)],
+        "fromBlock": hex(BLOCK_NUMBER - 50),
+        "toBlock": hex(BLOCK_NUMBER - 50 + 9_998),
+    }
+    rpc.logs_found = []
+    assert reader.opening_transaction(sid, BLOCK_NUMBER, BLOCK_NUMBER) is None
+    rpc.calls.clear()
+    assert reader.opening_transaction(sid, BLOCK_NUMBER, BLOCK_NUMBER - 1) is None
+    assert rpc.calls == []  # An empty range reads nothing.
+    rpc.logs_found = [log, dict(log, transactionHash=hx(b"\xcc" * 32), logIndex="0x1")]
+    with pytest.raises(ChainEvidenceError, match="ambiguous"):
+        reader.opening_transaction(sid, BLOCK_NUMBER, BLOCK_NUMBER)
+    for outside in (
+        dict(log, blockNumber=hex(BLOCK_NUMBER + 1)),
+        dict(log, address=hx(REGISTRY)),
+        dict(log, topics=[log["topics"][0], hx(b"\x01" * 32)]),
+    ):
+        rpc.logs_found = [outside]
+        with pytest.raises(ChainEvidenceError, match="differs from its filter"):
+            reader.opening_transaction(sid, BLOCK_NUMBER, BLOCK_NUMBER)
+    rpc.logs_found = [dict(log, removed=True)]
+    assert reader.opening_transaction(sid, BLOCK_NUMBER, BLOCK_NUMBER) is None
 
 
 def test_unverified_multicall3_code_falls_back_to_batched_reads_for_good(context) -> None:
@@ -1564,3 +1696,278 @@ def test_on_a_final_network_opening_and_closing_proofs_are_one_round_trip(contex
 
 def reader_calls_settle():
     return ContractCalls(DOMAIN, "USDC", "2").settle(DESCRIPTOR, 5_510_000, 5_420_000, SIGNATURE)
+
+
+class _Refused(Exception):
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+
+class Node:
+    """A synthetic Arc node behind HttpJsonRpc, answering each read at the block
+    it names. It records each request body's size and each aggregate3 it ran:
+    the block, its view count, its registry views and whether it was pinned.
+    A session's last activity names the block it was read at."""
+
+    timeout_ms = 1_000
+
+    def __init__(self, *, multicall: bool = True) -> None:
+        self.head = BLOCK_NUMBER
+        self.sizes: list[int] = []
+        self.bodies: list[object] = []
+        self.aggregates: list[tuple[int, int, int, bool]] = []
+        # The head moves on once this many more aggregate3 calls at latest ran.
+        self.advance_after: int | None = None
+        # Arc's -32014 for every read pinned by block hash.
+        self.unimported = False
+        self.code = {
+            address: bytes([i]) + b"test-runtime"
+            for i, address in enumerate(
+                (PROXY, IMPLEMENTATION, REGISTRY, REGISTRY_IMPLEMENTATION), start=1
+            )
+        }
+        self.code[MULTICALL3] = MULTICALL3_RUNTIME if multicall else b"another contract"
+
+    def profile(self) -> DeploymentProfile:
+        pins = (PROXY, IMPLEMENTATION, REGISTRY, REGISTRY_IMPLEMENTATION)
+        return DeploymentProfile(
+            DOMAIN, REGISTRY, *(CodePin(pin, keccak(self.code[pin])) for pin in pins)
+        )
+
+    @staticmethod
+    def hash(number: int) -> bytes:
+        return keccak(number.to_bytes(8, "big"))
+
+    @staticmethod
+    def activity(number: int) -> int:
+        return TIMESTAMP + number - BLOCK_NUMBER
+
+    def block(self, number: int) -> dict | None:
+        if number > self.head:
+            return None
+        return {
+            "number": hex(number),
+            "hash": hx(self.hash(number)),
+            "parentHash": hx(self.hash(number - 1)),
+            "timestamp": hex(self.activity(number)),
+        }
+
+    def request(self, url: str, *, body: bytes | None = None) -> bytes:
+        assert body is not None
+        self.sizes.append(len(body))
+        payload = json.loads(body)
+        self.bodies.append(payload)
+        calls = payload if isinstance(payload, list) else [payload]
+        replies = []
+        for call in calls:
+            try:
+                reply = {"result": self.answer(call["method"], call["params"])}
+            except _Refused as refused:
+                reply = {"error": {"code": refused.code, "message": "not yet imported"}}
+            replies.append({"jsonrpc": "2.0", "id": call["id"], **reply})
+        return json.dumps(replies if isinstance(payload, list) else replies[0]).encode()
+
+    def answer(self, method: str, params: list) -> object:
+        if method == "eth_chainId":
+            return hex(CHAIN)
+        if method == "eth_getBlockByNumber":
+            return self.block(self.head if params[0] == "latest" else int(params[0], 16))
+        *arguments, position = params
+        pinned = position != "latest"
+        number = self.head
+        if pinned:
+            assert position["requireCanonical"] is True
+            if self.unimported:
+                raise _Refused(-32014)
+            (number,) = [
+                n for n in range(self.head + 1) if hx(self.hash(n)) == position["blockHash"]
+            ]
+        target = bytes.fromhex(arguments[0][2:] if method != "eth_call" else arguments[0]["to"][2:])
+        if method == "eth_getCode":
+            return hx(self.code.get(target, b""))
+        if method == "eth_getStorageAt":
+            return hx(
+                bytes(12) + {PROXY: IMPLEMENTATION, REGISTRY: REGISTRY_IMPLEMENTATION}[target]
+            )
+        assert method == "eth_call"
+        data = bytes.fromhex(arguments[0]["data"][2:])
+        if target != MULTICALL3:
+            return hx(self.view(target, data, number))
+        assert data[:4] == keccak(text="aggregate3((address,bool,bytes)[])")[:4]
+        (views,) = decode(["(address,bool,bytes)[]"], data[4:])
+        answers = [(True, self.view(bytes.fromhex(to[2:]), view, number)) for to, _, view in views]
+        registry = sum(to.lower() == hx(REGISTRY) for to, _, _ in views)
+        self.aggregates.append((number, len(views), registry, pinned))
+        if not pinned and self.advance_after is not None:
+            self.advance_after -= 1
+            if self.advance_after == 0:
+                self.advance_after = None
+                self.head += 1
+        return hx(encode(["(bool,bytes)[]"], [answers]))
+
+    def view(self, target: bytes, data: bytes, number: int) -> bytes:
+        call, arguments = data[:4], data[4:]
+        selector = lambda signature: keccak(text=signature)[:4]  # noqa: E731
+        if target == MULTICALL3:
+            return {
+                selector("getBlockNumber()"): encode(["uint256"], [number]),
+                selector("getCurrentBlockTimestamp()"): encode(
+                    ["uint256"], [self.activity(number)]
+                ),
+                selector("getLastBlockHash()"): self.hash(number - 1),
+            }[call]
+        if target == PROXY:
+            if call == selector("voucherDigest(bytes32,uint64)"):
+                return voucher_digest(DOMAIN, bytes(32), 0)
+            if call == selector("pauseLevel()"):
+                return encode(["uint8"], [0])
+            assert call == selector("getSession(bytes32)")
+            state = (6_000_000, 0, 0, 0, self.activity(number), RATE_HASH)
+            return encode([STATE_TYPE], [state])
+        assert target == REGISTRY
+        if call == selector("getMetadata(uint256,string)"):
+            return encode(["bytes"], [CATALOG])
+        (provider,) = decode(["uint256"], arguments)
+        assert provider == DESCRIPTOR.provider_id
+        return {
+            selector("ownerOf(uint256)"): encode(["address"], [DESCRIPTOR.operator]),
+            selector("getAgentWallet(uint256)"): encode(["address"], [DESCRIPTOR.recipient]),
+            selector("tokenURI(uint256)"): encode(
+                ["string"], ["https://provider.example/discover"]
+            ),
+        }[call]
+
+
+def node_follower(node: Node, sessions: tuple[bytes, ...]) -> ChainFollower:
+    """A follower of one provider and ``sessions`` over HttpJsonRpc to ``node``."""
+    reader = ChainReader(
+        HttpJsonRpc("https://rpc.example/private-api-key", node),  # type: ignore[arg-type]
+        node.profile(),
+    )
+    follower = ChainFollower(
+        reader, max_age_ms=60_000, collection_margin_ms=1000, wall_clock=lambda: TIMESTAMP + 30
+    )
+    follower.follow(providers=(DESCRIPTOR.provider_id,), sessions=sessions)
+    return follower
+
+
+def session_ids(count: int) -> tuple[bytes, ...]:
+    return tuple(keccak(index.to_bytes(8, "big")) for index in range(count))
+
+
+def test_a_snapshot_of_2500_sessions_is_read_at_one_block_in_bounded_requests() -> None:
+    node = Node()
+    ids = session_ids(2_500)
+    follower = node_follower(node, ids)
+
+    async def scenario() -> None:
+        await follower.start()
+        requests, answered = len(node.sizes), len(node.aggregates)
+        node.head += 1
+        snapshot = await follower.refresh()
+        number = snapshot.block.observation.block_number
+        assert number == node.head and len(snapshot.sessions) == 2_500
+        # Each session's last activity names the block it was read at.
+        assert all(snapshot.sessions[sid].last_activity == node.activity(number) for sid in ids)
+        assert follower.readiness(ids[-1]).ready
+        # Each aggregate3 ran at the snapshot's block, within its gas bound: 512
+        # views besides its three head views, and one provider's identity.
+        calls = node.aggregates[answered:]
+        assert len(calls) == 5, calls
+        assert all(
+            at == number and views <= 3 + 512 and registry <= 4 and not pinned
+            for at, views, registry, pinned in calls
+        ), calls
+        # About 1.1 MB of requests: two exchanges, each within the transport bound.
+        assert len(node.sizes) - requests == 2
+        assert max(node.sizes) <= MAX_DOCUMENT_BYTES, node.sizes
+        await follower.stop()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_calls_that_ran_at_another_head_are_read_again_pinned_to_the_header() -> None:
+    node = Node()
+    follower = node_follower(node, session_ids(1_100))
+
+    async def scenario() -> None:
+        await follower.start()
+        requests, answered = len(node.sizes), len(node.aggregates)
+        number = node.head
+        # The first call runs at the header's block; then the head moves on.
+        node.advance_after = 1
+        snapshot = await follower.refresh()
+        assert snapshot.block.observation.block_number == number
+        assert all(s.last_activity == node.activity(number) for s in snapshot.sessions.values())
+        assert [(at, pinned) for at, _, _, pinned in node.aggregates[answered:]] == [
+            (number, False),
+            (number + 1, False),
+            (number + 1, False),
+            (number, True),
+            (number, True),
+        ]
+        assert len(node.sizes) - requests == 2
+        again = node.bodies[-1]
+        pinned = {"blockHash": hx(Node.hash(number)), "requireCanonical": True}
+        assert ["eth_getBlockByNumber", [hex(number), False]] in [
+            [call["method"], call["params"]] for call in again
+        ]
+        assert sum(call["params"][-1] == pinned for call in again) == 2
+        await follower.stop()
+
+    asyncio.run(scenario())
+
+
+def test_the_common_refresh_is_one_round_trip_even_over_several_calls() -> None:
+    node = Node()
+    follower = node_follower(node, session_ids(1_000))
+
+    async def scenario() -> None:
+        await follower.start()
+        requests, answered = len(node.sizes), len(node.aggregates)
+        node.head += 1
+        assert len((await follower.refresh()).sessions) == 1_000
+        assert len(node.sizes) - requests == 1
+        assert len(node.aggregates) - answered == 2
+        await follower.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_block_the_backend_has_not_imported_is_lag(monkeypatch) -> None:
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    # Arc's -32014: a backend "hasn't yet imported that block"; repeated past
+    # the reader's repeats, it is lag (docs.arc.io/arc/references/rpc-endpoints).
+    transport = RateLimitedTransport([-32014] * 3)
+    with pytest.raises(ChainLagError):
+        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
+    assert len(transport.calls) == 3
+    transport = RateLimitedTransport([-32005] * 3)
+    with pytest.raises(ChainEvidenceError) as caught:
+        HttpJsonRpc("https://rpc.example/private-api-key", transport).call("eth_chainId", [])
+    assert not isinstance(caught.value, ChainLagError)
+
+    async def no_wait(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(follower_module, "_sleep", no_wait)
+    # Without Multicall3 a refresh is the head, then reads pinned to its hash.
+    node = Node(multicall=False)
+    sid = descriptor_id(DESCRIPTOR)
+    follower = node_follower(node, (sid,))
+
+    async def scenario() -> None:
+        await follower.start()
+        accepted = follower.current
+        node.head += 1
+        node.unimported = True
+        assert await follower.refresh() is accepted
+        assert follower.readiness(sid).ready
+        # A watch the accepted snapshot does not cover reports the lag.
+        with pytest.raises(ChainLagError):
+            await follower.watch_session(b"\x56" * 32)
+        node.unimported = False
+        assert (await follower.refresh()).block.observation.block_number == node.head
+        await follower.stop()
+
+    asyncio.run(scenario())

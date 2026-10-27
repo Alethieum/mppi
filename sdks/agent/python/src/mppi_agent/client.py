@@ -3,7 +3,8 @@
 All grpc.aio objects live on that thread. Wallet, HTTP and chain I/O run outside
 the event loop; Control progresses independently of caller output consumption.
 No inference replay, implicit top-up or automatic close; a new session is
-funded only after this agent's own confirmed close (Client._retire_closed).
+funded only after a confirmed close within validated usage: this agent's own,
+or one by anyone else for an explicit open (Client._retire_closed).
 """
 
 from __future__ import annotations
@@ -15,8 +16,8 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import Callable, Coroutine, Iterator
-from contextlib import AsyncExitStack, contextmanager
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -49,7 +50,9 @@ from mppi_protocol.chain import (
     ChainLagError,
     ChainSession,
     DeploymentProfile,
+    FundingState,
 )
+from mppi_protocol.chain import _jitter as _chain_jitter
 from mppi_protocol.contract import (
     ContractCalls,
     OperationKind,
@@ -63,6 +66,7 @@ from mppi_protocol.follower import ChainFollower, ChainSnapshot, RefreshFailure
 from mppi_protocol.http import HttpTransport, TransportError
 from mppi_protocol.operations import reconcile_operation, submit_operation
 from mppi_protocol.signing import (
+    funding_signer,
     verify_close_auth,
     verify_reconnect_auth,
     verify_run_auth,
@@ -120,6 +124,13 @@ _RESYNC_WAIT_S = 60.0
 # nonce is used or cancelled, never cleared (Circle stablecoin-evm fc85788,
 # contracts/v2/EIP3009.sol:64-70, :266, :335; in Arc USDC's verified ABI).
 _AUTHORIZATION_STATE = _hash(b"authorizationState(address,bytes32)")[:4]
+# A provider snapshot's block the RPC does not serve yet is read again after a
+# uniformly random share of 250 ms, then of 1 s (full jitter, as every chain
+# read repeats: mppi_protocol.chain _jitter), so agents refused together do not
+# repeat in step.
+_SNAPSHOT_RETRY_DELAYS = (0.25, 1.0)
+_sleep = asyncio.sleep
+_jitter = _chain_jitter
 
 
 def _refused_before_admission(error: Exception) -> bool:
@@ -133,6 +144,94 @@ def _refused_before_admission(error: Exception) -> bool:
         failure.code is PaymentCode.SESSION_NOT_READY
         and failure.reason in ("AUTHORIZATION_REQUIRED", "PRICE_CHANGED")
     )
+
+
+# The checkpoint keys that belong to the retained session: a record with no
+# session retained holds none of them (Client._record).
+_SESSION_KEYS = ("ledger", "funding_intent", "confirmed_close", "reported_close", "closed_by_other")
+
+
+def _evidence_kept(new: dict[str, Any], old: dict[str, Any]) -> bool:
+    """Whether the record ``new`` carries at least the evidence of ``old``,
+    two records of one closed session. It must keep:
+    - every operation ``old`` holds, with its wallet operation id,
+      transaction hash and receipt block where ``old`` had one, and its
+      state where final, CONFIRMED or FAILED (a PENDING or UNKNOWN one may
+      resolve);
+    - ``old``'s confirmed close;
+    - ``old``'s reported close, or that close confirmed;
+    - ``old``'s foreign proof (closed_by_other), or a proof of the agent's own
+      close in its place: a confirmed close, or a withdraw or releaseIdle
+      CONFIRMED.
+    The ledger is not compared: its accounting only grows, and a run a record
+    no longer lists was forgotten only once its usage was in the totals
+    (Client._prune)."""
+    operations = {item["ref"]: item for item in new.get("operations", [])}
+    for item in old.get("operations", []):
+        kept = operations.get(item["ref"])
+        if kept is None or any(
+            item[field] is not None and kept[field] != item[field]
+            for field in ("wallet_id", "tx", "observation")
+        ):
+            return False
+        if item["state"] in ("confirmed", "failed") and kept["state"] != item["state"]:
+            return False
+    confirmed = new.get("confirmed_close")
+    if "confirmed_close" in old and confirmed != old["confirmed_close"]:
+        return False
+    reported = old.get("reported_close")
+    if (
+        reported is not None
+        and new.get("reported_close") != reported
+        and (confirmed is None or confirmed["tx"] != reported["tx"])
+    ):
+        return False
+    own = confirmed is not None or any(
+        item["kind"] in (OperationKind.WITHDRAW.value, OperationKind.RELEASE_IDLE.value)
+        and item["state"] == OperationState.CONFIRMED.value
+        for item in operations.values()
+    )
+    return "closed_by_other" not in old or "closed_by_other" in new or own
+
+
+def _archive(path: Path, archive: Path) -> None:
+    """Keep the checkpoint at ``path`` as the closed session's ``archive``, a
+    hard link to its last record. An archive an earlier attempt left is
+    replaced only by a record carrying at least its evidence
+    (_evidence_kept), and atomically: the record is linked under a temporary
+    name, compared, and moved over it with os.replace; otherwise it stays."""
+    try:
+        os.link(path, archive)
+        return
+    except FileExistsError:
+        pass
+    staged = archive.with_name("." + archive.name + ".next")
+    with suppress(FileNotFoundError):
+        os.unlink(staged)  # Left by an attempt that stopped here.
+    os.link(path, staged)
+    try:
+        if _evidence_kept(json.loads(staged.read_text()), json.loads(archive.read_text())):
+            os.replace(staged, archive)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(staged)
+
+
+def _next_attempt(reference: str) -> str:
+    """The reference of the exit attempt after ``reference``: the first,
+    <kind>-<session id hex>, is followed by .1, then .2 and so on, the
+    numbering the provider runtimes give a reverted close's retries."""
+    base, dot, count = reference.rpartition(".")
+    if dot and count.isascii() and count.isdigit():
+        return f"{base}.{int(count) + 1}"
+    return reference + ".1"
+
+
+def _untraceable(result: OperationResult) -> bool:
+    """An operation left UNKNOWN with no transaction hash, as after a crash
+    between its journal save and execute: nothing the agent holds proves it
+    took effect."""
+    return result.state is OperationState.UNKNOWN and result.tx_hash is None
 
 
 class _Timing:
@@ -226,9 +325,15 @@ class InferenceError(ClientError):
 
 
 class CloseAccountingError(ClientError):
-    """A confirmed close exceeded validated usage; its payment is not unknown."""
+    """A confirmed close exceeded validated usage; its payment is not unknown.
 
-    def __init__(self, operation: OperationResult, capture_amount: int, usage_amount: int) -> None:
+    ``operation`` is the agent's own close or exit, or None for a session its
+    provider or anyone else closed: the agent holds no transaction for that.
+    """
+
+    def __init__(
+        self, operation: OperationResult | None, capture_amount: int, usage_amount: int
+    ) -> None:
         self.operation, self.capture_amount, self.usage_amount = (
             operation,
             capture_amount,
@@ -359,9 +464,13 @@ class Sessions:
     def open(
         self, provider: str | int, *, model: str, initial_session_tokens: int | None = None
     ) -> OpenResult:
+        """Open or recover the session. Unlike a request, this also retires a
+        retained session its provider or anyone else closed and funds another."""
         self._client._check_provider(provider)
         client = self._client
-        return client._sync(client._measured("open", client._open(model, initial_session_tokens)))
+        return client._sync(
+            client._measured("open", client._open(model, initial_session_tokens, explicit=True))
+        )
 
     def topUp(self, session_id: bytes, amount: int) -> OperationResult:
         client = self._client
@@ -599,6 +708,8 @@ class Client:
         # _open_lock there). Requests never wait for a wallet operation.
         self._funding_lock = asyncio.Lock()
         self._operation_locks: dict[str, asyncio.Lock] = {}
+        # Set while a retirement runs (_retire_closed, _operation_lock).
+        self._retiring: asyncio.Event | None = None
         self._thread_ready.set()
         try:
             self._loop.run_forever()
@@ -894,7 +1005,12 @@ class Client:
         # Version 2 may omit forgotten runs (_prune): mppi-agent 0.1.2 refuses
         # it rather than misreading it. This release still reads version 1.
         result["version"] = 2
-        if self._ledger is not None:
+        if self._ledger is None:
+            # The session's keys follow live state: with none retained, no
+            # record names one, whatever the saved state still holds.
+            for key in _SESSION_KEYS:
+                result.pop(key, None)
+        else:
             ledger = self._ledger
             result["ledger"] = {
                 "descriptor": descriptor_to_wire(ledger.descriptor).SerializeToString().hex(),
@@ -1005,11 +1121,13 @@ class Client:
             self._receipted.discard(identifier)
 
     async def _persist(self) -> None:
+        """Save a record of the state as it is now. The saved state is never
+        replaced by that record: the state may change while it is written (a
+        retirement may drop the session), and every record is built from it
+        afresh (_record)."""
         async with self._checkpoint_lock:
             self._prune()
-            record = self._record()
-            await asyncio.to_thread(self._checkpoint.save, record)
-            self._saved = record
+            await asyncio.to_thread(self._checkpoint.save, self._record())
 
     def _require_ledger(self, identifier: bytes | None = None) -> Ledger:
         ledger = self._ledger
@@ -1485,18 +1603,39 @@ class Client:
         )
         return await asyncio.wait_for(asyncio.shield(future), self.timeout)
 
-    async def _open(self, model: str, choice: int | None) -> OpenResult:
+    @asynccontextmanager
+    async def _opening(self) -> AsyncIterator[None]:
+        """The open lock. Once an opening ends, refreshes read the funding
+        wallet it watched no longer (_watch_funding)."""
+        async with self._open_lock:
+            try:
+                yield
+            finally:
+                self.chain.unwatch_funding()
+
+    async def _open(self, model: str, choice: int | None, *, explicit: bool = False) -> OpenResult:
         validate_model(model)
         if choice is not None:
             uint64(choice, field="initial_session_tokens", positive=True)
-        async with self._open_lock:
+        async with self._opening():
             if self._ledger is None and self._saved.get("ledger") is None:
                 # Nothing retained, so this opening funds a new session: refuse
-                # before any discovery, chain read or provider exchange.
+                # before any discovery, chain read or provider exchange. The
+                # first refresh then reads its funding check's evidence too.
                 self._require_agent_id()
+                self._watch_funding()
             await self._start()
             if self._resync is not None and not self._resync_if_idle():
                 raise ClientError("Control re-sync is pending until active runs end (at most 60 s)")
+            if self._ledger is not None and (self._ledger.close_pending or self._shown_closed()):
+                if self._closed_error is not None:
+                    raise self._closed_error
+                # Whose close it was, and whether the session retires, is
+                # decided under the locks once what can be resolved is: a
+                # close by someone else is retired only by an explicit open,
+                # and a request on one is refused SESSION_CLOSED there, with no
+                # reconnect or resent SessionOpen, since it never reopens.
+                await self._retire_closed(choice, explicit=explicit)
             if (
                 self._ledger is not None
                 and self._ledger.ready
@@ -1509,10 +1648,6 @@ class Client:
                 return OpenResult(
                     self._operations[self._opening_ref][1], await self._get(self._ledger.session_id)
                 )
-            if self._ledger is not None and self._ledger.close_pending:
-                if self._closed_error is not None:
-                    raise self._closed_error
-                await self._retire_closed(choice)
             if self._ledger is not None and self._snapshot_waiter is not None:
                 # An attachment nonce is single-use, including failed attempts.
                 self._control_lost(ClientError("opening a fresh Control attachment"))
@@ -1554,6 +1689,8 @@ class Client:
                     "nonce": auth.nonce.hex(),
                     "valid_after": auth.valid_after,
                     "valid_before": auth.valid_before,
+                    # Its opening lands after this block (_opening_logged).
+                    "block": self.chain.snapshot().block.observation.block_number,
                 }
                 await self._persist()
                 outcome = await self._submit_open_intent(fresh=True)
@@ -1606,11 +1743,12 @@ class Client:
             if ledger.ready:
                 await self.chain.watch_session(ledger.session_id)
             else:
-                # The attachment reads the session with the provider's snapshot.
                 self.chain.follow(sessions=(ledger.session_id,))
-                self._confirm_opened(ledger, outcome)
+                proven = self._confirm_opened(ledger, outcome)
                 await self._connect()
-                await self._attach(outcome.tx_hash)
+                # A session this call opened is checked against its opening's
+                # proof; any other attachment reads it at the provider's block.
+                await self._attach(outcome.tx_hash, opened=None if retained else proven)
             self._observers.emit(
                 "on_session_open",
                 pb.SessionOpen(session_id=ledger.session_id, open_tx=outcome.tx_hash),
@@ -1654,6 +1792,9 @@ class Client:
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ClientError("retained opening funding intent is invalid") from error
+        self._watch_funding()
+        # Reads now only when the evidence does not include the funding wallet.
+        await self._timed_await(asyncio.wait_for(self.chain.start(), self.timeout))
 
         async def eligible() -> None:
             current = await self._fresh()
@@ -1698,7 +1839,7 @@ class Client:
         if getattr(self.wallet, "signs_at_execute", False) is True:
             # Its execute replaces the placeholder with the real signature; USDC
             # verifies that on chain. The agent id must still bind this wallet.
-            await self._check_binding()
+            self._check_binding()
         else:
             await self._check_funding(auth, signature)
         await eligible()
@@ -1707,8 +1848,9 @@ class Client:
         )
         return await self._submit(operation, ref)
 
-    def _confirm_opened(self, ledger: Ledger, outcome: OperationResult) -> None:
-        """Requests can use the opening its SessionOpened event proved.
+    def _confirm_opened(self, ledger: Ledger, outcome: OperationResult) -> ChainSession | None:
+        """Requests can use the opening its SessionOpened event proved; the
+        recorded state, or None.
 
         Its activity time is that of the follower's accepted block, used only
         when that block is no later than the opening's: block times never
@@ -1726,65 +1868,63 @@ class Client:
             or outcome.observation is None
             or current.block.observation.block_number > outcome.observation.block_number
         ):
-            return
-        self.chain.confirm(
-            ledger.session_id,
-            ChainSession(
-                proven[0],
-                0,
-                SessionStatus.OPEN,
-                0,
-                current.block.timestamp,
-                ledger.initial_hash,
-            ),
+            return None
+        state = ChainSession(
+            proven[0], 0, SessionStatus.OPEN, 0, current.block.timestamp, ledger.initial_hash
         )
+        self.chain.confirm(ledger.session_id, state, observation=outcome.observation)
+        return state
 
     def _require_agent_id(self) -> None:
         """Funding needs the agent id its provider verifies; exits never do."""
         if self.agent_id is None:
             raise FundingAuthorizationError("AGENT_ID_REQUIRED")
 
+    def _watch_funding(self) -> None:
+        """Until this opening ends (_opening), refreshes read the registry's
+        binding for the agent id and the funding wallet's code with everything
+        else (ChainFollower.follow), so its funding check reads at most once
+        more."""
+        assert self.agent_id is not None
+        self.chain.follow(funding=(self.agent_id, self.wallet.address))
+
     async def _check_funding(self, auth: FundingAuthorization, signature: bytes) -> None:
         """Refuse an opening the provider or USDC would refuse, before submission.
 
-        One read at the current snapshot block, as the provider checks the id
-        at SessionOpen and as USDC checks the signature (ChainReader.funding).
+        At the fresh snapshot's block, as the provider checks the id at
+        SessionOpen and as USDC checks the signature
+        (SignatureChecker.isValidSignatureNow): the binding first, then an
+        account the snapshot found without code must recover by ECDSA, with
+        no read, and for one with code USDC's rule is applied at that block in
+        one read (ChainReader.funding_signature).
         """
-        assert self.agent_id is not None
-        with _timed("chain"):
-            evidence = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.chain.reader.funding,
-                    auth,
-                    signature,
-                    self.agent_id,
-                    self.chain.snapshot().block,
-                ),
-                self.timeout,
-            )
-        if evidence.agent_wallet != self.wallet.address:
-            raise FundingAuthorizationError("AGENT_WALLET_MISMATCH")
-        if not evidence.signature_valid:
+        block, state = self._check_binding()
+        if state.has_code:
+            with _timed("chain"):
+                valid = await asyncio.wait_for(
+                    asyncio.to_thread(self.chain.reader.funding_signature, auth, signature, block),
+                    self.timeout,
+                )
+        else:
+            valid = funding_signer(auth, signature) == auth.owner
+        if not valid:
             raise FundingAuthorizationError(
                 "SIGNATURE_DEFERRED_UNDECLARED"
                 if signature == bytes(len(signature))
                 else "INVALID_SIGNATURE"
             )
 
-    async def _check_binding(self) -> None:
-        """The registry binds this agent's id to the funding wallet; one read."""
-        assert self.agent_id is not None
-        with _timed("chain"):
-            bound = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.chain.reader.agent_wallet,
-                    self.agent_id,
-                    self.chain.snapshot().block.observation,
-                ),
-                self.timeout,
-            )
-        if bound != self.wallet.address:
+    def _check_binding(self) -> tuple[Block, FundingState]:
+        """The registry binds this agent's id to the funding wallet, as the
+        fresh snapshot read it; no read of its own. Returns that snapshot's
+        block and funding evidence."""
+        current = self.chain.snapshot()
+        state = current.funding
+        if state is None or (state.agent_id, state.wallet) != (self.agent_id, self.wallet.address):
+            raise ClientError("chain evidence lacks the funding wallet's binding")
+        if state.agent_wallet != self.wallet.address:
             raise FundingAuthorizationError("AGENT_WALLET_MISMATCH")
+        return current.block, state
 
     def _intent_expired(self) -> bool:
         """The retained authorization's valid_before is reached at the fresh head."""
@@ -1818,7 +1958,7 @@ class Client:
         if self._closed_result is not None:
             return True
         for kind in (OperationKind.WITHDRAW, OperationKind.RELEASE_IDLE):
-            entry = self._operations.get(kind.value + "-" + ledger.session_id.hex())
+            entry = self._operations.get(self._exit_ref(kind, ledger.session_id))
             if entry is None or entry[1].state is not OperationState.CONFIRMED:
                 continue
             outcome = entry[1]
@@ -1844,22 +1984,187 @@ class Client:
             return True
         return False
 
-    async def _retire_closed(self, choice: int | None) -> None:
-        """Keep a session this agent closed itself beside the checkpoint, then forget it.
+    def _exit_ref(self, kind: OperationKind, session_id: bytes) -> str:
+        """The reference of this exit kind's latest attempt on the session, or
+        of its first while it has none. A later attempt follows only one that
+        FAILED (_exit), so the attempts run unbroken from the first."""
+        ref = kind.value + "-" + session_id.hex()
+        while (following := _next_attempt(ref)) in self._operations:
+            ref = following
+        return ref
+
+    def _shown_closed(self) -> bool:
+        """Whether the follower's last accepted evidence shows the retained
+        session Closed. A closed session never reopens, so that evidence
+        cannot be stale in the direction that matters."""
+        ledger, current = self._ledger, self.chain.current
+        if ledger is None or current is None:
+            return False
+        state = current.sessions.get(ledger.session_id)
+        return state is not None and state.status is SessionStatus.CLOSED
+
+    def _closed_by_other(self, *, unproven_report: bool = False) -> bool:
+        """Whether the retained session is Closed in the follower's last
+        accepted evidence with no close of this agent's own to explain it:
+        closed by its provider's close or anyone's releaseIdle, whatever
+        close_pending the provider reported. The agent's own close is a
+        cooperative close it requested in this process and still awaits, one
+        whose result the provider reported (proven by close()) or that was
+        proven, or its own withdraw or releaseIdle unless that FAILED or is
+        UNKNOWN with no transaction hash (_untraceable). Its own requestClose
+        only opens the close window, so a session closed after it is closed by
+        someone else. A close request is awaited only while its waiter is not
+        done: a lost Control fails the waiter and keeps it (_end_control). A
+        reported close explains it until its proof fails where it alone could
+        (_retire_closed passes ``unproven_report``)."""
+        ledger = self._ledger
+        if ledger is None or not self._shown_closed():
+            return False
+        waiter = self._close_waiter
+        if (
+            (waiter is not None and not waiter.done())
+            or self._closed_result is not None
+            or ("reported_close" in self._saved and not unproven_report)
+            or "confirmed_close" in self._saved
+        ):
+            return False
+        for kind in (OperationKind.WITHDRAW, OperationKind.RELEASE_IDLE):
+            entry = self._operations.get(self._exit_ref(kind, ledger.session_id))
+            if (
+                entry is not None
+                and entry[1].state is not OperationState.FAILED
+                and not _untraceable(entry[1])
+            ):
+                return False
+        return True
+
+    async def _prove_closed_by_other(self, ledger: Ledger) -> ChainSnapshot:
+        """Prove that a session closed by someone else settled within usage,
+        and return the evidence that shows it.
+
+        The agent holds no transaction for such a close, so its event is not
+        read: a log search would need its block, and is bounded to 9,999
+        blocks. The session's own state proves the settled total for both
+        kinds: close sets settledCumulative to the capture SessionClosed
+        reports, releaseIdle leaves it, and once Closed nothing changes it
+        again, since every payment path reverts SessionIsClosed (MPPI.sol
+        close, releaseIdle, _existingSession). So fresh evidence showing the
+        session Closed, which is at or after the close's block, holds its
+        final total, as for the agent's own exits (_closed_by_agent). Above
+        validated usage, opening raises CloseAccountingError with no
+        operation, and the session is kept.
+        """
+        current = await self._fresh()
+        state = current.sessions.get(ledger.session_id)
+        if state is None or state.status is not SessionStatus.CLOSED:
+            raise ClientError("chain evidence does not yet show the session closed")
+        if state.settled_cumulative > ledger.usage_amount:
+            raise CloseAccountingError(None, state.settled_cumulative, ledger.usage_amount)
+        return current
+
+    async def _retire_closed(self, choice: int | None, *, explicit: bool) -> None:
+        """Keep a closed session beside the checkpoint, then forget it.
+
+        A session this agent closed itself (_closed_by_agent), or, for an
+        explicit open, one its provider or anyone else closed
+        (_prove_closed_by_other), each within validated usage. _open sends
+        every retained session that is close-pending or shown Closed here, and
+        whose close it was is decided under the locks, since a reconcile or
+        refresh this waited for may have changed it: a request finding a close
+        by someone else is refused SESSION_CLOSED. The agent's own exit not yet
+        resolved is reconciled first, and a close the provider reported that
+        alone could explain the Closed state is proven; unproven, the close is
+        someone else's. An operation that begins while this runs waits for it
+        to end (_operation_lock; a top-up waits for the funding lock), so it
+        changes and writes nothing here, and then finds the session retired,
+        or restored if the save that drops it failed.
 
         The last record is linked as <name>.<session id>.closed<suffix> before
         the checkpoint drops it, so the history stays readable and the next
-        opening funds a new session with the same signer. A retry after a crash
-        keeps the first link. Only a new Control stream carries the new session.
+        opening funds a new session with the same signer. Retired on the
+        foreign proof, that record holds it as ``closed_by_other``: the block
+        whose Closed state proved the settled total, that total, validated
+        usage, and in ``superseded`` the agent's own closes the decision found
+        unresolved ("reported_close", an untraceable exit's reference), each
+        kept as it was. A retried retirement replaces an archive an earlier
+        attempt left only with a record carrying at least its evidence
+        (_archive, _evidence_kept). Once the
+        saved checkpoint no longer names them, the session's operations that
+        the journal holds a hash for go to a wallet's ``retire``, which may
+        forget its records of them, within the client's timeout. Only then
+        does a new Control stream, which alone carries the new session, begin.
         """
         ledger = self._require_ledger()
         async with AsyncExitStack() as held:
+            # Operations that begin from here on wait for this retirement to
+            # end (_operation_lock); the guard clears last, once its locks are
+            # free, whether it retired the session or failed.
+            retiring = self._retiring = asyncio.Event()
+
+            def retired() -> None:
+                self._retiring = None
+                retiring.set()
+
+            held.callback(retired)
             await held.enter_async_context(self._funding_lock)
             # A reconcile in flight must neither change the close it proves nor
             # write its result into the next journal.
             for lock in list(self._operation_locks.values()):
                 await held.enter_async_context(lock)
-            if not await self._closed_by_agent(ledger):
+            # The agent's own exit not yet resolved, PENDING or UNKNOWN, is
+            # reconciled first, so it never holds the session until a caller
+            # reconciles it, after a restart included, and the wallet is asked
+            # for the record of one the journal holds no hash for: holding
+            # one, the exit is traceable after all. What the wallet or chain
+            # reports now decides which rule applies.
+            for kind in (OperationKind.WITHDRAW, OperationKind.RELEASE_IDLE):
+                ref = self._exit_ref(kind, ledger.session_id)
+                entry = self._operations.get(ref)
+                if entry is not None and entry[1].state in (
+                    OperationState.PENDING,
+                    OperationState.UNKNOWN,
+                ):
+                    await self._reconcile_held(ref)
+            foreign = self._closed_by_other()
+            if not foreign and self._closed_by_other(unproven_report=True):
+                # Only the provider's reported close could explain it: prove
+                # it now. A transaction that is not that session's
+                # SessionClosed stays PENDING, and different amounts never
+                # match; then the agent cannot show a close of its own, and
+                # the Closed state's proof bounds the money instead.
+                try:
+                    await self._prove_close()
+                except CloseAccountingError:
+                    raise
+                except ClientError:
+                    pass  # It differs from the canonical close: it never proves.
+                foreign = self._closed_by_other(unproven_report=True)
+            proof: dict[str, Any] | None = None
+            if foreign:
+                if not explicit:
+                    raise PaymentError(
+                        PaymentFailure(
+                            PaymentCode.SESSION_NOT_READY, "SESSION_CLOSED", ledger.session_id
+                        )
+                    )
+                # The agent's own closes left unresolved, as this decision found
+                # them. On a Closed session such an exit can only have reverted
+                # or been the close itself, so the settled total bounds it too.
+                superseded = ["reported_close"] if "reported_close" in self._saved else []
+                for kind in (OperationKind.WITHDRAW, OperationKind.RELEASE_IDLE):
+                    ref = self._exit_ref(kind, ledger.session_id)
+                    entry = self._operations.get(ref)
+                    if entry is not None and _untraceable(entry[1]):
+                        superseded.append(ref)
+                current = await self._prove_closed_by_other(ledger)
+                proof = {
+                    "block": current.block.observation.block_number,
+                    "block_hash": current.block.observation.block_hash.hex(),
+                    "settled": current.sessions[ledger.session_id].settled_cumulative,
+                    "usage": ledger.usage_amount,
+                    "superseded": superseded,
+                }
+            elif not await self._closed_by_agent(ledger):
                 raise ClientError("session close is pending; new inference is ineligible")
             if any(o.task is not None and not o.task.done() for o in self._outputs.values()):
                 raise ClientError("the closed session's requests are still ending")
@@ -1867,24 +2172,91 @@ class Client:
             self._require_agent_id()
             if choice is None and self.initial_session_tokens is None:
                 raise ClientError("initial_session_tokens is required before funding")
+            # The archived record names this retirement's proof, never an
+            # earlier attempt's.
+            self._saved.pop("closed_by_other", None)
+            if proof is not None:
+                self._saved["closed_by_other"] = proof
             await self._persist()
             path = self._checkpoint.path
             archive = path.with_name(f"{path.stem}.{ledger.session_id.hex()}.closed{path.suffix}")
             try:
-                await asyncio.to_thread(os.link, path, archive)
-            except FileExistsError:
-                pass
-            except OSError:
+                await asyncio.to_thread(_archive, path, archive)
+            except (OSError, ValueError):
                 raise ClientError("the closed session's record could not be kept") from None
             self._end_control(ClientError("the session is closed"))
+            # Only an operation that holds a transaction hash is handed to
+            # retire. The wallet may hold a hash for one without, which the
+            # agent never learned (it may not have answered), and may forget a
+            # handed record that holds one, so that record would be lost.
+            references = tuple(
+                ref for ref, (_, result) in self._operations.items() if result.tx_hash is not None
+            )
+            kept = (
+                self._ledger,
+                self._opening_ref,
+                self._close_waiter,
+                self._closed_result,
+                self._top_up_hint,
+                self._operations,
+                self._outputs,
+                self._unsent,
+                self._receipted,
+                self._saved,
+            )
             self._ledger = self._opening_ref = None
             self._close_waiter = self._closed_result = self._top_up_hint = None
-            for retained in (self._operations, self._outputs, self._unsent, self._receipted):
-                retained.clear()
-            for key in ("ledger", "funding_intent", "confirmed_close", "reported_close"):
-                self._saved.pop(key, None)
+            self._operations, self._outputs, self._unsent, self._receipted = {}, {}, set(), set()
+            self._saved = {
+                key: value for key, value in self._saved.items() if key not in _SESSION_KEYS
+            }
+            # Saved and retired before anything that can fail for a reason
+            # outside the wallet: once saved, nothing retains the session, so
+            # no later step could retire its operations. A report of the old
+            # attachment still running may be saving a record built before the
+            # drop; this save follows it under the checkpoint lock, and no
+            # save installs its record as the saved state (_persist), so the
+            # session is not written back. A report after the drop finds no
+            # retained ledger, and its failure cannot end Control until
+            # _connect drains it, as before.
+            try:
+                await self._persist()
+            except BaseException:
+                # Nothing dropped it: the session stays, as an attachment's
+                # failed save keeps its ledger (_attach), so every later save
+                # still names its operations and the next open retries the
+                # whole retirement.
+                (
+                    self._ledger,
+                    self._opening_ref,
+                    self._close_waiter,
+                    self._closed_result,
+                    self._top_up_hint,
+                    self._operations,
+                    self._outputs,
+                    self._unsent,
+                    self._receipted,
+                    self._saved,
+                ) = kept
+                raise
+            # A closed session never changes again: refreshes stop reading it.
+            self.chain.unwatch_session(ledger.session_id)
+            # Its operations are never presented again: none is in the
+            # checkpoint, and the session is closed. A failure, or a wallet
+            # that does not return within the timeout, only leaves their
+            # records in the wallet.
+            retire = getattr(self.wallet, "retire", None)
+            if retire is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(retire, operation_refs=references, at=time.time()),
+                        self.timeout,
+                    )
+                except Exception as error:
+                    self._observers.emit(
+                        "on_error", HookError("retire", type(error).__name__, ledger.session_id)
+                    )
             await self._connect()
-            await self._persist()
 
     async def _opening_void(self) -> bool:
         """Whether the retained opening can never fund its session.
@@ -1913,6 +2285,64 @@ class Client:
             return False  # Not proven: it stays uncertain.
         return not state.exists
 
+    async def _opening_logged(
+        self, operation: PreparedOperation, ref: str, result: OperationResult
+    ) -> OperationResult | None:
+        """The opening's own proof when its wallet reports no transaction.
+
+        The session id is its descriptor's hash, known locally. A canonical
+        block showing the session funded proves the opening happened: opening
+        funds and creates a session in one call, which refuses an existing
+        one, and sessions are never deleted (MPPI.sol open). Its SessionOpened
+        log, indexed by sessionId, then names the transaction, searched from
+        the block the intent was recorded at (ChainReader.opening_transaction).
+        Only that transaction's receipt proof, CONFIRMED by its own event
+        against the intended descriptor and deposit, is taken; anything else,
+        or an intent that names no block, leaves the opening as it was.
+        """
+        ledger = self._ledger
+        intent = self._saved.get("funding_intent")
+        first = intent.get("block") if isinstance(intent, dict) else None
+        if ledger is None or type(first) is not int:
+            return None
+        reader = self.chain.reader
+        try:
+            block = (await self._fresh()).block
+            number = block.observation.block_number
+            _, state = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._timed_read,
+                    reader.session_at,
+                    number,
+                    block.observation.block_hash,
+                    ledger.session_id,
+                ),
+                self.timeout,
+            )
+            if not state.exists:
+                return None
+            tx = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._timed_read, reader.opening_transaction, ledger.session_id, first, number
+                ),
+                self.timeout,
+            )
+            if tx is None:
+                return None
+            proven = await asyncio.wait_for(
+                asyncio.to_thread(
+                    reader.reconcile,
+                    operation,
+                    operation_ref=ref,
+                    tx_hash=tx,
+                    wallet_operation_id=result.wallet_operation_id,
+                ),
+                self.timeout,
+            )
+        except (ChainEvidenceError, TransportError, TimeoutError, ValidationError):
+            return None  # Not proven: it stays uncertain.
+        return proven if proven.state is OperationState.CONFIRMED else None
+
     def _funding_authorization(self, amount: int) -> FundingAuthorization:
         ledger = self._require_ledger()
         timestamp = self.chain.snapshot().block.timestamp
@@ -1933,7 +2363,14 @@ class Client:
         if ref in self._operations:
             raise ClientError("operation reference already submitted; reconcile it")
         self._operations[ref] = (operation, OperationResult(ref, OperationState.UNKNOWN))
-        await self._persist()
+        try:
+            await self._persist()
+        except BaseException:
+            # Nothing was sent. Kept, the next save would make the attempt
+            # durable as UNKNOWN with no hash, which is never sent again
+            # (_exit), so its kind could not be retried, after a restart too.
+            del self._operations[ref]
+            raise
         timing = _TIMING.get()
         wallet = _TimedWallet(self.wallet, timing)
         started = time.monotonic()
@@ -1971,6 +2408,17 @@ class Client:
             )
         return result
 
+    @asynccontextmanager
+    async def _operation_lock(self, ref: str) -> AsyncIterator[None]:
+        """One retained operation's lock. While a retirement runs, it waits for
+        that retirement to end first: the retirement holds every lock that
+        existed when it began, and one made after it could otherwise change or
+        write into the session it retires (_retire_closed)."""
+        while (retiring := self._retiring) is not None:
+            await retiring.wait()
+        async with self._operation_locks.setdefault(ref, asyncio.Lock()):
+            yield
+
     async def _reconcile_ref(self, ref: str) -> OperationResult:
         await self._local_start()
         if self._ledger is not None and ref == "close-" + self._ledger.session_id.hex():
@@ -1981,104 +2429,135 @@ class Client:
             if self._closed_result is not None:
                 return self._closed_result
             if "reported_close" in self._saved:
-                return await self._prove_close()
+                return await self._prove_reported_close(self._ledger.session_id)
         if ref not in self._operations:
             raise ClientError("unknown retained operation reference")
-        async with self._operation_locks.setdefault(ref, asyncio.Lock()):
-            if ref not in self._operations:
-                raise ClientError("unknown retained operation reference")
-            operation, previous = self._operations[ref]
-            try:
-                if previous.tx_hash is not None:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.chain.reader.reconcile,
-                            operation,
-                            operation_ref=ref,
-                            tx_hash=previous.tx_hash,
-                            wallet_operation_id=previous.wallet_operation_id,
-                        ),
-                        self.timeout,
-                    )
-                else:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            reconcile_operation,
-                            self.wallet,
-                            operation,
-                            operation_ref=ref,
-                            chain=self.chain.reader,
-                        ),
-                        self.timeout,
-                    )
-            except Exception:
-                result = OperationResult(ref, OperationState.UNKNOWN)
-            if (
-                operation.kind is OperationKind.OPEN
-                and ref == self._opening_ref
-                and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
-                and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
-                and await self._opening_void()
-            ):
-                result = OperationResult(
-                    ref,
-                    OperationState.FAILED,
-                    result.wallet_operation_id,
-                    result.tx_hash,
-                    cause="authorization expired before any opening",
+        async with self._operation_lock(ref):
+            return await self._reconcile_held(ref)
+
+    async def _reconcile_held(self, ref: str) -> OperationResult:
+        """The reconcile of one retained operation, for a caller that holds
+        its lock or, as a retirement does, every operation lock and the guard
+        that holds back the rest (_retire_closed)."""
+        if ref not in self._operations:
+            raise ClientError("unknown retained operation reference")
+        operation, previous = self._operations[ref]
+        try:
+            if previous.tx_hash is not None:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.chain.reader.reconcile,
+                        operation,
+                        operation_ref=ref,
+                        tx_hash=previous.tx_hash,
+                        wallet_operation_id=previous.wallet_operation_id,
+                    ),
+                    self.timeout,
                 )
-            if (
-                operation.kind is OperationKind.TOP_UP
-                and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
-                and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
-                and await self._top_up_void(ref)
-            ):
-                result = OperationResult(
-                    ref,
-                    OperationState.FAILED,
-                    result.wallet_operation_id,
-                    result.tx_hash,
-                    cause="authorization expired before any top-up",
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        reconcile_operation,
+                        self.wallet,
+                        operation,
+                        operation_ref=ref,
+                        chain=self.chain.reader,
+                    ),
+                    self.timeout,
                 )
-            if (
-                result.operation_ref != ref
-                or (
-                    previous.tx_hash is not None
-                    and result.tx_hash is not None
-                    and result.tx_hash != previous.tx_hash
-                )
-                or (
-                    previous.wallet_operation_id is not None
-                    and result.wallet_operation_id is not None
-                    and result.wallet_operation_id != previous.wallet_operation_id
-                )
-            ):
-                raise ClientError("reconciliation changed the retained operation identity")
-            if previous.state in (OperationState.CONFIRMED, OperationState.FAILED):
-                if result.state in (OperationState.UNKNOWN, OperationState.PENDING):
-                    return previous
-                if result.state is not previous.state:
-                    raise ClientError("reconciliation contradicts a terminal operation result")
+        except Exception:
+            result = OperationResult(ref, OperationState.UNKNOWN)
+        if (
+            operation.kind is OperationKind.OPEN
+            and ref == self._opening_ref
+            and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
+            and previous.tx_hash is None
+            and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
+            and result.tx_hash is None
+        ):
+            result = await self._opening_logged(operation, ref, result) or result
+        if (
+            operation.kind is OperationKind.OPEN
+            and ref == self._opening_ref
+            and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
+            and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
+            and await self._opening_void()
+        ):
             result = OperationResult(
                 ref,
-                result.state,
-                result.wallet_operation_id or previous.wallet_operation_id,
-                result.tx_hash or previous.tx_hash,
-                result.observation,
-                result.sessions,
-                result.cause,
+                OperationState.FAILED,
+                result.wallet_operation_id,
+                result.tx_hash,
+                cause="authorization expired before any opening",
             )
-            retained = self._operations.get(ref)
-            if retained is None or retained[0] is not operation:
-                # Its session was retired while it read (_retire_closed).
-                raise ClientError("unknown retained operation reference")
-            self._operations[ref] = (operation, result)
-            await self._persist()
-            if operation.kind is OperationKind.TOP_UP and result.state is OperationState.CONFIRMED:
-                await self._top_up_confirmed(result)
-            return result
+        if (
+            operation.kind is OperationKind.TOP_UP
+            and previous.state not in (OperationState.CONFIRMED, OperationState.FAILED)
+            and result.state in (OperationState.UNKNOWN, OperationState.PENDING)
+            and await self._top_up_void(ref)
+        ):
+            result = OperationResult(
+                ref,
+                OperationState.FAILED,
+                result.wallet_operation_id,
+                result.tx_hash,
+                cause="authorization expired before any top-up",
+            )
+        if (
+            result.operation_ref != ref
+            or (
+                previous.tx_hash is not None
+                and result.tx_hash is not None
+                and result.tx_hash != previous.tx_hash
+            )
+            or (
+                previous.wallet_operation_id is not None
+                and result.wallet_operation_id is not None
+                and result.wallet_operation_id != previous.wallet_operation_id
+            )
+        ):
+            raise ClientError("reconciliation changed the retained operation identity")
+        if previous.state in (OperationState.CONFIRMED, OperationState.FAILED):
+            if result.state in (OperationState.UNKNOWN, OperationState.PENDING):
+                return previous
+            if result.state is not previous.state:
+                raise ClientError("reconciliation contradicts a terminal operation result")
+        result = OperationResult(
+            ref,
+            result.state,
+            result.wallet_operation_id or previous.wallet_operation_id,
+            result.tx_hash or previous.tx_hash,
+            result.observation,
+            result.sessions,
+            result.cause,
+        )
+        retained = self._operations.get(ref)
+        if retained is None or retained[0] is not operation:
+            # Its session was retired while it read (_retire_closed).
+            raise ClientError("unknown retained operation reference")
+        self._operations[ref] = (operation, result)
+        await self._persist()
+        if operation.kind is OperationKind.TOP_UP and result.state is OperationState.CONFIRMED:
+            await self._top_up_confirmed(result)
+        return result
 
-    async def _attach(self, opening_tx: bytes, *, require_ready: bool = True) -> None:
+    async def _attach(
+        self, opening_tx: bytes, *, require_ready: bool = True, opened: ChainSession | None = None
+    ) -> None:
+        """Authenticate a Control attachment and apply the provider's snapshot.
+
+        ``opened`` is the state a session's opening proved, for its first
+        attachment in the call that opened it: the deposit, and a settled
+        total of 0. Only the funding wallet's topUp raises the deposit, and
+        only a voucher the fixed signer signed lets the provider settle
+        (MPPI.sol topUp, _settle, close); it has signed none yet. So the
+        snapshot is checked against that proof and the session is not read;
+        one that differs fails closed, and the next attachment reads it.
+        While no accepted read holds the session, the proof is its state here
+        too, and the attachment is not ready until fresh evidence holds it.
+        Every other attachment reads the session at the snapshot's block
+        (_snapshot_evidence).
+        """
         ledger = self._require_ledger()
         notice = pb.SessionOpen(session_id=ledger.session_id, open_tx=opening_tx)
         if self.agent_id is not None:
@@ -2114,9 +2593,12 @@ class Client:
         await self._send(pb.ControlMessage(reconnect_request=request))
         try:
             snapshot = await asyncio.wait_for(asyncio.shield(self._snapshot_waiter), self.timeout)
-            current, observed = await self._snapshot_evidence(
-                snapshot.chain_block_number, snapshot.chain_block_hash, ledger.session_id
-            )
+            if opened is not None:
+                current, observed = await self._fresh(), opened
+            else:
+                current, observed = await self._snapshot_evidence(
+                    snapshot.chain_block_number, snapshot.chain_block_hash, ledger.session_id
+                )
             if (snapshot.deposit, snapshot.settled_cumulative, snapshot.status) != (
                 observed.deposit,
                 observed.settled_cumulative,
@@ -2127,7 +2609,8 @@ class Client:
                 }[observed.status],
             ):
                 raise ClientError("snapshot chain fields differ from canonical state")
-            latest = current.sessions[ledger.session_id]
+            # A new session no accepted read holds yet has its opening's proof.
+            latest = current.sessions.get(ledger.session_id, observed)
             identity = current.identities[ledger.descriptor.provider_id]
             candidate = deepcopy(ledger)
             if identity.catalog is not None:
@@ -2177,7 +2660,8 @@ class Client:
         did, so evidence older than its block is never used. Usually one round
         trip: everything is read at its block, or only the session when the
         follower is already further on. A load-balanced RPC may briefly not
-        serve that block yet: wait for it.
+        serve that block yet: either read is made again, after a random share
+        of 250 ms and then of 1 s (_at_snapshot_block).
         """
         try:
             current: ChainSnapshot | None = self.chain.snapshot()
@@ -2189,8 +2673,9 @@ class Client:
                 raise ClientError("snapshot block is not canonical")
             return current, current.sessions[session_id]
         if current is not None and head > number:
-            try:
-                _, observed = await asyncio.wait_for(
+            # Only the session, at that block: the follower is already further on.
+            _, observed = await self._at_snapshot_block(
+                lambda: asyncio.wait_for(
                     asyncio.to_thread(
                         self._timed_read,
                         self.chain.reader.session_at,
@@ -2199,11 +2684,9 @@ class Client:
                         session_id,
                     ),
                     self.timeout,
-                )
-            except ChainLagError:
-                raise
-            except ChainEvidenceError as error:
-                raise ClientError("snapshot block is not canonical") from error
+                ),
+                unserved="snapshot block was not served by the RPC",
+            )
             if session_id not in current.sessions:
                 # Not yet read, as when a refresh overtook a new session's
                 # opening, unless a refresh read it meanwhile. Its deposit,
@@ -2217,16 +2700,28 @@ class Client:
                     assert latest is not None
                 current = latest
             return current, observed
-        for delay in (0.25, 1.0, None):
+        refreshed = await self._at_snapshot_block(
+            lambda: asyncio.wait_for(
+                self._timed_await(self.chain.refresh_at(number, block_hash)), self.timeout
+            ),
+            unserved="confirmed chain observation precedes snapshot",
+        )
+        return refreshed, refreshed.sessions[session_id]
+
+    @staticmethod
+    async def _at_snapshot_block(read: Callable[[], Coroutine[Any, Any, T]], *, unserved: str) -> T:
+        """One read at a provider snapshot's block, made again after a random
+        share of 250 ms and then of 1 s while the RPC lags behind that block
+        (ChainLagError, a -32014 among them once the reader's repeats are
+        spent). A block it never serves is ClientError(``unserved``), and one
+        that is not canonical ClientError("snapshot block is not canonical")."""
+        for delay in (*_SNAPSHOT_RETRY_DELAYS, None):
             try:
-                current = await asyncio.wait_for(
-                    self._timed_await(self.chain.refresh_at(number, block_hash)), self.timeout
-                )
-                return current, current.sessions[session_id]
+                return await read()
             except ChainLagError:
                 if delay is None:
-                    raise ClientError("confirmed chain observation precedes snapshot") from None
-                await asyncio.sleep(delay)
+                    raise ClientError(unserved) from None
+                await _sleep(delay * _jitter())
             except ChainEvidenceError as error:
                 raise ClientError("snapshot block is not canonical") from error
         raise AssertionError("unreachable")
@@ -2660,6 +3155,8 @@ class Client:
         ledger = self._require_ledger(identifier)
         uint64(amount, field="top-up amount", positive=True)
         async with self._funding_lock:
+            # A retirement may have run while this waited (_retire_closed).
+            ledger = self._require_ledger(identifier)
             await self._fresh()
             readiness = self.chain.readiness(identifier)
             if not readiness.ready or ledger.close_pending:
@@ -2821,7 +3318,9 @@ class Client:
                 raise ClientError("top-up event contradicts the confirmed deposit")
             prior = self._observed_state()
             self.chain.confirm(
-                ledger.session_id, replace(prior, deposit=max(prior.deposit, proven[0].deposit))
+                ledger.session_id,
+                replace(prior, deposit=max(prior.deposit, proven[0].deposit)),
+                observation=result.observation,
             )
         else:
             await self.chain.refresh()
@@ -2868,8 +3367,11 @@ class Client:
         if "reported_close" in self._saved:
             # The provider already reported this close: prove it again, and
             # never request a close it may already have made canonical.
-            return await self._prove_close()
+            return await self._prove_reported_close(identifier)
         async with self._open_lock, self._funding_lock:
+            # A retirement may have run while this waited (_retire_closed):
+            # never attach the next session for a close of this one.
+            self._require_ledger(identifier)
             await self._ensure_close_attachment()
             ledger = self._require_ledger(identifier)
             ledger.close_pending, ledger.ready = True, False
@@ -2912,9 +3414,25 @@ class Client:
             "refunded": message.refunded,
         }
         await self._persist()
-        result = await self._prove_close()
-        if not self._close_waiter.done():
+        result = await self._prove_reported_close(message.session_id)
+        if self._close_waiter is not None and not self._close_waiter.done():
             self._close_waiter.set_result(result)
+
+    async def _prove_reported_close(self, identifier: bytes) -> OperationResult:
+        """_prove_close under the close's operation lock, close-<session id
+        hex>. A retirement holds every operation lock and the retiring guard,
+        and proves a report itself where it must (_retire_closed), so no
+        other proof writes while one runs: one that begins meanwhile waits,
+        then finds the session as the retirement left it."""
+        async with self._operation_lock("close-" + identifier.hex()):
+            self._require_ledger(identifier)
+            if self._closed_error is not None:
+                raise self._closed_error
+            if self._closed_result is not None:
+                return self._closed_result
+            if "reported_close" not in self._saved:
+                raise ClientError("unknown retained operation reference")
+            return await self._prove_close()
 
     async def _prove_close(self) -> OperationResult:
         """Prove the reported close on chain; PENDING while its proof is unreadable.
@@ -2945,6 +3463,14 @@ class Client:
                 ),
             )
             return OperationResult(ref, OperationState.PENDING, tx_hash=tx)
+        if "reported_close" not in self._saved or self._saved["reported_close"] is not record:
+            # The session was retired, or another call proved this report or
+            # received a newer one, while this read ran. It writes nothing, so
+            # a retired session's close never reaches the next one's state.
+            self._require_ledger(ledger.session_id)
+            if self._closed_error is not None:
+                raise self._closed_error
+            return self._closed_result or OperationResult(ref, OperationState.PENDING, tx_hash=tx)
         if (proof.capture_amount, proof.refunded) != (record["capture"], record["refunded"]):
             raise ClientError("close result differs from canonical payment and refund")
         result = OperationResult(
@@ -2964,7 +3490,8 @@ class Client:
                 result, record["capture"], ledger.usage_amount
             )
         await self._persist()
-        # SessionClosed proves the capture; the next refresh replaces this view.
+        # SessionClosed proves the capture; the next refresh at or after its
+        # block replaces this view.
         prior = self._observed_state()
         self.chain.confirm(
             ledger.session_id,
@@ -2973,6 +3500,7 @@ class Client:
                 status=SessionStatus.CLOSED,
                 settled_cumulative=max(prior.settled_cumulative, record["capture"]),
             ),
+            observation=proof.observation,
         )
         if self._closed_error is not None:
             raise self._closed_error
@@ -2982,11 +3510,22 @@ class Client:
         await self._local_start()
         ledger = self._require_ledger(identifier)
         async with self._open_lock, self._funding_lock:
-            ref = kind.value + "-" + identifier.hex()
-            if ref in self._operations:
-                # Current Closed/paused state cannot erase this operation's
-                # original confirmed, pending or unknown outcome.
-                return await self._reconcile_ref(ref)
+            # A retirement may have run while this waited (_retire_closed).
+            ledger = self._require_ledger(identifier)
+            ref = self._exit_ref(kind, identifier)
+            retained = self._operations.get(ref)
+            if retained is not None:
+                # Current Closed/paused state cannot erase this attempt's
+                # confirmed, pending or unknown outcome: one PENDING or UNKNOWN
+                # could still land, so it is reconciled, and its outcome
+                # stands. Only one that FAILED admits a new attempt, under the
+                # next reference; it stays in the journal.
+                outcome = retained[1]
+                if outcome.state is not OperationState.FAILED:
+                    outcome = await self._reconcile_ref(ref)
+                if outcome.state is not OperationState.FAILED:
+                    return outcome
+                ref = _next_attempt(ref)
             current = await self._fresh()
             state = current.sessions[identifier]
             now = current.block.timestamp

@@ -357,7 +357,7 @@ impl SessionOperationOutcome {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct OperationResult {
     operation_ref: String,
     state: OperationState,
@@ -365,7 +365,20 @@ pub struct OperationResult {
     tx_hash: Option<B256>,
     observation: Option<ChainObservation>,
     sessions: Vec<SessionOperationOutcome>,
+    cause: Option<String>,
 }
+// The cause is a diagnostic, so equal outcomes compare equal whatever it says.
+impl PartialEq for OperationResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation_ref == other.operation_ref
+            && self.state == other.state
+            && self.wallet_operation_id == other.wallet_operation_id
+            && self.tx_hash == other.tx_hash
+            && self.observation == other.observation
+            && self.sessions == other.sessions
+    }
+}
+impl Eq for OperationResult {}
 impl OperationResult {
     pub fn new(
         operation_ref: impl Into<String>,
@@ -394,11 +407,27 @@ impl OperationResult {
             tx_hash,
             observation,
             sessions,
+            cause: None,
         })
+    }
+    /// This result with why the wallet call ended this way, written by the SDK
+    /// or the wallet adapter and never remote text. Diagnostic only; it is not
+    /// compared. A proven non-submission reads `NotSubmittedError: <kind>`, as
+    /// in the Python SDK.
+    pub fn with_cause(mut self, cause: impl Into<String>) -> Result<Self, ValidationError> {
+        let cause = cause.into();
+        if cause.is_empty() {
+            return Err(invalid("operation cause must be nonempty when present"));
+        }
+        self.cause = Some(cause);
+        Ok(self)
     }
     copy_getters!(state: OperationState, tx_hash: Option<B256>, observation: Option<ChainObservation>);
     pub fn operation_ref(&self) -> &str {
         &self.operation_ref
+    }
+    pub fn cause(&self) -> Option<&str> {
+        self.cause.as_deref()
     }
     pub fn wallet_operation_id(&self) -> Option<&str> {
         self.wallet_operation_id.as_deref()

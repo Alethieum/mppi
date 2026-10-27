@@ -27,7 +27,7 @@ from mppi_protocol.chain import (
     ChainEvidenceError,
     ChainLagError,
     ChainSession,
-    FundingEvidence,
+    FundingState,
 )
 from mppi_protocol.contract import ContractCalls, OperationKind
 from mppi_protocol.discovery import ProviderIdentity
@@ -87,6 +87,7 @@ def component_client():
         snapshot=lambda: current,
         readiness=lambda _=None: Readiness(True),
         confirmed_readiness=lambda _=None: Readiness(True),
+        unwatch_funding=Mock(),
     )
     client.signer, client.timeout = SIGNER, 1
     client._persist = AsyncMock()
@@ -99,7 +100,7 @@ def component_client():
     client._queue_options = {"max_messages": 4, "max_bytes": 16384, "wait_ms": 50}
     client._nonce = client._snapshot_waiter = client._close_waiter = None
     client._snapshot_applied = None
-    client._operation_locks = {}
+    client._operation_locks, client._retiring = {}, None
     client._challenges, client._outputs = {}, {}
     client._control = None
     client._on_low_credit = None
@@ -217,12 +218,16 @@ def attachment_client(*, catalog=CATALOG):
         identities={7: identity},
         sessions={client._ledger.session_id: state},
         pause_level=PauseLevel.NONE,
+        # A funding wallet with code, which the agent id binds.
+        funding=FundingState(AGENT_ID, DESCRIPTOR.agent, DESCRIPTOR.agent, True),
     )
     client.chain = SimpleNamespace(
         current=current,
         snapshot=lambda: current,
         refresh=AsyncMock(return_value=current),
         refresh_at=AsyncMock(return_value=current),
+        start=AsyncMock(),
+        unwatch_funding=Mock(),
         follow=Mock(),
         readiness=lambda _=None: Readiness(True),
         confirmed_readiness=lambda _=None: Readiness(True),
@@ -641,11 +646,7 @@ def opening_intent_client():
         0, 0, SessionStatus.OPEN, 0, 0, bytes(32)
     )
     client.agent_id = AGENT_ID
-    client.chain.reader.funding = Mock(
-        side_effect=lambda auth, signature, agent_id, block: FundingEvidence(
-            block, True, DESCRIPTOR.agent
-        )
-    )
+    client.chain.reader.funding_signature = Mock(return_value=True)
     client._submit = AsyncMock(
         return_value=OperationResult(client._opening_ref, OperationState.UNKNOWN)
     )
@@ -702,7 +703,7 @@ def test_funding_without_an_agent_id_is_refused_before_any_signature():
             await client._submit_open_intent()
         assert refused.value.reason == "AGENT_ID_REQUIRED"
         client.wallet.sign_funding_authorization.assert_not_called()
-        client.chain.reader.funding.assert_not_called()
+        client.chain.reader.funding_signature.assert_not_called()
         client._submit.assert_not_awaited()
         assert client._saved == original
 
@@ -735,20 +736,31 @@ def test_a_fresh_opening_without_an_agent_id_never_asks_the_provider():
     ],
 )
 def test_a_funding_the_provider_or_usdc_would_refuse_is_never_submitted(bound, valid, reason):
+    """The snapshot read the binding and the wallet's code; a wallet with code
+    is then asked for the signature at that block, unless the binding fails."""
+
     async def scenario():
         client = opening_intent_client()
         block = client.chain.current.block
-        client.chain.reader.funding = Mock(return_value=FundingEvidence(block, valid, bound))
+        funded = client.chain.current.funding
+        client.chain.current.funding = replace(funded, agent_wallet=bound)
+        check = client.chain.reader.funding_signature
+        check.return_value = valid
         original = deepcopy(client._saved)
         with pytest.raises(FundingAuthorizationError) as refused:
             await client._submit_open_intent()
         assert refused.value.reason == reason
+        client.chain.follow.assert_called_with(funding=(AGENT_ID, DESCRIPTOR.agent))
+        client.chain.start.assert_awaited()  # Reads only if the evidence lacks it.
         auth = client.wallet.sign_funding_authorization.call_args.args[0]
-        client.chain.reader.funding.assert_called_once_with(auth, b"w" * 65, AGENT_ID, block)
+        if reason == "AGENT_WALLET_MISMATCH":
+            check.assert_not_called()
+        else:
+            check.assert_called_once_with(auth, b"w" * 65, block)
         client._submit.assert_not_awaited()
         assert client._saved == original and client._operations == {}
         # Nothing was sent: the same intent goes out once the wallet can fund it.
-        client.chain.reader.funding.return_value = FundingEvidence(block, True, DESCRIPTOR.agent)
+        client.chain.current.funding, check.return_value = funded, True
         await client._submit_open_intent()
         operation, ref = client._submit.call_args.args
         assert ref == "original-opening-reference" and operation.amounts == (100,)
@@ -764,15 +776,14 @@ def test_a_wallet_that_signs_at_execute_opens_with_its_placeholder_once_its_id_b
         client = opening_intent_client()
         client.wallet.sign_funding_authorization.return_value = bytes(65)
         client.wallet.signs_at_execute = True
-        observation = client.chain.current.block.observation
-        client.chain.reader.agent_wallet = Mock(return_value=b"z" * 20)
+        funded = client.chain.current.funding
+        client.chain.current.funding = replace(funded, agent_wallet=b"z" * 20)
         with pytest.raises(FundingAuthorizationError, match="^AGENT_WALLET_MISMATCH$"):
             await client._submit_open_intent()
         client._submit.assert_not_awaited()
-        client.chain.reader.agent_wallet.return_value = DESCRIPTOR.agent
+        client.chain.current.funding = funded
         await client._submit_open_intent()
-        client.chain.reader.agent_wallet.assert_called_with(AGENT_ID, observation)
-        client.chain.reader.funding.assert_not_called()
+        client.chain.reader.funding_signature.assert_not_called()
         auth = client.wallet.sign_funding_authorization.call_args.args[0]
         operation, _ = client._submit.call_args.args
         assert operation == client.contract.open(
@@ -789,10 +800,7 @@ def test_a_placeholder_from_a_wallet_that_never_declared_it_is_refused(declared)
         client.wallet.sign_funding_authorization.return_value = bytes(65)
         if declared is not None:
             client.wallet.signs_at_execute = declared  # Only True declares it.
-        block = client.chain.current.block
-        client.chain.reader.funding = Mock(
-            return_value=FundingEvidence(block, False, DESCRIPTOR.agent)
-        )
+        client.chain.reader.funding_signature.return_value = False
         with pytest.raises(FundingAuthorizationError, match="^SIGNATURE_DEFERRED_UNDECLARED$"):
             await client._submit_open_intent()
         client._submit.assert_not_awaited()
@@ -808,7 +816,28 @@ def test_an_unusable_wallet_signature_is_refused_without_a_read(signature):
         client.wallet.sign_funding_authorization.return_value = signature
         with pytest.raises(FundingAuthorizationError, match="^INVALID_SIGNATURE$"):
             await client._submit_open_intent()
-        client.chain.reader.funding.assert_not_called()
+        client.chain.reader.funding_signature.assert_not_called()
+        client._submit.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "signature,reason",
+    [(b"w" * 65, "INVALID_SIGNATURE"), (bytes(65), "SIGNATURE_DEFERRED_UNDECLARED")],
+)
+def test_a_funding_wallet_without_code_is_checked_by_ecdsa_recovery_with_no_read(signature, reason):
+    """USDC recovers an account without code by ECDSA (SignatureChecker): so
+    does the agent, from the snapshot's code, and asks the chain nothing."""
+
+    async def scenario():
+        client = opening_intent_client()
+        funded = client.chain.current.funding
+        client.chain.current.funding = replace(funded, has_code=False)
+        client.wallet.sign_funding_authorization.return_value = signature
+        with pytest.raises(FundingAuthorizationError, match=f"^{reason}$"):
+            await client._submit_open_intent()
+        client.chain.reader.funding_signature.assert_not_called()
         client._submit.assert_not_awaited()
 
     asyncio.run(scenario())
@@ -974,6 +1003,68 @@ def test_an_uncertain_opening_is_void_only_at_a_canonical_block_past_its_authori
             )
         else:
             assert result.state is OperationState.UNKNOWN
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "case", ["found", "unfunded", "no_log", "unproven", "unreadable", "no_block"]
+)
+def test_an_uncertain_opening_with_no_transaction_hash_is_found_by_its_log(case):
+    """The wallet reports the opening uncertain and names no transaction. A
+    canonical block showing its session funded proves it happened; its
+    SessionOpened log, from the intent's block on, names the transaction,
+    and only that transaction's receipt proof confirms it. Anything less
+    leaves it UNKNOWN, never FAILED."""
+
+    async def scenario():
+        client = opening_intent_client()
+        client._saved["funding_intent"]["block"] = 40
+        block = Block(
+            ChainObservation(DOMAIN.chain_id, DOMAIN.verifying_contract, 90, b"h" * 32),
+            100,
+            b"c" * 32,
+        )
+        client.chain.current.block = block
+        await client._submit_open_intent()
+        operation, ref = client._submit.call_args.args
+        uncertain = OperationResult(ref, OperationState.UNKNOWN, "wallet-1")
+        client._operations[ref] = (operation, uncertain)
+        client.wallet.reconcile = Mock(return_value=uncertain)
+        client.chain.reader.profile = SimpleNamespace(domain=DOMAIN)
+        client._local_start = AsyncMock()
+        funded = ChainSession(100, 0, SessionStatus.OPEN, 0, 100, CATALOG.rate_card_hash)
+        empty = ChainSession(0, 0, SessionStatus.OPEN, 0, 0, bytes(32))
+        reader = client.chain.reader
+        reader.session_at = Mock(return_value=(block, empty if case == "unfunded" else funded))
+        reader.opening_transaction = Mock(return_value=None if case == "no_log" else b"t" * 32)
+        if case == "unreadable":
+            reader.opening_transaction.side_effect = ChainEvidenceError("RPC logs missing")
+        proven = OperationResult(
+            ref, OperationState.CONFIRMED, "wallet-1", b"t" * 32, block.observation
+        )
+        if case == "unproven":  # A mined transaction without this opening's event.
+            proven = replace(proven, state=OperationState.FAILED)
+        reader.reconcile = Mock(return_value=proven)
+        if case == "no_block":
+            del client._saved["funding_intent"]["block"]  # Recorded by an earlier release.
+        result = await client._reconcile_ref(ref)
+        if case == "found":
+            assert result.state is OperationState.CONFIRMED and result.tx_hash == b"t" * 32
+            assert client._operations[ref][1] == result
+            reader.opening_transaction.assert_called_once_with(client._ledger.session_id, 40, 90)
+            assert reader.reconcile.call_args.kwargs == {
+                "operation_ref": ref,
+                "tx_hash": b"t" * 32,
+                "wallet_operation_id": "wallet-1",
+            }
+            return
+        assert result.state is OperationState.UNKNOWN and result.tx_hash is None
+        assert client._operations[ref][1].state is OperationState.UNKNOWN
+        if case in ("unfunded", "no_block"):
+            reader.opening_transaction.assert_not_called()
+        if case == "no_block":
+            reader.session_at.assert_not_called()
 
     asyncio.run(scenario())
 

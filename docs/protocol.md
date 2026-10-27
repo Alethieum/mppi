@@ -233,7 +233,10 @@ This setup result is distinct from SESSION_NOT_FOUND. Actual inference errors
 remain on Complete. [Native gRPC status definitions](https://grpc.github.io/grpc/core/md_doc_statuscodes.html)
 
 SessionOpen names a transaction; the provider confirms the canonical opening
-event, full descriptor and state. The notice grants no attachment. When its
+event, full descriptor and state. The notice grants no attachment. A provider
+keeps a closed session for a bounded window. For a session closed on chain that
+it no longer holds, it refuses SessionOpen with `SESSION_CLOSED`: the session is
+terminal, and no reattachment follows. When its
 optional agent_id is present, verify the selected registry's getAgentWallet(id)
 returns the descriptor's funding-wallet agent, not its session signer.
 [ERC-8004 wallet metadata](https://eips.ethereum.org/EIPS/eip-8004#on-chain-metadata)

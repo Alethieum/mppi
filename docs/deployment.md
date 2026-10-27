@@ -66,7 +66,7 @@ independent of the MPPI SDK release.
 
 ## Trusted profile file
 
-Agent `0.1.5` and provider `0.1.2` built-in setup package the verified official
+Agent `0.1.6` and provider `0.2.0` built-in setup package the verified official
 profiles for both Arc networks. `--testnet` and `--mainnet` select the respective
 profile without a separate download. Version `0.1.1` packages testnet only. The
 provider composition helpers use those same pins; they still verify chain ID,
@@ -145,10 +145,9 @@ Source contracts: [Python profile parser](../proto/python/src/mppi_protocol/depl
 
 ## SDK installation inputs
 
-The provider quickstart uses `mppi-provider==0.1.2` from PyPI and native
-`mppi-provider` version `0.1.2`. The agent quickstart uses `mppi-agent==0.1.5`.
-The agent depends on `mppi-protocol==0.1.3` and the provider on
-`mppi-protocol==0.1.1`. Use the release record to
+The provider quickstart uses `mppi-provider==0.2.0` from PyPI and native
+`mppi-provider` version `0.2.0`. The agent quickstart uses `mppi-agent==0.1.6`.
+Both depend on `mppi-protocol==0.1.4`. Use the release record to
 identify the reviewed source revision and exact artifact digests. For development, the
 [public source tree can be built independently](build.md).
 
@@ -306,8 +305,8 @@ Local Anvil fixtures do not prove those integrations.
 For mainnet preparation, select `runMainnet()` explicitly with Foundry's
 `--sig 'runMainnet()'`. The existing `run()` entry point continues to enforce
 testnet and its **60-second** timelock. Mainnet uses the selected initialized
-**1-of-1 Safe** and an **86,400-second** timelock. It requires the designated
-Daybreak audit of the exact artifacts and deployment inputs, resolved required
-findings and its own verified release evidence. Preparation is not deployment
+**1-of-1 Safe** and an **86,400-second** timelock. It requires a security
+audit of the exact artifacts and deployment inputs, resolved required findings
+and its own verified release evidence. Preparation is not deployment
 acceptance. The one-hour session dispute window and 24-hour idle timeout are
 separate from governance delay.

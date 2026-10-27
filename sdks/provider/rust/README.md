@@ -1,6 +1,6 @@
 # MPPI provider — Rust
 
-Version `0.1.2` provides exact payment arithmetic, canonical price catalogs,
+Version `0.2.0` provides exact payment arithmetic, canonical price catalogs,
 immutable validation of provider usage reports, generated `mppi.v1` tonic types
 and typed session/proof hashing and verification. It also provides validated
 configuration and integration traits, discovery documents, bounded HTTP/RPC,
@@ -12,12 +12,114 @@ provider-host launch and endpoint verification. `provider init` generates fresh
 declarations for an explicit network; saved configuration selects the packaged
 official mainnet or testnet profile, with optional `--mainnet` / `--testnet` overrides.
 `setup::runtime_from_config` composes the runtime with the existing Circle
-Agent Wallet operator. Earlier `0.1.0` live Arc testnet acceptance exercised an independent
+Agent Wallet operator, and `setup::runtime_from_config_with_wallet` with another
+`TransactionWallet`. Earlier `0.1.0` live Arc testnet acceptance exercised an independent
 Python agent, including capture/refund and explicit updates. See the
 [deployment reference](../../../docs/deployment.md) for both networks and the
 [v0.1.0 release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0) for
 the exact artifact digests, published-install verification status and security
 review scope and results.
+
+## Upgrading from 0.1.2
+
+- The `mppi` CLI and the Python package read and write the same
+  `<config>.wallet-operations.json`. Upgrade both to `0.2.0` together: `0.1.2`
+  of either refuses a journal `0.2.0` has saved. The Circle adapter's journal
+  keeps each call's digest instead of the call, has no count limit, and holds
+  its lock only while it reads or replaces the journal, never across a Circle
+  call, so `mppi provider update` can run while a host serves. An execute or
+  reconcile waits for that lock up to `CircleOptions::read_timeout_ms`.
+  Within one process an adapter runs one operation at a time, CLI commands
+  included, so an operation may also wait behind another's command.
+- `interfaces::ProviderSessions` has a new method, `recover_current`, whose
+  default refuses with `UNIMPLEMENTED`. A host type that implements the trait,
+  such as a wrapper around the runtime's `sessions()`, still compiles unless
+  another trait in scope has a method of the same name, but must forward
+  `recover_current` itself: otherwise a call through it is refused.
+- `setup::runtime_from_config_with_wallet(host, wallet, coverage, execution,
+  options)` composes the runtime with any `TransactionWallet`, such as one whose
+  key an HSM or KMS holds. Setup checks its address against the saved operator
+  and verifies the deployment and USDC domain; the wallet's own account,
+  network and access are its own to check. A `CircleAgentWallet` passed this way
+  skips the CLI check and the existing-record requirement that
+  `runtime_from_config` applies: use that for Circle.
+- `capabilities::TransactionWallet` has three defaulted methods, so an
+  implementation compiles unchanged unless another trait in scope has a method
+  of the same name: `retire(operation_refs, at)` receives references the
+  runtime no longer needs, with the time from which they may be forgotten,
+  which a later `reconcile` of the reference, or its record gaining a
+  transaction hash, withdraws (the default keeps every record);
+  `near_capacity`, each rise of which the runtime reports as an
+  `on_error` `HookError`; and `max_call_bytes` (default 61,440, the Circle
+  adapter's bound), which sizes each batch the runtime builds. The runtime may
+  now call `execute` and `reconcile` for different operations at once: an
+  implementation serializes its own records, as `circle::CircleAgentWallet`
+  does, one operation at a time. The
+  [wallet requirements](../../../docs/sdk-interfaces.md#wallet-requirements)
+  state everything the runtime assumes of a wallet.
+- `runtime::Hooks` has new fields, `on_session_retired` and `on_timing`: build
+  it with `..Hooks::default()`. `on_timing` receives a `runtime::OperationTiming`
+  for each request's admission and each settlement or close, in milliseconds:
+  the host's coverage callback, chain reads, the wallet's call and waiting.
+- `runtime::RuntimeLimits::new(max_control_streams, wire)` no longer takes a
+  session count, and `max_sessions()` is gone. A session closed on chain leaves
+  the runtime after `closed_retention()` (24 hours by default,
+  `with_closed_retention`). A `SessionOpen` for a closed session it no longer
+  holds, and a recovery from a record that `RecoveryEvidence::is_final` reports
+  final once the chain shows the session closed, are refused
+  `SESSION_NOT_READY` / `SESSION_CLOSED`. Pass such final records to `recover`
+  at startup rather than skipping them: their refusal hands the wallet each
+  reference only they still name, if the wallet's `reconcile` of it agrees with
+  the record: the same reference, the same transaction hash or none on both,
+  and the same wallet operation id when the record names one.
+  Maintenance makes the same check before it hands over a reference no wallet
+  answer in this process has matched (one restored without a transaction hash,
+  or kept against an answer that disagreed); every other hand-over makes no
+  wallet call first.
+- Collections: a batch fits the wallet's `max_call_bytes`, at most 136 sessions
+  for Circle, and maintenance splits the rest; a host's own `settle_batch` over
+  it is refused before any intent is recorded. A close mined and reverted is
+  prepared again under a successor of its reference (`<reference>.1`, `.2`, …),
+  at most once per settlement interval, and sent only once the successor
+  simulates: a failed simulation sends nothing, and a `close` call then fails
+  with its error. A settlement or close that never began
+  (a `Failed` result with neither a transaction hash nor a wallet operation id)
+  is restored as `Failed`, so the live rules prepare it again.
+- A session's waiting runs are admitted in the order they first waited, while
+  each voucher arrives within the runtime's turn; `0.1.2` could admit a later
+  run first.
+- `chain::ChainError` has new variants, `Transport`, `Rpc`, `Reverted` and
+  `Lagging`, and `http::TransportError` is an enum of causes: `Invalid`,
+  `Connection`, `Timeout`, `Status` and `Response`. Both, and
+  `circle::CircleError`, are `#[non_exhaustive]`, so a `match` on any of them
+  outside this crate needs a wildcard arm. `chain::Rpc::call_many` is a
+  defaulted method that sends one call at a time; implement it to batch a
+  step's reads. An `Rpc` that sees a block its backend has not imported
+  reports `Lagging`, as `HttpJsonRpc` does for Arc's -32014.
+- `circle::supported_account_pins` is removed: the adapter pins no account code.
+- Behaviour a caller can observe: `ChainFollower::refresh` returns the accepted
+  snapshot as `Ok` when the RPC lags and that snapshot covers every watch, and
+  `Err(ChainError::Lagging)` otherwise; a Circle `execute` refused for an
+  invalid reference, or once the journal shows no record of its reference,
+  returns a `Failed` result with a `NotSubmittedError: <kind>` cause instead of
+  an error; `OnboardingError` and `CliError` include a failed chain read's typed
+  cause in their `Display` and equality; and recovery refusals name the check
+  that failed (`SESSION_NOT_READY: <check>`).
+- `types::OperationResult` can carry a wallet's cause (`with_cause`, `cause`);
+  the Circle adapter names the error kind and the CLI's listed error code.
+  `local_state::LocalState`, the locked, crash-safe record the Circle adapter
+  keeps, is public for other wallet adapters.
+- The package's lockfile, which `cargo install --locked` uses, moves rustls to
+  0.23.46 and rustls-webpki to 0.103.16 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349
+  and RUSTSEC-2026-0382), webpki-root-certs to 1.0.10 (RUSTSEC-2026-0383) and
+  the yanked yoke-derive 0.8.3 to 0.8.4, and tokio is pinned to `=1.53.3`
+  (RUSTSEC-2026-0386). An application built with its own lockfile should
+  update them too:
+  `cargo update -p rustls -p rustls-webpki -p webpki-root-certs -p yoke-derive`.
+  Its `cargo audit` also reports RUSTSEC-2026-0387 for crypto-bigint 0.5.5,
+  which alloy-primitives' `k256` feature brings in. This crate accepts that
+  advisory in `.cargo/audit.toml`: it only recovers the signer of a received
+  signature, whose inputs are public, and holds no secp256k1 key.
 
 ## Install from crates.io
 
@@ -26,7 +128,7 @@ the complete setup and Linux ARM64 binary installation. To build the native CLI
 from crates.io, use Rust 1.95.0:
 
 ```sh
-cargo install mppi-provider --version 0.1.2 --locked --bin mppi
+cargo install mppi-provider --version 0.2.0 --locked --bin mppi
 mppi --help
 ```
 
@@ -35,7 +137,7 @@ provider application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-mppi-provider = "=0.1.2"
+mppi-provider = "=0.2.0"
 ```
 
 Build that application using its own committed lockfile. The CLI uses the
@@ -153,6 +255,11 @@ and lifecycle contracts. Providers supply counts, termination and storage.
 `PreparedRequest` keeps validated inference JSON bytes unchanged; a cancellation
 signal does not prove final usage. Recovery records carry supplied evidence;
 `ProviderSessions::recover` validates it before installing payment state.
+`RecoveryEvidence::is_final` marks a closed session's record with nothing left
+to recover: recovery refuses it, but pass it at startup all the same, since the
+refusal hands to retirement each reference it names that the wallet's own
+record agrees with. The runtime retires a closed session after
+`RuntimeLimits::closed_retention` and limits no session count.
 
 `wire::decode_message` enforces received byte limits and structural protobuf
 validation. `wire::validate_message` checks already decoded values. Use the
@@ -174,26 +281,36 @@ chain reader verifies the observed deployment against the selected profile
 using the selected trusted RPC.
 
 `http::HttpTransport::new(timeout_ms, max_bytes, ca_pem)` uses verified TLS,
-no redirects, no implicit proxy, no retries and no decompression. A supplied
-PEM trust bundle replaces system roots. A total request deadline and streamed
-body limit apply. For JSON-RPC use `http::MAX_RPC_RESPONSE_BYTES` (4 MiB): ABI
-framing and hexadecimal encoding expand a valid 1 MiB catalog beyond 2 MiB.
-Discovery documents, request bodies and CA bundles retain their 1 MiB limits.
-Endpoints whose request paths would be silently normalized
-are rejected. `HttpJsonRpc` exposes only read methods and omits endpoint values
-and remote response bodies from errors.
+no redirects, no implicit proxy and no decompression, and sends each request
+once over kept-alive connections. A supplied PEM trust bundle replaces system
+roots. A total request deadline and streamed body limit apply. For JSON-RPC use
+`http::MAX_RPC_RESPONSE_BYTES` (4 MiB): ABI framing and hexadecimal encoding
+expand a valid 1 MiB catalog beyond 2 MiB. Discovery documents, request bodies
+and CA bundles retain their 1 MiB limits. Endpoints whose request paths would be
+silently normalized are rejected. `HttpJsonRpc` exposes only read methods, sends
+a step's reads as JSON-RPC batches and repeats a transient failure at most twice.
+`chain::ChainError` and `http::TransportError` name a failure's cause (status,
+JSON-RPC code, revert selector, lag) without endpoint values or remote response
+bodies. A wallet that submits its own transactions posts them through
+`HttpTransport::request`, which never repeats them.
 
 `chain::ChainReader` checks the selected chain, code hashes, proxy implementation
-slots, voucher domain, canonical block inclusion and exact ABI/event bytes.
-`identity` binds the ERC-8004 owner, recipient, discovery URI and catalog to one
-observation. These checks establish consistency with the caller's trusted inputs.
+slots, voucher domain, canonical block inclusion and exact ABI/event bytes,
+reading each step at one block, in one exchange per JSON-RPC batch of 32 calls and
+1 MiB. `identity` binds the ERC-8004 owner, recipient, discovery URI and catalog
+to one observation. These checks establish consistency with the caller's trusted
+inputs.
 
 `follower::ChainFollower` runs on Tokio. Call `start`, watch the provider and
-session IDs in use, then read `snapshot` and `readiness` without per-token RPC.
-Observation age, head progress, block time, pause state and collection margin
-all affect readiness. Failures and cancelled refreshes invalidate readiness;
-`current` retains historical evidence. Keep the local clock synchronized.
-`stop` aborts and joins the background task; dropping the follower aborts it.
+session IDs in use, then read `snapshot` and `readiness` without per-token RPC. On
+Arc each refresh reads every watch at one block through Multicall3, in one round
+trip up to about 2,300 watched sessions. Session watches that wait behind a
+refresh are read together by the next one. Observation age, head progress, block
+time, pause state and collection margin all affect readiness. Failures and
+cancelled refreshes invalidate readiness; a lagging RPC keeps the accepted
+evidence, which ages as usual. `current` retains historical evidence. Keep the
+local clock synchronized. `stop` aborts and joins the background task; dropping
+the follower aborts it.
 
 `contract::ContractCalls` prepares the eight MPPI operations against the exact
 packaged Solidity interface. `settle` captures the supplied actual cumulative
@@ -202,12 +319,18 @@ usage within the voucher's authorization. A higher voucher alone is not usage.
 `reconcile_operation` queries the original operation without resubmission.
 Wallet adapters must durably bind each operation reference to its exact intent
 before sending it. Keep unknown outcomes and their handles for reconciliation.
+`TransactionWallet::max_call_bytes`, 61,440 by default (the Circle adapter's
+bound), caps the calldata of each batch the runtime builds: 260 bytes plus 448
+per session, at most 136 sessions by default. A wallet whose real limit is gas
+rather than bytes states a smaller size.
 Only verified canonical receipts and state establish confirmation; a repeated
 no-op cannot invent a new collection event. `circle::CircleAgentWallet`
 uses official Circle CLI `1.1.4` with an explicit bounded operation record.
 `CircleAgentWallet::new(chain, address, path, CircleOptions)` creates a journal;
 `open_existing` requires the original journal. `setup::runtime_from_config(host,
-operation_path, coverage, execution)` composes the authenticated wallet and runtime.
+operation_path, coverage, execution)` composes the authenticated wallet and runtime;
+`setup::runtime_from_config_with_wallet(host, wallet, coverage, execution, options)`
+composes another `TransactionWallet`, checked by its address.
 Registry and CLI onboarding use the same original-operation checks. Select the
 operator with `mppi provider onboard --wallet ADDRESS`; login and renewal remain
 with Circle and the operator.
@@ -266,8 +389,10 @@ adapter and CLI are described in the [command guide](../../../docs/rust-cli.md).
 
 ## Lifecycle observers
 
-Use `runtime::Hooks` with `Mppi::with_limits_and_hooks(...)`.
-See the [hook payloads, ordering and bounds](../../../docs/lifecycle-hooks.md).
+Use `runtime::Hooks` with `Mppi::with_limits_and_hooks(...)` or
+`setup::RuntimeOptions`. `on_timing` reports where each admission and
+collection spent its time. See the
+[hook payloads, ordering and bounds](../../../docs/lifecycle-hooks.md).
 
 ## License
 

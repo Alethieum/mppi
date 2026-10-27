@@ -9,12 +9,30 @@ use crate::{
     signing::{RunAuth, Voucher},
     types::{OperationState, SessionView},
 };
+use std::time::SystemTime;
 
-fn inconsistent(sid: B256) -> Status {
-    not_ready("INCONSISTENT_STATE", Some(sid), None)
+/// The evidence contradicts itself, the chain, the wallet or a session already
+/// held. The payment failure stays `INCONSISTENT_STATE`; the message names the
+/// check that failed, in the SDK's words, never remote text. Each check is
+/// listed in `recovery_tests.rs`, whose test keeps every refusal here to one
+/// literal from that list.
+fn inconsistent(sid: B256, check: &str) -> Status {
+    labelled("INCONSISTENT_STATE", sid, check)
 }
-fn missing(sid: B256) -> Status {
-    not_ready("STATE_UNAVAILABLE", Some(sid), None)
+/// Evidence recovery needs is missing or unavailable. The payment failure stays
+/// `STATE_UNAVAILABLE`; the message names the check that failed, in the SDK's
+/// words, never remote text.
+pub(super) fn missing(sid: B256, check: &str) -> Status {
+    labelled("STATE_UNAVAILABLE", sid, check)
+}
+/// A `SESSION_NOT_READY` refusal for `reason` whose message names `check`.
+fn labelled(reason: &str, sid: B256, check: &str) -> Status {
+    let status = not_ready(reason, Some(sid), None);
+    Status::with_details(
+        status.code(),
+        format!("{}: {check}", status.message()),
+        status.details().to_vec().into(),
+    )
 }
 fn wire_status(status: SessionStatus) -> i32 {
     match status {
@@ -47,6 +65,12 @@ fn preserves_identity(known: &OperationResult, incoming: &OperationResult) -> bo
             .wallet_operation_id()
             .is_none_or(|id| incoming.wallet_operation_id() == Some(id))
 }
+/// The wallet's answer for a reference matches the runtime's record of it: the
+/// same reference, the same transaction hash or none on both, and the same
+/// wallet operation id when the record names one.
+pub(super) fn agrees(record: &OperationResult, answer: &OperationResult) -> bool {
+    answer.tx_hash() == record.tx_hash() && preserves_identity(record, answer)
+}
 fn unresolved_operation(operation: &PendingOperation) -> bool {
     matches!(
         operation.result.state(),
@@ -55,6 +79,17 @@ fn unresolved_operation(operation: &PendingOperation) -> bool {
 }
 
 impl Runtime {
+    /// A collection of this deployment's contract that covers `sid`, the
+    /// first check of any supplied operation.
+    fn collects(&self, prepared: &PreparedOperation, sid: B256) -> bool {
+        matches!(
+            prepared.kind(),
+            OperationKind::Settle | OperationKind::SettleBatch | OperationKind::Close
+        ) && prepared.call().chain_id() == self.contract.domain().chain_id()
+            && prepared.call().to() == self.contract.domain().verifying_contract()
+            && prepared.session_ids().contains(&sid)
+    }
+
     fn check_recovery_limits(&self, evidence: &RecoveryEvidence) -> IntegrationResult<()> {
         wire::validate_recovery_snapshot(&evidence.snapshot, &self.limits.wire)?;
         if evidence.snapshot.control_generation == Some(0)
@@ -111,16 +146,48 @@ impl Runtime {
         let prepared = &evidence.prepared;
         let ids = prepared.session_ids().into_iter().collect::<BTreeSet<_>>();
         let units = evidence.units.iter().copied().collect::<BTreeMap<_, _>>();
-        if !matches!(
-            prepared.kind(),
-            OperationKind::Settle | OperationKind::SettleBatch | OperationKind::Close
-        ) || prepared.call().chain_id() != self.contract.domain().chain_id()
-            || prepared.call().to() != self.contract.domain().verifying_contract()
-            || !ids.contains(&sid)
+        if !self.collects(prepared, sid)
             || units.len() != evidence.units.len()
             || units.keys().copied().collect::<BTreeSet<_>>() != ids
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "a saved operation does not collect this session or misstates its units",
+            )
+            .into());
+        }
+        let operation = |result| PendingOperation {
+            prepared: Arc::new(prepared.clone()),
+            result: Arc::new(result),
+            units: Arc::new(units.clone()),
+        };
+        // A Failed result with no handle at all is the wallet's attestation
+        // that submission never began (TransactionWallet): no call is bound to
+        // its reference and there is nothing to read. It stays Failed, so the
+        // live rules apply again: a settlement is replaced by a new reference,
+        // and a close continues under its own. Neither can pay twice: captures
+        // are cumulative on chain, and the wallet checks a reused close
+        // reference against the call bound to it.
+        let source = &evidence.result;
+        if source.state() == OperationState::Failed
+            && source.tx_hash().is_none()
+            && source.wallet_operation_id().is_none()
+            && source.observation().is_none()
+            && source.sessions().is_empty()
+        {
+            let result = OperationResult::new(
+                source.operation_ref(),
+                OperationState::Failed,
+                None,
+                None,
+                None,
+                vec![],
+            )?;
+            let result = match source.cause() {
+                Some(cause) => result.with_cause(cause)?,
+                None => result,
+            };
+            return Ok(Some(operation(result)));
         }
         // PreparedOperation is immutable and only ContractCalls constructs it;
         // the exact signed ABI payload and ordered targets cannot be substituted.
@@ -134,9 +201,13 @@ impl Runtime {
                 .wallet
                 .reconcile(evidence.result.operation_ref())
                 .await
-                .map_err(|_| missing(sid))?;
+                .map_err(|_| missing(sid, "the wallet could not look up a saved transaction"))?;
             if !preserves_identity(&evidence.result, &result) {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(
+                    sid,
+                    "the wallet's record of a saved transaction differs from the evidence",
+                )
+                .into());
             }
             Some(result)
         } else {
@@ -158,13 +229,13 @@ impl Runtime {
             )
             .await?;
         if !preserves_identity(&evidence.result, &result) {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the chain's record of a saved transaction differs from the evidence",
+            )
+            .into());
         }
-        Ok(Some(PendingOperation {
-            prepared: Arc::new(prepared.clone()),
-            result: Arc::new(result),
-            units: Arc::new(units),
-        }))
+        Ok(Some(operation(result)))
     }
 
     async fn restore_history(&self, evidence: &RecoveryEvidence) -> IntegrationResult<Session> {
@@ -180,7 +251,11 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(String::is_empty)
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the descriptor is not this provider's, or the close state is malformed",
+            )
+            .into());
         }
         let mut catalogs = BTreeMap::new();
         for row in &record.catalogs {
@@ -190,20 +265,30 @@ impl Runtime {
                 self.limits.wire.catalog_bytes(),
             )?;
             if hash != catalog.rate_card_hash() || catalogs.insert(hash, catalog).is_some() {
-                return Err(inconsistent(sid).into());
+                return Err(
+                    inconsistent(sid, "a catalog does not match its hash or repeats").into(),
+                );
             }
         }
         let initial = B256::from_slice(record.initial_rate_card_hash.as_deref().unwrap());
         let opening = self
             .reader
             .opening(
-                evidence.opening_tx.ok_or_else(|| missing(sid))?,
+                evidence
+                    .opening_tx
+                    .ok_or_else(|| missing(sid, "the evidence names no opening transaction"))?,
                 sid,
-                Some(catalogs.get(&initial).ok_or_else(|| missing(sid))?),
+                Some(
+                    catalogs
+                        .get(&initial)
+                        .ok_or_else(|| missing(sid, "the evidence lacks the initial catalog"))?,
+                ),
             )
             .await?;
         if opening.descriptor() != &descriptor {
-            return Err(inconsistent(sid).into());
+            return Err(
+                inconsistent(sid, "the opening transaction shows another descriptor").into(),
+            );
         }
         let block = self
             .reader
@@ -217,7 +302,11 @@ impl Runtime {
             || (block.observation().block_number() == opening.block().observation().block_number()
                 && block != *opening.block())
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the checkpoint block contradicts the chain or the opening",
+            )
+            .into());
         }
         let chain = self.reader.session(sid, &block).await?;
         if !chain.exists()
@@ -226,7 +315,11 @@ impl Runtime {
             || record.status != Some(wire_status(chain.status()))
             || initial != chain.initial_rate_card_hash()
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the session's chain state at the checkpoint block differs from the evidence",
+            )
+            .into());
         }
         let identity = self
             .reader
@@ -239,19 +332,27 @@ impl Runtime {
                 .as_ref()
                 .map(|hash| hash.as_slice())
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the current catalog differs from the provider's at the checkpoint block",
+            )
+            .into());
         }
         if identity
             .catalog()
             .is_some_and(|catalog| catalogs.get(&catalog.rate_card_hash()) != Some(catalog))
         {
-            return Err(missing(sid).into());
+            return Err(missing(sid, "the evidence lacks the current catalog").into());
         }
         let mut publications = BTreeMap::new();
         for (raw, observation) in &evidence.publications {
             let hash = B256::from_slice(raw);
             if !catalogs.contains_key(&hash) || publications.insert(hash, *observation).is_some() {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(
+                    sid,
+                    "a publication names no catalog of the evidence or repeats",
+                )
+                .into());
             }
         }
         let mut checked_blocks = BTreeMap::from([
@@ -265,9 +366,13 @@ impl Runtime {
             if *hash == initial {
                 continue;
             }
-            let observed = publications.get(hash).ok_or_else(|| missing(sid))?;
+            let observed = publications
+                .get(hash)
+                .ok_or_else(|| missing(sid, "a catalog has no publication evidence"))?;
             if observed.block_number() > block.observation().block_number() {
-                return Err(missing(sid).into());
+                return Err(
+                    missing(sid, "a catalog was published after the checkpoint block").into(),
+                );
             }
             let published = self.reader.block(Some(observed.block_number())).await?;
             if published.observation() != observed
@@ -278,13 +383,15 @@ impl Runtime {
                     .catalog()
                     != Some(catalog)
             {
-                return Err(inconsistent(sid).into());
+                return Err(
+                    inconsistent(sid, "a catalog's publication differs from the chain").into(),
+                );
             }
             if checked_blocks
                 .get(&observed.block_number())
                 .is_some_and(|known| known != &published)
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(sid, "two blocks read at one height differ").into());
             }
             checked_blocks.insert(observed.block_number(), published);
         }
@@ -307,7 +414,11 @@ impl Runtime {
                 || item.meter_seq > session.meter_seq
                 || (item.meter_seq != 0 && !cursors.insert(item.meter_seq))
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(
+                    sid,
+                    "a run's context, admission or meter sequence contradicts the evidence",
+                )
+                .into());
             }
             self.contract
                 .domain()
@@ -323,16 +434,16 @@ impl Runtime {
                     },
                     &item.signature,
                 )
-                .map_err(|_| inconsistent(sid))?;
+                .map_err(|_| inconsistent(sid, "a run's acceptance signature is invalid"))?;
             let rates = *session
                 .catalogs
                 .get(&context.rate_card_hash())
                 .and_then(|catalog| catalog.rates_for(context.model()))
-                .ok_or_else(|| missing(sid))?;
+                .ok_or_else(|| missing(sid, "a run's model has no rates in its catalog"))?;
             let accounting = item.accounting;
             let total = priced_numerator(accounting.counts(), rates)?
                 .checked_add(accounting.remaining_numerator())
-                .ok_or_else(|| inconsistent(sid))?;
+                .ok_or_else(|| inconsistent(sid, "a run's accounting overflows"))?;
             let bound = priced_numerator(item.covered_counts, rates)?;
             if item.admitted {
                 if total > bound
@@ -341,12 +452,17 @@ impl Runtime {
                         || accounting.final_status().is_some())
                         && item.meter_seq == 0)
                 {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(
+                        sid,
+                        "an admitted run's accounting contradicts its coverage or meter sequence",
+                    )
+                    .into());
                 }
                 let key = (context.model().to_owned(), context.rate_card_hash());
                 let previous = totals.get(&key).copied().unwrap_or_else(zero_counts);
                 let add = |left: u64, right: u64| {
-                    left.checked_add(right).ok_or_else(|| inconsistent(sid))
+                    left.checked_add(right)
+                        .ok_or_else(|| inconsistent(sid, "the priced usage overflows"))
                 };
                 totals.insert(
                     key,
@@ -363,7 +479,7 @@ impl Runtime {
                 || item.covered_counts != zero_counts()
                 || item.meter_seq != 0
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(sid, "a run that was not admitted has accounting").into());
             }
             let stop = CancellationToken::new();
             stop.cancel();
@@ -387,11 +503,14 @@ impl Runtime {
                     retained_bytes: 0,
                     last_low_credit: None,
                     queued: None,
+                    refusal: None,
                 },
             );
         }
         if session.meter_seq != cursors.last().copied().unwrap_or(0) {
-            return Err(inconsistent(sid).into());
+            return Err(
+                inconsistent(sid, "the session's meter sequence is not its runs' last").into(),
+            );
         }
         let mut reservations = BTreeMap::new();
         for (context, accounting) in &evidence.reservations {
@@ -399,7 +518,9 @@ impl Runtime {
                 .insert(context.run_id(), (context, accounting))
                 .is_some()
             {
-                return Err(inconsistent(sid).into());
+                return Err(
+                    inconsistent(sid, "the reservations differ from the active runs").into(),
+                );
             }
         }
         let expected = session
@@ -407,7 +528,7 @@ impl Runtime {
             .map(|run| (run.context.run_id(), (&run.context, &run.accounting)))
             .collect::<BTreeMap<_, _>>();
         if reservations != expected {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(sid, "the reservations differ from the active runs").into());
         }
         let mut stated = BTreeMap::new();
         for row in &record.usage_by_price {
@@ -419,12 +540,15 @@ impl Runtime {
                 row.model.as_deref().unwrap(),
                 B256::from_slice(row.rate_card_hash.as_deref().unwrap()),
             )?;
-            let run = session.runs.get(&rid).ok_or_else(|| missing(sid))?;
+            let run = session
+                .runs
+                .get(&rid)
+                .ok_or_else(|| missing(sid, "a priced usage row names no run in the evidence"))?;
             if !run.admitted()
                 || run.context != context
                 || row.acceptance_signature.as_deref() != Some(run.signature.as_slice())
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(sid, "a priced usage row differs from its run").into());
             }
             stated.insert(
                 (context.model().to_owned(), context.rate_card_hash()),
@@ -436,7 +560,7 @@ impl Runtime {
             );
         }
         if stated != totals {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(sid, "the priced usage differs from the runs' totals").into());
         }
         let mut finals = record
             .run_states
@@ -447,14 +571,18 @@ impl Runtime {
             let row = finals.remove(&run.context.run_id());
             if run.active() {
                 if row.is_some() {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(sid, "an unfinished run has a final state").into());
                 }
                 continue;
             }
-            let row = row.ok_or_else(|| missing(sid))?;
+            let row = row.ok_or_else(|| missing(sid, "a finished run has no final state"))?;
             if run.phase == RunPhase::NotAdmitted {
                 if row.status != Some(proto::RunStatus::NotAdmitted as i32) {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(
+                        sid,
+                        "a run that was not admitted has another final status",
+                    )
+                    .into());
                 }
             } else if row.status != run.accounting.final_status().map(final_status)
                 || row.model.as_deref() != Some(run.context.model())
@@ -467,11 +595,11 @@ impl Runtime {
                     row.output_tokens.unwrap(),
                 )? != run.accounting.counts()
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(sid, "a final state differs from its run").into());
             }
         }
         if !finals.is_empty() {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(sid, "a final state names no run of the evidence").into());
         }
         let required = required_coverage(
             std::iter::once(session.usage_numerator()?).chain(
@@ -493,16 +621,20 @@ impl Runtime {
                     },
                     voucher.signature.as_deref().unwrap(),
                 )
-                .map_err(|_| inconsistent(sid))?;
+                .map_err(|_| inconsistent(sid, "the accepted voucher's signature is invalid"))?;
             if cumulative < required || cumulative > chain.deposit() {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(
+                    sid,
+                    "the accepted voucher does not cover the usage or exceeds the deposit",
+                )
+                .into());
             }
             session.voucher = Some(voucher.clone());
         } else if session.runs.values().any(Run::admitted) || chain.settled_cumulative() != 0 {
-            return Err(missing(sid).into());
+            return Err(missing(sid, "admitted usage has no accepted voucher").into());
         }
         if session.usage()? < chain.settled_cumulative() {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(sid, "the usage is below the settled amount").into());
         }
         session.operation = self
             .restore_operation(evidence.operation.as_ref(), sid)
@@ -515,7 +647,11 @@ impl Runtime {
             .flatten()
         {
             if operation.units[&sid] > session.units()? {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(
+                    sid,
+                    "a saved operation exceeds the session's usage or names another descriptor",
+                )
+                .into());
             }
             for ((owner, target), operation_sid) in operation
                 .prepared
@@ -525,7 +661,11 @@ impl Runtime {
                 .zip(operation.prepared.session_ids())
             {
                 if operation_sid == sid && (owner != &descriptor || *target > session.usage()?) {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(
+                        sid,
+                        "a saved operation exceeds the session's usage or names another descriptor",
+                    )
+                    .into());
                 }
             }
             if operation.prepared.kind() == OperationKind::Close {
@@ -533,12 +673,21 @@ impl Runtime {
                     || session.close_reference.as_deref() != Some(operation.result.operation_ref())
                     || session.active().next().is_some()
                 {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(
+                        sid,
+                        "a saved close does not match the session's close intent",
+                    )
+                    .into());
                 }
                 if operation.result.state() == OperationState::Confirmed {
                     let closing = self
                         .reader
-                        .closing(operation.result.tx_hash().ok_or_else(|| missing(sid))?, sid)
+                        .closing(
+                            operation.result.tx_hash().ok_or_else(|| {
+                                missing(sid, "a confirmed close has no transaction hash")
+                            })?,
+                            sid,
+                        )
                         .await?;
                     session.close_result = Some(proto::CloseResult {
                         session_id: Some(sid.to_vec()),
@@ -550,7 +699,7 @@ impl Runtime {
             }
         }
         if evidence.confirmed_units > session.units()? {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(sid, "the confirmed units exceed the session's units").into());
         }
         if evidence.confirmed_units != 0
             && session.baseline.as_ref().is_none_or(|baseline| {
@@ -558,7 +707,7 @@ impl Runtime {
                     || !super::sessions::covered(baseline, sid)
             })
         {
-            return Err(missing(sid).into());
+            return Err(missing(sid, "confirmed units have no covered baseline").into());
         }
         session.confirmed_units = evidence.confirmed_units;
         self.history_fits_locked(&session, None, None)?;
@@ -610,7 +759,11 @@ impl Runtime {
                     .is_none_or(|incoming| incoming.cumulative < voucher.cumulative)
             })
         {
-            return Err(inconsistent(sid).into());
+            return Err(inconsistent(
+                sid,
+                "the evidence is older than the held session or contradicts it",
+            )
+            .into());
         }
         if let Some(known) = &previous.operation
             && (unresolved_operation(known) || known.prepared.kind() == OperationKind::Close)
@@ -620,16 +773,23 @@ impl Runtime {
                     || !preserves_identity(&known.result, &incoming.result)
             })
         {
-            return Err(missing(sid).into());
+            return Err(missing(
+                sid,
+                "the evidence lacks the held session's unresolved or close operation",
+            )
+            .into());
         }
         for (rid, run) in &previous.runs {
-            let incoming = candidate.runs.get(rid).ok_or_else(|| missing(sid))?;
+            let incoming = candidate
+                .runs
+                .get(rid)
+                .ok_or_else(|| missing(sid, "the evidence lacks a run the held session has"))?;
             if run.context != incoming.context
                 || run.signature != incoming.signature
                 || run.admitted() != incoming.admitted()
                 || (run.phase == RunPhase::NotAdmitted) != (incoming.phase == RunPhase::NotAdmitted)
             {
-                return Err(inconsistent(sid).into());
+                return Err(inconsistent(sid, "a run differs from the held session's").into());
             }
             report_transition(
                 &run.accounting,
@@ -653,24 +813,76 @@ impl Mppi {
         let runtime = &self.inner;
         runtime.check_recovery_limits(&evidence)?;
         let sid = B256::from_slice(evidence.snapshot.session_id.as_deref().unwrap());
-        let _operations = runtime.operations.lock().await;
-        let _openings = runtime.openings.lock().await;
+        // Every read comes first, holding only this session's watch interest,
+        // so sessions recover concurrently while collections and openings go
+        // on. Every check against held state (the follower's snapshot, a session
+        // already held, other sessions' operations) runs below against what was
+        // read, under the operation, opening and state locks with no read under
+        // them, and the candidate is installed under the same locks.
         let _watch = PendingWatch::new(runtime, sid)?;
+        runtime.snapshot_locked(&*runtime.lock()?)?;
+        // Nothing remains to serve or collect for final evidence of a closed
+        // session: it is never reinstalled, whether or not it retired here.
+        if evidence.is_final()
+            && runtime.chain.watch_session(sid).await?.status() == SessionStatus::Closed
         {
-            let state = runtime.lock()?;
-            runtime.snapshot_locked(&state)?;
-            if !state.sessions.contains_key(&sid)
-                && state.sessions.len() >= runtime.limits.max_sessions
+            // Hosts pass such records at startup: the session no longer needs
+            // the references it names, from now, as if it retired here. One
+            // that only it covers goes at once; a batch waits for the rest.
+            // A reference goes only if the wallet's own record of it agrees
+            // with the record, as restore_operation corroborates a saved hash:
+            // both name the same transaction, or neither names one. A mixed-up
+            // or corrupt record could pair this session's call with another
+            // session's reference, and a wallet record with a transaction the
+            // record lacks is traceable, so it stays for the wallet's own
+            // reconciliation. Keeping one is always safe.
+            let mut bound = Vec::new();
+            for operation in [&evidence.operation, &evidence.baseline]
+                .into_iter()
+                .flatten()
+                .filter(|operation| runtime.collects(&operation.prepared, sid))
             {
-                return Err(Status::resource_exhausted("session retention limit").into());
+                if let Ok(answer) = runtime
+                    .wallet
+                    .reconcile(operation.result.operation_ref())
+                    .await
+                    && agrees(&operation.result, &answer)
+                {
+                    bound.push(operation);
+                }
             }
+            let mut state = runtime.lock()?;
+            if !state.sessions.contains_key(&sid) {
+                let now = SystemTime::now();
+                for operation in bound {
+                    let covered = state
+                        .references
+                        .entry(operation.result.operation_ref().to_owned())
+                        .or_insert_with(|| {
+                            operation
+                                .prepared
+                                .session_ids()
+                                .into_iter()
+                                .map(|id| (id, None))
+                                .collect()
+                        });
+                    covered.entry(sid).or_insert(None).get_or_insert(now);
+                }
+                super::sessions::hand_over(&mut state);
+            }
+            return Err(not_ready("SESSION_CLOSED", Some(sid), None).into());
         }
         let mut candidate = runtime.restore_history(&evidence).await?;
         candidate.admissions_known = current;
         runtime.chain.watch_session(sid).await?;
+        let _operations = runtime.operations.lock().await;
+        let _openings = runtime.openings.lock().await;
         let mut state = runtime.lock()?;
         let current = runtime.snapshot_locked(&state)?;
-        let observed = current.sessions().get(&sid).ok_or_else(|| missing(sid))?;
+        let observed = current
+            .sessions()
+            .get(&sid)
+            .ok_or_else(|| missing(sid, "the chain follower does not show the session"))?;
         if !observed.exists()
             || candidate.usage()? < observed.settled_cumulative()
             || observed.deposit() < evidence.snapshot.deposit.unwrap()
@@ -681,7 +893,9 @@ impl Mppi {
             || (current.block().observation().block_number() == evidence.observation.block_number()
                 && current.block().observation() != &evidence.observation)
         {
-            return Err(inconsistent(sid).into());
+            return Err(
+                inconsistent(sid, "the chain follower's view contradicts the evidence").into(),
+            );
         }
         runtime.check_replacement(&state, &candidate)?;
         // A restored batch cannot coexist with a different unresolved call
@@ -702,7 +916,11 @@ impl Mppi {
                     incoming.result.operation_ref() != known.result.operation_ref()
                 })
             {
-                return Err(missing(sid).into());
+                return Err(missing(
+                    sid,
+                    "another held session's unresolved operation includes this session",
+                )
+                .into());
             }
         }
         // A batch's immutable intent and known identifiers agree across every
@@ -715,7 +933,11 @@ impl Mppi {
                         || known.units != incoming.units
                         || !preserves_identity(&known.result, &incoming.result))
                 {
-                    return Err(inconsistent(sid).into());
+                    return Err(inconsistent(
+                        sid,
+                        "another held session holds this reference for a different operation",
+                    )
+                    .into());
                 }
             }
         }
@@ -736,8 +958,40 @@ impl Mppi {
                 }
             }
         }
+        // A restored reference covers sessions this process may not hold yet;
+        // each needs it until it retires here or a later confirmed collection
+        // supersedes it. The installed session names it again, so it leaves
+        // the retirement queue; a retire task already under way checks again
+        // before its call. One restored without a transaction hash was not
+        // looked up in the wallet, so its hand-over takes the wallet check
+        // until a wallet answer matches it.
+        for operation in [&candidate.operation, &candidate.baseline]
+            .into_iter()
+            .flatten()
+        {
+            let reference = operation.result.operation_ref();
+            state.retirable.retain(|(queued, _)| queued != reference);
+            if operation.result.tx_hash().is_none() {
+                state
+                    .unconfirmed
+                    .insert(reference.to_owned(), operation.result.as_ref().clone());
+            } else {
+                state.unconfirmed.remove(reference);
+            }
+            state
+                .references
+                .entry(operation.result.operation_ref().to_owned())
+                .or_insert_with(|| {
+                    operation
+                        .prepared
+                        .session_ids()
+                        .into_iter()
+                        .map(|id| (id, None))
+                        .collect()
+                })
+                .insert(sid, None);
+        }
         state.sessions.insert(sid, candidate);
-        runtime.changed.notify_waiters();
         Ok(view)
     }
 }

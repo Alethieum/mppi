@@ -4,6 +4,7 @@
 use crate::{
     Address, B256, U256,
     capabilities::TransactionWallet,
+    chain::ChainError,
     config::{ProviderConfig, ProviderDeclarations, ProviderIdentityConfig},
     deployment::profile_to_mapping,
     discovery::{
@@ -22,23 +23,47 @@ use std::{
 
 const RECORD_LIMIT: usize = 4 << 20;
 const PROOF_LIMIT: usize = 64 << 10;
+const UNSUBMITTED: &str =
+    "original registry operation failed before submission; repair wallet setup and rerun";
 
-/// A bounded, redacted setup failure; rejected credentials/remote bodies are omitted.
+/// A bounded, redacted setup failure; rejected credentials/remote bodies are
+/// omitted. A failed chain read keeps its typed cause, which carries no
+/// endpoint, credential or remote text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OnboardingError(&'static str);
+pub struct OnboardingError {
+    message: &'static str,
+    cause: Option<ChainError>,
+}
 impl std::fmt::Display for OnboardingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        match &self.cause {
+            Some(cause) => write!(f, "{}: {cause}", self.message),
+            None => f.write_str(self.message),
+        }
     }
 }
 impl std::error::Error for OnboardingError {}
 impl OnboardingError {
     pub fn message(&self) -> &'static str {
-        self.0
+        self.message
+    }
+    /// Why the chain read behind this failure produced no evidence.
+    pub fn cause(&self) -> Option<ChainError> {
+        self.cause
     }
 }
 pub(crate) fn fail(message: &'static str) -> OnboardingError {
-    OnboardingError(message)
+    OnboardingError {
+        message,
+        cause: None,
+    }
+}
+/// `message` for a chain read that failed, keeping its cause.
+pub(crate) fn read_failed(message: &'static str) -> impl Fn(ChainError) -> OnboardingError {
+    move |cause| OnboardingError {
+        message,
+        cause: Some(cause),
+    }
 }
 
 /// The recipient signs the previously exported exact request in its own wallet.
@@ -570,7 +595,7 @@ pub async fn onboard(
                     record["pending"] = Value::Null;
                     save(&mut store, &record)?;
                     return Err(fail(if retained.result.tx_hash().is_none() {
-                        "original registry operation failed before submission; repair wallet setup and rerun"
+                        UNSUBMITTED
                     } else {
                         "original registry transaction reverted; rerun to check the remaining setup"
                     }));
@@ -590,7 +615,7 @@ pub async fn onboard(
             let identity = registry
                 .read(id, None)
                 .await
-                .map_err(|_| fail("provider registry identity is unavailable"))?;
+                .map_err(read_failed("provider registry identity is unavailable"))?;
             let intended_uri = format!("{}/discover", declarations.provider().public_origin());
             if identity.owner() != owner {
                 return Err(fail(
@@ -654,7 +679,18 @@ pub async fn onboard(
                     let deadline =
                         crate::discovery::exact_uint256(&proof.request["message"]["deadline"])
                             .map_err(|_| fail("recipient proof deadline is invalid"))?;
-                    let expected=registry.wallet_proof(id,declarations.provider().recipient(),owner,deadline,None).await.map_err(|_|fail("recipient proof context changed or expired; export a fresh request"))?;
+                    let expected = registry
+                        .wallet_proof(
+                            id,
+                            declarations.provider().recipient(),
+                            owner,
+                            deadline,
+                            None,
+                        )
+                        .await
+                        .map_err(read_failed(
+                            "recipient proof context changed or expired; export a fresh request",
+                        ))?;
                     if expected != proof.request {
                         return Err(fail(
                             "recipient proof context differs from selected provider",
@@ -673,7 +709,7 @@ pub async fn onboard(
                     let block = registry
                         .verified_block()
                         .await
-                        .map_err(|_| fail("recipient proof chain context is unavailable"))?;
+                        .map_err(read_failed("recipient proof chain context is unavailable"))?;
                     let deadline = U256::from(block.timestamp()) + U256::from(300u64);
                     let proof = registry
                         .wallet_proof(
@@ -684,7 +720,7 @@ pub async fn onboard(
                             Some(&block),
                         )
                         .await
-                        .map_err(|_| fail("recipient proof context is unavailable"))?;
+                        .map_err(read_failed("recipient proof context is unavailable"))?;
                     record["recipient_proof"] = proof.clone();
                     save(&mut store, &record)?;
                     return Ok(result(
@@ -725,14 +761,20 @@ pub async fn onboard(
                 .register(owner, None)
                 .map_err(|_| fail("provider registration is invalid"))?
         };
-        registry
-            .simulate(&planned)
-            .await
-            .map_err(|_| fail("planned registry write did not pass simulation"))?;
+        registry.simulate(&planned).await.map_err(read_failed(
+            "planned registry write did not pass simulation",
+        ))?;
         let retained = new_retained(planned)?;
         record["pending"] = encode_retained(&retained);
         save(&mut store, &record)?;
         let retained = wallet_registry_result(wallet.as_ref(), &retained, true).await?;
+        if retained.result.state() == OperationState::Failed {
+            // Proven never submitted. The wallet may keep no record of it to
+            // reconcile, so end it now; a rerun prepares a fresh intent.
+            record["pending"] = Value::Null;
+            save(&mut store, &record)?;
+            return Err(fail(UNSUBMITTED));
+        }
         submitted = true;
         record["pending"] = encode_retained(&retained);
         save(&mut store, &record)?;
@@ -793,7 +835,7 @@ pub async fn refresh_completed_onboarding(
     let identity = registry
         .read(config.identity().provider_id(), None)
         .await
-        .map_err(|_| fail("updated provider identity is unavailable"))?;
+        .map_err(read_failed("updated provider identity is unavailable"))?;
     if config.chain().chain_id() != identity.observation().chain_id()
         || identity.owner() != config.identity().wallet_address()
         || identity.agent_wallet() != config.provider().recipient()

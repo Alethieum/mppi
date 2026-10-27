@@ -2,6 +2,8 @@
 
 No redirects, cookies, implicit proxy credentials or wallet submissions;
 failures say whether they are transient so a read-only caller may repeat them.
+A request body holds at most 1 MiB (MAX_DOCUMENT_BYTES); a longer one is
+refused before anything is sent.
 Run blocking reads away from the gRPC I/O loop. TLS uses certificate/hostname
 verification; an optional CA file adds support for provider-managed private PKI.
 
@@ -16,6 +18,7 @@ response arrives is sent once more on a new connection, as RFC 9110 section
 from __future__ import annotations
 
 import http.client
+import re
 import ssl
 import threading
 import time
@@ -37,6 +40,23 @@ TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 _Origin = tuple[str, str, int | None]
 
+# Retry-After is delay-seconds or an HTTP-date (RFC 9110 section 10.2.3), and a
+# recipient must accept each of the three HTTP-date formats (section 5.6.7).
+# HTTP-date is case sensitive.
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MONTH_DAYS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+_MONTH = "(" + "|".join(_MONTHS) + ")"
+_TIME = "([0-9]{2}):([0-9]{2}):([0-9]{2})"
+_IMF_FIXDATE = re.compile(
+    rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), ([0-9]{{2}}) {_MONTH} ([0-9]{{4}}) {_TIME} GMT"
+)
+_RFC850_DATE = re.compile(
+    rf"(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, ([0-9]{{2}})-{_MONTH}-([0-9]{{2}}) {_TIME} GMT"
+)
+_ASCTIME_DATE = re.compile(
+    rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) {_MONTH} ([0-9]{{2}}| [0-9]) {_TIME} ([0-9]{{4}})"
+)
+
 
 class TransportError(RuntimeError):
     """Read did not produce usable evidence; never proof of economic failure.
@@ -45,11 +65,65 @@ class TransportError(RuntimeError):
     connection or a timeout, which a later identical read may not repeat:
     every request this transport sends is a read. Rejected content, TLS
     verification failure or another status is not transient.
+    ``retry_after`` is the wait in seconds a refusing response's one
+    Retry-After field asked for, or None.
     """
 
-    def __init__(self, message: str, *, transient: bool = False) -> None:
+    def __init__(
+        self, message: str, *, transient: bool = False, retry_after: float | None = None
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.retry_after = retry_after
+
+
+def _days(year: int, month: int, day: int) -> int:
+    """Days from 1970-01-01 to a proleptic Gregorian date (days_from_civil,
+    https://howardhinnant.github.io/date_algorithms.html)."""
+    year -= month <= 2
+    era = year // 400
+    of_era = year - era * 400
+    of_year = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    return era * 146_097 + of_era * 365 + of_era // 4 - of_era // 100 + of_year - 719_468
+
+
+def _http_date(value: str, now: float) -> int | None:
+    """An HTTP-date as Unix time, or None; ``now`` is Unix time."""
+    if found := _IMF_FIXDATE.fullmatch(value):
+        day_text, name, year_text, *clock = found.groups()
+    elif found := _ASCTIME_DATE.fullmatch(value):
+        name, day_text, *clock, year_text = found.groups()
+    elif found := _RFC850_DATE.fullmatch(value):
+        day_text, name, year_text, *clock = found.groups()
+    else:
+        return None
+    year, month, day = int(year_text), _MONTHS.index(name) + 1, int(day_text)
+    hour, minute, second = (int(part) for part in clock)
+    seconds = hour * 3600 + minute * 60 + second
+    if len(year_text) == 2:
+        # rfc850-date: the latest year with these two digits whose date is not
+        # more than 50 years after now.
+        current = time.gmtime(now).tm_year
+        year = current + 50 - (current + 50 - year) % 100
+        if _days(year - 50, month, day) * 86_400 + seconds > now:
+            year -= 100
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    if not 1 <= day <= _MONTH_DAYS[month - 1] + (leap and month == 2):
+        return None
+    if hour > 23 or minute > 59 or second > 60:
+        return None
+    return _days(year, month, day) * 86_400 + seconds
+
+
+def _retry_after(value: str, now: float) -> float | None:
+    """The seconds a Retry-After field value asks to wait from ``now`` (Unix
+    time): its delay-seconds, or the time until its HTTP-date, none once that
+    has passed. None for any other value."""
+    value = value.strip(" \t")
+    if re.fullmatch("[0-9]+", value):
+        return float(value)
+    at = _http_date(value, now)
+    return None if at is None else max(0.0, at - now)
 
 
 class _Stale(Exception):
@@ -81,6 +155,8 @@ class HttpTransport:
     def request(self, url: str, *, body: bytes | None = None) -> bytes:
         if type(url) is not str or any(ord(c) <= 32 or ord(c) >= 127 for c in url):
             raise TransportError("invalid HTTP endpoint")
+        if body is not None and len(body) > MAX_DOCUMENT_BYTES:
+            raise TransportError("HTTP request body exceeds 1 MiB")
         try:
             parsed = urlsplit(url)
             host, port = parsed.hostname, parsed.port
@@ -181,9 +257,11 @@ class HttpTransport:
                     raise _Stale from None
                 raise
             if response.status != 200:
+                fields = response.headers.get_all("Retry-After") or []
                 raise TransportError(
                     f"HTTP endpoint returned status {response.status}",
                     transient=response.status in TRANSIENT_STATUSES,
+                    retry_after=_retry_after(fields[0], time.time()) if len(fields) == 1 else None,
                 )
             if response.getheader("Content-Encoding", "identity").lower() != "identity":
                 raise TransportError("compressed HTTP response is not accepted")

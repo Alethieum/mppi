@@ -7,12 +7,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from mppi.v1 import mppi_pb2 as pb
 from mppi_protocol import RunAccounting, RunStatus, TokenCounts
 from mppi_protocol.contract import PreparedOperation
 from mppi_protocol.types import (
     AccountingResult,
     ChainObservation,
     OperationResult,
+    OperationState,
     PaymentFailure,
     Readiness,
     RunContext,
@@ -93,6 +95,28 @@ class RecoveryEvidence:
     confirmed_units: int = 0
     close_reference: str | None = None
     inconsistent: bool = False
+
+    def is_final(self) -> bool:
+        """Nothing in this evidence remains to recover.
+
+        Its snapshot shows the session closed, which is terminal on chain; no
+        run is reserved; every retained operation is resolved; and it is not
+        inconsistent. Recovery refuses such evidence ``SESSION_CLOSED`` once the
+        follower shows the session closed. Pass such records to ``recover`` at
+        startup all the same: the refusal hands the references the wallet binds
+        to them to retirement.
+        """
+        return (
+            self.snapshot.status == pb.SESSION_STATUS_CLOSED
+            and not self.reservations
+            and all(
+                operation is None
+                or operation.result.state not in (OperationState.PENDING, OperationState.UNKNOWN)
+                or operation.result.observation is not None
+                for operation in (self.operation, self.baseline)
+            )
+            and not self.inconsistent
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,8 +4,8 @@ Start with the [agent quickstart](agent-quickstart.md) or
 [provider quickstart](provider-quickstart.md) for built-in Circle setup. This page
 documents custom wallet and application composition.
 
-Python agent `0.1.5` and provider `0.1.2` share the Circle Agent Wallet adapter
-from `mppi-protocol` (`0.1.3` and `0.1.1` respectively). Both built-in setup paths select the packaged official
+Python agent `0.1.6` and provider `0.2.0` share the Circle Agent Wallet adapter
+from `mppi-protocol` `0.1.4`. Both built-in setup paths select the packaged official
 profile for the requested network. Explicit integrations below supply their own
 trusted profile. Python and Rust providers use the same native onboarding CLI.
 The [versioned testnet release record](https://github.com/Alethieum/mppi/releases/tag/v0.1.0)
@@ -22,10 +22,10 @@ explicit capabilities.
 Install your role into a Python 3.12+ environment:
 
 ```sh
-uv pip install 'mppi-agent==0.1.5'
+uv pip install 'mppi-agent==0.1.6'
 ```
 
-The provider environment installs `mppi-provider==0.1.2`. The shared protocol
+The provider environment installs `mppi-provider==0.2.0`. The shared protocol
 dependency installs automatically. Neither role needs the other role's package.
 For source development, see the [build guide](build.md).
 
@@ -66,6 +66,8 @@ circle wallet list --type agent --chain ARC-TESTNET --output json
 circle wallet fund --address YOUR_WALLET --chain ARC-TESTNET
 circle wallet balance --address YOUR_WALLET --chain ARC-TESTNET
 ```
+
+MPPI's Circle adapter accepts only this verified CLI version and refuses any other before anything is sent; other wallets are not affected.
 
 Provide a trusted local integration function `wallet(profile)` in an importable
 module. It returns the selected wallet adapter, with secrets obtained from your
@@ -123,7 +125,9 @@ pass its recoverable reference to `Client`.
 ### Funding wallet adapters
 
 Any wallet provider fits behind `FundingWallet` with a thin adapter; the SDK
-pins no wallet implementation or version. An adapter provides:
+pins no wallet implementation or version. The
+[wallet requirements](sdk-interfaces.md#wallet-requirements) state everything
+the agent and the providers assume of a wallet. An adapter provides:
 
 | Member | Requirement |
 | --- | --- |
@@ -134,9 +138,12 @@ pins no wallet implementation or version. An adapter provides:
 | `signs_at_execute` (optional) | `True` when the wallet service creates that signature as it executes: `sign_funding_authorization` returns a placeholder, and `execute` replaces it with the real signature before sending |
 
 Funding requires the agent id: pass `agent_id` to `Client`. Before submitting
-an opening, the agent checks, in one read at one block, that the
-registry's `getAgentWallet(agent_id)` is `address` and that the signature passes
-the same check USDC applies. Otherwise it raises `FundingAuthorizationError`
+an opening, the agent checks at one block that the registry's
+`getAgentWallet(agent_id)` is `address` and that the signature passes the same
+check USDC applies. The binding, and whether `address` has code, come with the
+chain snapshot the opening reads anyway; the signature of an account without
+code is then recovered by ECDSA with no read, and one with code is asked
+through `isValidSignature`, in one read. Otherwise it raises `FundingAuthorizationError`
 with `reason` `AGENT_ID_REQUIRED`, `AGENT_WALLET_MISMATCH` or
 `INVALID_SIGNATURE`, and nothing is submitted; an all-zero placeholder from a
 wallet that has not declared `signs_at_execute` is
@@ -165,19 +172,57 @@ wallet = CircleAgentWallet(
 wallet.verify_wallet()
 ```
 
-Before signing or submission, the adapter verifies the CLI version and that the
-CLI selects `address` as an agent wallet on the selected network. It pins no
-account code, so any Circle account generation that supports the self-execution
-call works. Circle documents deployment on the
+The adapter checks the CLI version and that the CLI selects `address` as an
+agent wallet on the selected network. An execute runs that check first unless
+one that passed began less than 60 seconds earlier; a signature and
+`verify_wallet` accept the last passing check whatever its age. Any CLI command
+that fails, or prints output the adapter refuses, clears it, so the next
+operation checks again. When an execute's check finds the login gone, it raises
+`CircleNotSubmittedError` before saving its intent: nothing was sent. A login
+lost less than 60 seconds after a passing check began is found only by the
+CLI's own refusal of the execute, before it sends anything but after the
+adapter saved the intent: the result is `UNKNOWN` with no transaction id and
+cause
+`CircleAgentWalletError: Circle command did not return success (AUTH_REQUIRED)`.
+It can only ever be reconciled, so the sessions of a provider's capture that
+ends this way cannot be collected again. A signature with a lost login raises.
+Circle CLI `1.1.4` reports `AUTH_REQUIRED` when its saved login is missing or
+past its expiry, and `AUTH_EXPIRED` when Circle's service refuses a login the
+CLI still holds. Restart after installing another CLI version.
+The adapter pins no account code, so any Circle account generation that supports
+the self-execution call works. Circle documents deployment on the
 [first outbound transaction](https://developers.circle.com/wallets/account-types#smart-contract-accounts-sca-and-msca);
 receiving funds alone does not establish deployment. Circle wallet upgrades are
 started only by the wallet holder ([upgrades](https://developers.circle.com/wallets/wallet-upgrades));
 an upgraded account keeps working while USDC accepts its signatures.
 
 The adapter passes the exact target and calldata through the account's
-`execute(address,uint256,bytes)` function with zero native value. It retains a
-stable key and exact intent before invoking the CLI. Funding signatures remain
-the original Circle signature bytes; MPPI's fixed ECDSA signer stays separate.
+`execute(address,uint256,bytes)` function with zero native value. It saves a
+stable key and its call's digest before invoking the CLI. The journal's file
+lock is held only while the journal is read or replaced, never while a CLI
+command runs, so another process sharing the journal, such as the native
+`mppi provider update` command, goes on meanwhile; each save keeps that
+process's records. An execute or reconcile waits for that lock up to
+`timeout_seconds` (240 by default); other operations wait a second. Within one
+process the adapter runs one operation at a time, CLI commands included, so an
+operation may also wait behind another's command. An execute that cannot save
+its intent in that time raises before Circle is asked, and `submit_operation`
+records it `UNKNOWN`: nothing was sent, but the journal was not read to show
+it. If the adapter cannot record Circle's answer (the journal is held past that
+time, cannot be read or saved, or already holds other evidence for it), the
+result is `UNKNOWN` with Circle's transaction id and hash, and the adapter
+writes them into the journal at its next journal step, unless the journal still
+holds other evidence; a failed save keeps them in memory and does not fail that
+step. They live only in that memory until then: if the process stops first,
+the journal row holds no transaction id or hash, a reconcile of the reference
+is `UNKNOWN` without a hash, and a provider runtime refuses to recover a
+checkpoint holding that hash ([Python runtime](python-runtime.md)). Circle's
+documentation describes no lookup of a transaction by the idempotency key the
+adapter sends, `circle transaction list` prints a wallet's transactions without
+their idempotency keys, and MPPI documents no procedure for writing a
+transaction id and hash into a journal row: there is no documented remedy.
+Funding signatures remain the original Circle signature bytes; MPPI's fixed
+ECDSA signer stays separate.
 The earlier agent integration passed the versioned live Arc testnet registration,
 funding and payment checks with a deployed Circle SCA.
 
@@ -187,11 +232,38 @@ CLI exposes no idempotency-key lookup: the result remains `UNKNOWN`, even when a
 similar transaction appears in recent history. Do not delete the journal to
 retry. Resolve the original operation with the wallet service first.
 
-The journal permits 4,096 retained operations; exceeding that bound stops new
-submissions. Its format 2 no longer retains account code pins. A format 1
-journal for the same wallet and deployment still loads and is rewritten on its
-next save; earlier releases refuse format 2, so do not downgrade over it. Calls are limited to 60 KiB of calldata to fit the reviewed CLI
-transport. Each command has bounded output. Read-only commands have a default
+A failed Circle command names only Circle CLI `1.1.4`'s error code, never its
+message or other output: `Circle command did not return success (AUTH_EXPIRED)`.
+When `execute` or `reconcile` leaves an operation `UNKNOWN`, the result's `cause`
+carries that reason, for example
+`CircleAgentWalletError: Circle command did not return success (TIMEOUT)`.
+
+Each record keeps a 32-byte digest of its call rather than the call, so the
+16 MiB journal, its only bound, holds tens of thousands of them. A record from
+an earlier release, which kept the whole call, still loads and is written in
+the compact form on the next save; earlier releases refuse that form, so do not
+downgrade over it. Format 2 no longer retains account code pins, and a format 1
+journal for the same wallet and deployment still loads. A new operation that
+would leave too little room for its record, and for the transaction id, hash
+and retirement mark every record may still gain, is refused before Circle is
+asked. `near_capacity` is true from three quarters of the bound.
+`retire(operation_refs=..., at=...)` marks each named record with `at`, Unix
+time in seconds as from `time.time()`, keeping an earlier mark; it skips a
+reference without a record and one no record can have. The mark is saved in
+the journal, so a restart keeps it, and every save from `at` on forgets each
+marked record that holds a transaction hash. A record without one keeps its
+mark, since its call may still reach Circle. A `reconcile` of a marked record
+withdraws its mark, since a recovery from an older checkpoint may present that
+reference again. The provider runtime passes the references of the sessions
+it retired, which may include one without a transaction hash. The agent passes
+those of a session it retired, once its checkpoint no longer names them, and
+never one without a transaction hash. Pass only references that are never used
+again once `at` has passed. Calls are limited to 60 KiB of
+calldata to fit the reviewed CLI transport; a larger call, or one for another
+network, is refused before its intent is saved, as `CircleNotSubmittedError`.
+A save that fails after it may have replaced the journal is read back and its
+unsent intent removed; only then is the failure reported as not submitted.
+Each command has bounded output. Read-only commands have a default
 240-second timeout, and reconciliation examines at most 20 pages. Execute and
 sign commands drain to completion without a timeout kill. These are adapter limits,
 not new protocol limits. The `command`, `timeout_seconds` and `max_pages`
@@ -209,7 +281,9 @@ constructor shown above, with the provider operator's address and journal. Set
 `require_existing=True` when restoring an onboarded wallet. Its operator must
 match the configuration and differ from the receive-only payout recipient.
 Recipient proof signing stays outside the serving process. Separate wallet
-addresses under one Circle account still share account custody.
+addresses under one Circle account still share account custody. Another
+`TransactionWallet` composes through `Mppi.from_config(..., wallet=...)`; see
+[provider composition](python-runtime.md#provider-composition).
 
 Circle owns login and its 28-day session renewal. Agent Wallet transaction gas
 is sponsored subject to caps and fair use; see Circle's
@@ -218,8 +292,9 @@ and [fees](https://developers.circle.com/agent-stack/agent-wallets/fees).
 
 `execute` sends exact calldata through the supported SCA using the official
 [contract execution command](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/execute-contract).
-The shared journal retains exact intent before submission and uses only the
-original returned transaction ID for read-only reconciliation. Circle service
+The shared journal binds each reference to its call's digest before submission
+and uses only the original returned transaction ID for read-only
+reconciliation. Circle service
 state alone does not confirm MPPI payment; the runtime independently verifies
 canonical contract events and state. An unknown outcome remains attached to its
 original operation. The adapter provides no provider storage service or automatic

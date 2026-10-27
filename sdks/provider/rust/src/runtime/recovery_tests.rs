@@ -7,7 +7,7 @@ use crate::{
     types::OperationState,
 };
 
-fn restarted(fixture: &Fixture) -> Mppi {
+pub(super) fn restarted(fixture: &Fixture) -> Mppi {
     let source = &fixture.provider.inner;
     let provider = Mppi::new(
         source.config.clone(),
@@ -1297,5 +1297,286 @@ async fn a_restored_never_metered_run_cancelled_at_zero_lets_its_session_reattac
             .usage()
             .unwrap(),
         0
+    );
+}
+
+/// Its payment reason, and the message naming the check that failed.
+fn refusal(error: &crate::interfaces::IntegrationError) -> (Option<String>, String) {
+    let status = error.downcast_ref::<Status>().unwrap();
+    (reason(status), status.message().to_owned())
+}
+
+#[tokio::test]
+async fn each_refusal_for_unavailable_evidence_names_its_check() {
+    let (fixture, valid) = final_history().await;
+    let error = restarted(&fixture)
+        .checkpoint(fixture.sid)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&error).1,
+        "SESSION_NOT_READY: the session is not held"
+    );
+    fixture.begin(2);
+    let error = fixture.provider.checkpoint(fixture.sid).await.unwrap_err();
+    assert_eq!(
+        refusal(&error).1,
+        "SESSION_NOT_READY: a run is still preparing"
+    );
+    let mut cases = Vec::new();
+    let mut bad = valid.clone();
+    bad.opening_tx = None;
+    cases.push((bad, "the evidence names no opening transaction"));
+    let mut bad = valid.clone();
+    bad.snapshot.usage_by_price[0].acceptance_run_id = Some(hash(9).to_vec());
+    cases.push((bad, "a priced usage row names no run in the evidence"));
+    let mut bad = valid.clone();
+    bad.snapshot.accepted_voucher = None;
+    cases.push((bad, "admitted usage has no accepted voucher"));
+    let mut bad = valid.clone();
+    bad.confirmed_units = 1;
+    cases.push((bad, "confirmed units have no covered baseline"));
+    for (bad, check) in cases {
+        let error = restarted(&fixture).recover(bad).await.unwrap_err();
+        assert_eq!(
+            refusal(&error),
+            (
+                Some("STATE_UNAVAILABLE".into()),
+                format!("SESSION_NOT_READY: {check}")
+            )
+        );
+    }
+
+    let (fixture, wallet, evidence) = original_pending_operation().await;
+    *wallet.answer.lock().unwrap() = Some(Err(WalletError));
+    let error = restarted(&fixture).recover(evidence).await.unwrap_err();
+    assert_eq!(
+        refusal(&error),
+        (
+            Some("STATE_UNAVAILABLE".into()),
+            "SESSION_NOT_READY: the wallet could not look up a saved transaction".into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn each_refusal_for_inconsistent_evidence_names_its_check() {
+    let (fixture, valid) = final_history().await;
+    let mut cases = Vec::new();
+    // A check of several conditions has one label.
+    let mut bad = valid.clone();
+    bad.snapshot.close_pending = Some(true);
+    cases.push((
+        bad,
+        "the descriptor is not this provider's, or the close state is malformed",
+    ));
+    let mut bad = valid.clone();
+    bad.runs[0].meter_seq = valid.snapshot.meter_seq.unwrap() + 1;
+    cases.push((
+        bad,
+        "a run's context, admission or meter sequence contradicts the evidence",
+    ));
+    // Only this runtime refuses a bad signature as inconsistent state.
+    let mut bad = valid.clone();
+    bad.runs[0].signature[0] ^= 1;
+    cases.push((bad, "a run's acceptance signature is invalid"));
+    let mut bad = valid.clone();
+    bad.snapshot.usage_by_price[0].output_tokens = Some(749);
+    cases.push((bad, "the priced usage differs from the runs' totals"));
+    let mut bad = valid.clone();
+    bad.snapshot.run_states[0].status = Some(proto::RunStatus::Failed as i32);
+    cases.push((bad, "a final state differs from its run"));
+    let mut bad = valid.clone();
+    bad.confirmed_units = u64::MAX;
+    cases.push((bad, "the confirmed units exceed the session's units"));
+    for (bad, check) in cases {
+        let error = restarted(&fixture).recover(bad).await.unwrap_err();
+        assert_eq!(
+            refusal(&error),
+            (
+                Some("INCONSISTENT_STATE".into()),
+                format!("SESSION_NOT_READY: {check}")
+            )
+        );
+    }
+
+    let (fixture, wallet, evidence) = original_pending_operation().await;
+    let reference = evidence.operation.as_ref().unwrap().result.operation_ref();
+    *wallet.answer.lock().unwrap() = Some(Ok(OperationResult::new(
+        reference,
+        OperationState::Pending,
+        Some("wallet-original".into()),
+        Some(hash(0xde)),
+        None,
+        vec![],
+    )
+    .unwrap()));
+    let error = restarted(&fixture).recover(evidence).await.unwrap_err();
+    assert_eq!(
+        refusal(&error),
+        (
+            Some("INCONSISTENT_STATE".into()),
+            "SESSION_NOT_READY: the wallet's record of a saved transaction differs from the evidence"
+                .into()
+        )
+    );
+}
+
+/// Every check an `INCONSISTENT_STATE` recovery refusal names, as
+/// `recovery.rs` spells it. The Python runtime's test reads them there and
+/// compares them with its own: all but the last five are both runtimes'.
+const INCONSISTENT_CHECKS: &[&str] = &[
+    "a saved operation does not collect this session or misstates its units",
+    "the wallet's record of a saved transaction differs from the evidence",
+    "the chain's record of a saved transaction differs from the evidence",
+    "the descriptor is not this provider's, or the close state is malformed",
+    "a catalog does not match its hash or repeats",
+    "the opening transaction shows another descriptor",
+    "the checkpoint block contradicts the chain or the opening",
+    "the session's chain state at the checkpoint block differs from the evidence",
+    "the current catalog differs from the provider's at the checkpoint block",
+    "a publication names no catalog of the evidence or repeats",
+    "a catalog's publication differs from the chain",
+    "a run's context, admission or meter sequence contradicts the evidence",
+    "an admitted run's accounting contradicts its coverage or meter sequence",
+    "a run that was not admitted has accounting",
+    "the session's meter sequence is not its runs' last",
+    "the reservations differ from the active runs",
+    "a priced usage row differs from its run",
+    "the priced usage differs from the runs' totals",
+    "an unfinished run has a final state",
+    "a run that was not admitted has another final status",
+    "a final state differs from its run",
+    "a final state names no run of the evidence",
+    "the accepted voucher does not cover the usage or exceeds the deposit",
+    "the usage is below the settled amount",
+    "a saved operation exceeds the session's usage or names another descriptor",
+    "a saved close does not match the session's close intent",
+    "the confirmed units exceed the session's units",
+    "the evidence is older than the held session or contradicts it",
+    "a run differs from the held session's",
+    "the chain follower's view contradicts the evidence",
+    "another held session holds this reference for a different operation",
+    // This runtime's only.
+    "two blocks read at one height differ",
+    "a run's acceptance signature is invalid",
+    "a run's accounting overflows",
+    "the priced usage overflows",
+    "the accepted voucher's signature is invalid",
+];
+
+#[test]
+fn every_inconsistent_state_refusal_in_recovery_names_a_listed_check() {
+    let source = include_str!("recovery.rs");
+    // Only the helper builds the refusal.
+    let helper = source.find("fn inconsistent(").unwrap();
+    let body = &source[helper..helper + source[helper..].find("\n}").unwrap()];
+    let built = "\"INCONSISTENT_STATE\"";
+    assert!(
+        source.matches(built).count() == 1 && body.contains(built),
+        "a refusal built without the helper"
+    );
+    // Each call names its check with a literal from the list; each listed
+    // check is named.
+    let listed = INCONSISTENT_CHECKS
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        listed.len(),
+        INCONSISTENT_CHECKS.len(),
+        "a check is listed twice"
+    );
+    let mut named = std::collections::BTreeSet::new();
+    for (at, call) in source.match_indices("inconsistent(") {
+        let before = source[..at].chars().next_back();
+        if at == helper + "fn ".len() || before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let rest = source[at + call.len()..].trim_start();
+        let check = rest
+            .strip_prefix("sid")
+            .and_then(|rest| rest.trim_start().strip_prefix(','))
+            .and_then(|rest| rest.trim_start().strip_prefix('"'))
+            .and_then(|rest| rest.split_once('"'))
+            .filter(|(check, rest)| {
+                !check.contains('\\')
+                    && rest
+                        .trim_start()
+                        .trim_start_matches(',')
+                        .trim_start()
+                        .starts_with(')')
+            })
+            .map(|(check, _)| check)
+            .unwrap_or_else(|| {
+                let call = rest.chars().take(60).collect::<String>();
+                panic!("a check that is not one literal: {call}")
+            });
+        assert!(listed.contains(check), "unlisted check: {check}");
+        named.insert(check);
+    }
+    assert_eq!(named, listed, "a listed check is never named");
+}
+
+/// How long `provider` takes to recover every piece of `evidence` at once,
+/// as a host restoring all its sessions at startup does.
+async fn recovered_together(provider: &Mppi, evidence: &[RecoveryEvidence]) -> Duration {
+    let start = Instant::now();
+    let tasks = evidence
+        .iter()
+        .map(|item| {
+            let (provider, item) = (provider.clone(), item.clone());
+            tokio::spawn(async move { provider.recover(item).await.map(|_| ()) })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    Instant::now() - start
+}
+
+#[tokio::test(start_paused = true)]
+async fn sessions_recover_concurrently_reading_before_any_runtime_lock() {
+    use super::retirement_tests::{attached, fixture as sessions};
+    const SESSIONS: u64 = 200;
+    let (fixture, chain) = sessions().await;
+    let mut evidence = Vec::new();
+    for n in 1..=SESSIONS {
+        let (sid, _) = attached(&fixture, &chain, n).await.unwrap();
+        evidence.push(fixture.provider.checkpoint(sid).await.unwrap());
+    }
+    // Every exchange with the RPC, a call or a batch, now takes 50 ms.
+    chain.round_trip.store(50, Ordering::SeqCst);
+    let one = recovered_together(&restarted(&fixture), &evidence[..1]).await;
+    let all = recovered_together(&restarted(&fixture), &evidence).await;
+    // Reads overlap, and watches added together share the follower's next
+    // refresh (follower.rs, watch_session): 200 sessions take about as long as
+    // a few. Only each install still runs one session at a time. One refresh
+    // per watch, as before, took 20 s here against one session's 450 ms.
+    assert!(
+        all < one * 4,
+        "{SESSIONS} sessions took {all:?}, one took {one:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_recovery_leaves_the_watch_a_concurrent_one_installs() {
+    use super::retirement_tests::{attached, fixture as sessions};
+    let (fixture, chain) = sessions().await;
+    let (sid, _) = attached(&fixture, &chain, 1).await.unwrap();
+    let valid = fixture.provider.checkpoint(sid).await.unwrap();
+    let mut contradicted = valid.clone();
+    contradicted.snapshot.deposit = Some(101);
+    chain.round_trip.store(50, Ordering::SeqCst);
+    let provider = restarted(&fixture);
+    let (refused, installed) =
+        tokio::join!(provider.recover(contradicted), provider.recover(valid));
+    assert!(refused.is_err());
+    installed.unwrap();
+    assert!(provider.inner.lock().unwrap().pending_watch.is_empty());
+    let current = provider.inner.chain.refresh().await.unwrap();
+    assert!(
+        current.sessions().contains_key(&sid),
+        "the held session lost its watch"
     );
 }

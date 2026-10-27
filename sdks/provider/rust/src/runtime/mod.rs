@@ -5,7 +5,7 @@ use prost::Message;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -30,14 +30,14 @@ use crate::{
     remaining_funding_tokens, report_transition, required_coverage,
     types::{
         AccountingResult, ChainObservation, OperationResult, PaymentCode, PaymentFailure,
-        RunContext, SessionStatus,
+        Readiness, RunContext, SessionStatus,
     },
     wire::{self, WireLimits},
 };
 
 mod core;
 mod hooks;
-pub use hooks::{HookError, Hooks, ObserverStats};
+pub use hooks::{HookError, Hooks, ObserverStats, OperationTiming};
 mod lifecycle;
 mod recovery;
 mod services;
@@ -46,28 +46,43 @@ pub use services::{RpcStream, UpstreamFailure};
 #[cfg(test)]
 mod tests;
 
-/// Local retention limits. They do not change MPPI wire messages.
+/// Calldata the runtime prepares, in bytes. Every argument has a fixed size, so
+/// these are exact for every session, the worst case included. One `settle` or
+/// `close`: the 4-byte selector, the descriptor's seven 32-byte words, the
+/// cumulative and capture words, the signature's offset and length words, and
+/// its 65 bytes padded to 96 (452; a refund-only close has no signature, 356).
+/// A `settleBatch`: the selector, four head offsets and four array lengths
+/// (260), then per session the descriptor's seven words, the two amount words,
+/// and the signature's offset, length and 96 padded bytes (448).
+pub(super) const SETTLE_CALL_BYTES: usize = 4 + 7 * 32 + 2 * 32 + 2 * 32 + 96;
+const BATCH_CALL_BYTES: usize = 4 + 4 * 32 + 4 * 32;
+const BATCH_ITEM_BYTES: usize = 7 * 32 + 2 * 32 + 2 * 32 + 96;
+/// The most sessions one batch holds within `max_call_bytes`: 260 + 448 n
+/// bytes. Circle's 61,440 hold (61,440 - 260) / 448 = 136 sessions in 61,188
+/// bytes; 137 would take 61,636. At least one: a single session is collected by
+/// `settle`, which fits every bound the runtime accepts.
+pub(super) fn batch_sessions(max_call_bytes: usize) -> usize {
+    (max_call_bytes.saturating_sub(BATCH_CALL_BYTES) / BATCH_ITEM_BYTES).max(1)
+}
+
+/// Local retention limits. They do not change MPPI wire messages. No count of
+/// sessions is limited: a closed session retires after `closed_retention`.
 #[derive(Clone, Debug)]
 pub struct RuntimeLimits {
-    pub(super) max_sessions: usize,
     pub(super) max_control_streams: usize,
     pub(super) wire: WireLimits,
     pub(super) control_auth_timeout: Duration,
+    pub(super) closed_retention: Duration,
 }
 impl RuntimeLimits {
-    pub fn new(
-        max_sessions: usize,
-        max_control_streams: usize,
-        wire: WireLimits,
-    ) -> Result<Self, ValidationError> {
-        if max_sessions == 0 || max_control_streams == 0 {
+    pub fn new(max_control_streams: usize, wire: WireLimits) -> Result<Self, ValidationError> {
+        if max_control_streams == 0 {
             return Err(ValidationError::new(
                 ValidationCode::InvalidValue,
                 "runtime retention limits must be positive",
             ));
         }
         Ok(Self {
-            max_sessions,
             max_control_streams,
             wire,
             ..Self::default()
@@ -91,8 +106,23 @@ impl RuntimeLimits {
     pub fn control_auth_timeout(&self) -> Duration {
         self.control_auth_timeout
     }
-    pub fn max_sessions(&self) -> usize {
-        self.max_sessions
+    /// How long a final session stays retained before it retires, from one
+    /// hour to seven days; 24 hours by default. Within it an agent can
+    /// reattach to read the final state and the host can take a final
+    /// checkpoint. A final session has nothing left to serve, collect or
+    /// reconcile, and a closed session is terminal on chain.
+    pub fn with_closed_retention(mut self, retention: Duration) -> Result<Self, ValidationError> {
+        if retention < Duration::from_secs(3600) || retention > Duration::from_secs(7 * 86400) {
+            return Err(ValidationError::new(
+                ValidationCode::InvalidValue,
+                "closed session retention must be one hour to seven days",
+            ));
+        }
+        self.closed_retention = retention;
+        Ok(self)
+    }
+    pub fn closed_retention(&self) -> Duration {
+        self.closed_retention
     }
     pub fn max_control_streams(&self) -> usize {
         self.max_control_streams
@@ -104,10 +134,10 @@ impl RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_sessions: 1024,
             max_control_streams: 1024,
             wire: WireLimits::default(),
             control_auth_timeout: Duration::from_secs(60),
+            closed_retention: Duration::from_secs(86400),
         }
     }
 }
@@ -124,11 +154,15 @@ pub(super) struct Runtime {
     pub(super) reader: ChainReader,
     pub(super) contract: ContractCalls,
     pub(super) wallet: Arc<dyn TransactionWallet>,
+    /// `TransactionWallet::max_call_bytes`, read once at construction.
+    pub(super) max_call_bytes: usize,
     pub(super) coverage: Arc<dyn CoverageProvider>,
     pub(super) execution: Arc<dyn ExecutionProvider>,
     pub(super) limits: RuntimeLimits,
     observers: hooks::Observers,
     pub(super) state: Mutex<State>,
+    /// Wakes shutdown, which waits for the final report of every active run
+    /// (`Runtime::wake_locked`).
     pub(super) changed: Notify,
     pub(super) operations: tokio::sync::Mutex<()>,
     pub(super) openings: tokio::sync::Mutex<()>,
@@ -140,8 +174,9 @@ pub(super) struct Runtime {
 
 pub(super) struct State {
     pub(super) sessions: BTreeMap<B256, Session>,
-    // At most one opening/recovery holds this interest under openings mutex.
-    pub(super) pending_watch: Option<B256>,
+    /// Openings and recoveries in progress that hold a session's chain watch,
+    /// counted: recoveries run concurrently (`PendingWatch`).
+    pub(super) pending_watch: BTreeMap<B256, usize>,
     pub(super) collecting: BTreeSet<B256>,
     pub(super) empty_batch: Option<PendingOperation>,
     pub(super) unsubmitted_collection: Option<String>,
@@ -152,21 +187,40 @@ pub(super) struct State {
     pub(super) retained_request_bytes: usize,
     pub(super) next_attachment: u64,
     pub(super) documents: Option<DiscoveryDocuments>,
+    /// The follower's readiness at the last maintenance pass.
+    pub(super) readiness: Option<Readiness>,
+    /// Each operation reference this runtime prepared or restored, and for
+    /// each session it covers the time from which that session no longer
+    /// needs it: `None` while the session's checkpoint may still name it; the
+    /// time the session retired here; or `closed_retention` after a later
+    /// confirmed collection of the session superseded it.
+    pub(super) references: BTreeMap<String, BTreeMap<B256, Option<SystemTime>>>,
+    /// References no covered session needs, each with the time from which the
+    /// wallet may forget it (`TransactionWallet::retire`), the latest of its
+    /// sessions' times; whether that call is under way; and, after the wallet
+    /// refused one, when maintenance may try again.
+    pub(super) retirable: Vec<(String, SystemTime)>,
+    /// The record of each reference no wallet answer in this process has
+    /// matched (`recovery::agrees`): restored without a transaction hash, so
+    /// not looked up at recovery, or kept against a wallet answer that
+    /// disagreed with it. Its hand-over to `retire` takes recovery's wallet
+    /// check; a matching answer removes it.
+    pub(super) unconfirmed: BTreeMap<String, OperationResult>,
+    pub(super) retiring: bool,
+    pub(super) retire_after: Option<Instant>,
+    /// `TransactionWallet::near_capacity` at the last maintenance pass.
+    pub(super) near_capacity: bool,
 }
 /// Runtime-local watch interest across asynchronous opening/recovery. The
-/// public follower retains idempotent watch/unwatch semantics. Declare after
-/// the openings mutex guard so cleanup finishes before the next operation.
+/// public follower retains idempotent watch/unwatch semantics. The last
+/// interest in a session that was not installed releases its watch.
 struct PendingWatch {
     runtime: Arc<Runtime>,
     sid: B256,
 }
 impl PendingWatch {
     fn new(runtime: &Arc<Runtime>, sid: B256) -> Result<Self, Status> {
-        let mut state = runtime.lock()?;
-        if state.pending_watch.is_some() {
-            return Err(Status::internal("overlapping opening watch interest"));
-        }
-        state.pending_watch = Some(sid);
+        *runtime.lock()?.pending_watch.entry(sid).or_default() += 1;
         Ok(Self {
             runtime: runtime.clone(),
             sid,
@@ -175,10 +229,15 @@ impl PendingWatch {
 }
 impl Drop for PendingWatch {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.runtime.lock()
-            && state.pending_watch == Some(self.sid)
-        {
-            state.pending_watch = None;
+        let Ok(mut state) = self.runtime.lock() else {
+            return;
+        };
+        let Some(count) = state.pending_watch.get_mut(&self.sid) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            state.pending_watch.remove(&self.sid);
             // Current installed state owns the watch. A cancelled/failed
             // operation with no remaining session must release its interest.
             if !state.sessions.contains_key(&self.sid) {
@@ -227,6 +286,16 @@ pub(super) struct Session {
     pub(super) last_collection: Instant,
     /// Runs that have waited for admission so far: the next one's position.
     pub(super) waited: u64,
+    /// When maintenance first found this session final (`Session::is_final`).
+    pub(super) final_since: Option<Instant>,
+    /// Wakes this session's runs waiting for admission (`Runtime::wake_locked`).
+    /// A session is replaced, retired or discarded only while none of its runs
+    /// is preparing (`check_replacement`, `Session::is_final`, a provisional
+    /// opening has no runs), so no waiting run outlives the session it waits on.
+    pub(super) wake: Arc<Notify>,
+    /// Admission checks of this session's runs, counted for the wake-up tests.
+    #[cfg(test)]
+    pub(super) checks: u64,
 }
 #[derive(Clone)]
 pub(super) struct PendingOperation {
@@ -257,6 +326,9 @@ pub(super) struct Run {
     pub(super) retained_bytes: usize,
     /// Its place among runs waiting for admission, from its first wait.
     pub(super) queued: Option<Queued>,
+    /// This runtime's first refusal of the run's coverage. A host error that
+    /// then ends its execution reaches the agent as this typed failure.
+    pub(super) refusal: Option<PaymentFailure>,
 }
 pub(super) struct Queued {
     pub(super) position: u64,
@@ -274,6 +346,8 @@ pub(super) struct RunHandle {
     pub(super) request: PreparedRequest,
     pub(super) stop: CancellationToken,
     pub(super) output: Arc<ByteQueue>,
+    /// Its session's `Session::wake`.
+    pub(super) wake: Arc<Notify>,
 }
 pub(super) enum Admission {
     Granted,
@@ -347,6 +421,13 @@ impl Mppi {
                 "provider deployment, wallet or follower configuration mismatch",
             ));
         }
+        let max_call_bytes = wallet.max_call_bytes();
+        if max_call_bytes < SETTLE_CALL_BYTES {
+            return Err(ValidationError::new(
+                ValidationCode::InvalidValue,
+                "wallet call bound is below one settlement call (452 bytes)",
+            ));
+        }
         let reader = chain.reader().clone();
         Ok(Self {
             inner: Arc::new(Runtime {
@@ -355,13 +436,14 @@ impl Mppi {
                 reader,
                 contract,
                 wallet,
+                max_call_bytes,
                 coverage,
                 execution,
                 limits,
                 observers: hooks::Observers::new(hooks),
                 state: Mutex::new(State {
                     sessions: BTreeMap::new(),
-                    pending_watch: None,
+                    pending_watch: BTreeMap::new(),
                     collecting: BTreeSet::new(),
                     empty_batch: None,
                     unsubmitted_collection: None,
@@ -372,6 +454,13 @@ impl Mppi {
                     retained_request_bytes: 0,
                     next_attachment: 0,
                     documents: None,
+                    readiness: None,
+                    references: BTreeMap::new(),
+                    retirable: Vec::new(),
+                    unconfirmed: BTreeMap::new(),
+                    retiring: false,
+                    retire_after: None,
+                    near_capacity: false,
                 }),
                 changed: Notify::new(),
                 operations: tokio::sync::Mutex::new(()),
@@ -441,6 +530,10 @@ impl Session {
             confirmed_units: 0,
             last_collection: Instant::now(),
             waited: 0,
+            final_since: None,
+            wake: Arc::new(Notify::new()),
+            #[cfg(test)]
+            checks: 0,
         }
     }
     pub(super) fn active(&self) -> impl Iterator<Item = &Run> {

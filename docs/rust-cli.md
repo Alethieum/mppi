@@ -5,7 +5,7 @@ and Rust providers. Start with the [provider quickstart](provider-quickstart.md)
 for installation, generated declarations and application composition. This
 reference covers onboarding, host launch, verification and explicit updates.
 
-Provider `0.1.2` packages official Arc mainnet and testnet profiles and selects
+Provider `0.2.0` packages official Arc mainnet and testnet profiles and selects
 the profile from the resolved `chain.network`. `--mainnet` or `--testnet` overrides that
 configuration selection; `init` requires one of these flags. An explicit
 `--profile FILE` overrides packaged pins and must match the selected network.
@@ -17,6 +17,11 @@ environment before running them. Without that flag, the configuration selects
 the RPC, defaulting to `https://rpc.testnet.arc.io` on testnet and
 `https://rpc.mainnet.arc.io` on mainnet. Use `ARC_RPC_URL_MAINNET` explicitly for a
 mainnet environment override. See [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc).
+`--timeout-ms` bounds each chain read attempt. A read that fails for a transient
+reason is repeated at most twice; no transaction is repeated. A failed read
+names its cause after the message, for example
+`provider registry identity is unavailable: chain RPC unavailable: JSON HTTP endpoint returned status 503`,
+never the RPC URL or its credentials.
 
 ## Generate declarations
 
@@ -37,7 +42,9 @@ Keep the configuration and its sidecars in a private durable directory.
 `--timeout-ms` sets the bounded CLI request timeout; the default is 30,000 ms.
 
 The operator is an existing Circle Agent Wallet selected by address. Install
-`@circle-fin/cli@1.1.4` and complete `circle wallet login EMAIL --testnet`, or omit
+`@circle-fin/cli@1.1.4`; the Circle adapter accepts only this verified CLI version
+and refuses any other before anything is sent, and other wallets are not affected.
+Complete `circle wallet login EMAIL --testnet`, or omit
 `--testnet` for mainnet. Use `circle wallet list --type agent --chain ARC-TESTNET`
 (`ARC` on mainnet) to select it. Keep the Circle CLI available on `PATH` to both
 the native CLI and provider host. Circle's [sessions](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/authenticate)
@@ -105,11 +112,13 @@ alongside the declarations. The result explicitly reports
 `endpoint_verified: false` and `runtime_application_required: true`: registration
 does not start your application or prove its public route.
 
-The adapter checks CLI version, authenticated account selection and the supported
-SCA runtime and implementation. Initial onboarding permits an undeployed account
-only for the intended registration call. It verifies the deployed account before
-continuing; no separate activation transaction is added. Existing provider
-configurations and runtime composition require the deployed account. See
+The adapter checks the CLI version and the authenticated account's selection of
+the wallet before an execute, unless a check that passed began less than 60
+seconds earlier. For signing, which submits nothing, it relies on the last
+passing check until any CLI command fails or prints output it refuses. It pins
+no account code, so any Circle account generation works. Initial onboarding
+sends the intended registration call directly, so no separate activation
+transaction is added. See
 [the adapter source](../sdks/provider/rust/src/circle.rs) and Circle's
 [contract execution interface](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/execute-contract).
 
@@ -119,7 +128,8 @@ Providers supply measured coverage, cumulative usage, final job outcomes and
 available session history through the existing
 [Rust integration interfaces](rust-runtime.md). Use `setup::runtime_from_config`
 to compose `runtime::Mppi` from the saved configuration, selected wallet and those
-integrations.
+integrations, or `setup::runtime_from_config_with_wallet` with
+[another wallet](rust-runtime.md#compose-a-provider-host).
 
 For an owned listener, the application calls
 `standalone::serve(runtime, listener_config, shutdown, policy)`. The helper starts the
@@ -215,7 +225,30 @@ For `--config mppi.toml`, these are `mppi.toml.onboarding.json`,
 `mppi.toml.wallet-operations.json` and, after an
 explicit update, `mppi.toml.update.json`, with their locking records.
 Keep that directory private, durable and backed up. Cooperating local commands
-use file locks. Providers coordinate independent hosts using the same operator.
+use file locks. A second onboarding or update command for the same
+configuration is refused as already in use. A record another process holds is
+waited for up to one second and then refused, except that the Circle adapter's
+execute and reconcile wait for the wallet-operation journal up to the CLI read
+timeout (`CircleOptions::read_timeout_ms`, 240 seconds by default); a journal
+still held is reported as the Circle Agent Wallet being unavailable or
+inconsistent. A serving provider shares that journal, but the Circle adapter
+holds its lock only while it reads or replaces the journal, never while a
+Circle CLI command runs. An execute that cannot take the lock in time sends
+nothing, yet is `UNKNOWN`: the journal was not read to show it unsent. If the
+adapter cannot record Circle's answer (the journal is held past that time,
+cannot be read or saved, or already holds other evidence for it), the result is
+`UNKNOWN` with Circle's transaction id and hash, and the adapter writes them
+into the journal at its next journal step, unless the journal still holds other
+evidence; a failed save keeps them in memory and does not fail that step. They live
+only in that memory until then: if the process stops first, the journal row
+holds no transaction id or hash, a reconcile of the reference is `UNKNOWN`
+without a hash, and the runtime refuses to recover a checkpoint holding that
+hash ([Rust runtime](rust-runtime.md)). Circle's documentation describes no
+lookup of a transaction by the idempotency key the adapter sends,
+`circle transaction list` prints a wallet's transactions without their
+idempotency keys, and MPPI documents no procedure for writing a transaction id
+and hash into a journal row: there is no documented remedy. Providers
+coordinate independent hosts using the same operator.
 The records contain exact setup/payment transaction intent and identifiers,
 not credentials, inference history, usage storage or a provider recovery service.
 
@@ -226,10 +259,39 @@ read-only and requires the original retained Circle transaction ID and matching
 call fields. If submission loses its result before that ID is saved, the operation
 remains `UNKNOWN`; similar history entries do not establish its identity. Keep
 the original journal and resolve the original operation with Circle before any
-replacement is considered.
+replacement is considered. Such a result's `cause` names the adapter's error and,
+when Circle CLI `1.1.4` reported one, its error code, for example
+`Unavailable (TIMEOUT)` or `Authentication (AUTH_EXPIRED)`; Circle's message and
+other output are never retained. A failure after the journal shows no record of
+the reference and before the intent is saved (a call over 60 KiB or for another
+network, capacity, CLI version, wallet selection or login, or the save itself)
+never reached Circle: the result is `FAILED` without a hash and its cause begins
+`NotSubmittedError`. A save that fails after it may have replaced the journal is
+read back and its unsent intent removed first; if that fails too, the result is
+`UNKNOWN`. Onboarding and update then clear a `FAILED` step, so a rerun prepares
+a fresh intent. An execute checks the CLI version and wallet selection first
+unless a check that passed began less than 60 seconds earlier; signing accepts
+the last passing check whatever its age, and any failed command clears it. When
+that check finds the login gone, the execute is such a failure:
+`NotSubmittedError: Authentication (AUTH_REQUIRED)`. A login lost less than 60
+seconds after a passing check began is found only by the CLI's refusal of the
+execute itself, after the intent is saved: the result is `UNKNOWN` with no
+transaction id, which can only be reconciled, so the sessions of a capture that
+ends this way cannot be collected again. Circle CLI `1.1.4` reports
+`AUTH_REQUIRED` when its saved login is missing or past its expiry, and
+`AUTH_EXPIRED` when Circle's service refuses a login the CLI still holds.
 
-The adapter permits 60 KiB calldata, 4,096 operation references and a 16 MiB
-journal. It refuses new operations at capacity and retains original evidence.
+The adapter permits 60 KiB calldata and a 16 MiB journal. Each record keeps a
+32-byte digest of its call rather than the call, so the journal holds tens of
+thousands of them. The runtime retires a session's records with the session:
+`retire` marks each with the time from which it may be forgotten, kept in the
+journal so a restart keeps it, and every save from then on forgets each marked
+record that holds a transaction hash; one without a hash keeps its mark. A
+reconcile of a marked record withdraws its mark, since a recovery from an older
+checkpoint may present that reference again. A new operation that would leave
+too little room for its record, and for the transaction id, hash and
+retirement mark every record may still gain, is refused before Circle is asked; original evidence is retained. Earlier releases
+refuse a journal this release has saved, so do not downgrade over it.
 Read commands have a default 240-second deadline and reconciliation examines at
 most 20 pages. Execute and sign commands drain to completion; a timeout kill does
 not turn an uncertain submission into a safe retry. Trusted embedded hosts can

@@ -5,7 +5,7 @@ Arc testnet. MPPI supplies registration, payment authorization, usage accounting
 and settlement. Your application supplies inference, token counts, final job
 outcomes, HTTPS hosting and retained session history.
 
-This walkthrough uses provider `0.1.2` and shared Python protocol `0.1.1`.
+This walkthrough uses provider `0.2.0` and shared Python protocol `0.1.4`.
 Both networks use the same Circle Agent Wallet integration. Select testnet or
 mainnet explicitly and retain separate configuration and operation records.
 
@@ -18,9 +18,9 @@ installing it:
 ```sh
 set -eu
 curl -fL -o mppi-linux-arm64 \
-  https://github.com/Alethieum/mppi/releases/download/provider-v0.1.2/mppi-linux-arm64
+  https://github.com/Alethieum/mppi/releases/download/provider-v0.2.0/mppi-linux-arm64
 curl -fL -o SHA256SUMS \
-  https://github.com/Alethieum/mppi/releases/download/provider-v0.1.2/SHA256SUMS
+  https://github.com/Alethieum/mppi/releases/download/provider-v0.2.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 mkdir -p "$HOME/.local/bin"
 install -m 755 mppi-linux-arm64 "$HOME/.local/bin/mppi"
@@ -28,17 +28,17 @@ export PATH="$HOME/.local/bin:$PATH"
 mppi --version
 ```
 
-The [provider release](https://github.com/Alethieum/mppi/releases/tag/provider-v0.1.2)
+The [provider release](https://github.com/Alethieum/mppi/releases/tag/provider-v0.2.0)
 includes the binary and `SHA256SUMS`. Linux ARM64 is the published native binary
 target. For a source build, use Rust 1.95.0 and a working native build toolchain:
 
 ```sh
-cargo install mppi-provider --version 0.1.2 --locked --bin mppi
+cargo install mppi-provider --version 0.2.0 --locked --bin mppi
 mppi --version
 ```
 
 Ensure Cargo's executable directory is on `PATH`. `--version` selects exactly
-`0.1.2`; `--locked` uses the package's dependency lockfile. Source builds on other
+`0.2.0`; `--locked` uses the package's dependency lockfile. Source builds on other
 platforms are not covered by the Linux ARM64 binary verification.
 [Cargo installation and lockfiles](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 
@@ -46,11 +46,11 @@ For a Python application, use Python 3.12+:
 
 ```sh
 uv venv --python 3.12
-uv pip install 'mppi-provider==0.1.2'
+uv pip install 'mppi-provider==0.2.0'
 ```
 
 The shared protocol dependency installs automatically. For a Rust application,
-add `mppi-provider = "=0.1.2"` to `[dependencies]` in your own `Cargo.toml` and
+add `mppi-provider = "=0.2.0"` to `[dependencies]` in your own `Cargo.toml` and
 build with your application's committed lockfile.
 
 ## 2. Generate your declarations
@@ -88,6 +88,7 @@ circle wallet login you@example.com --testnet
 circle wallet list --type agent --chain ARC-TESTNET --output json
 ```
 
+MPPI's Circle adapter accepts only this verified CLI version and refuses any other before anything is sent; other wallets are not affected.
 Use the selected address as `YOUR_OPERATOR_WALLET` below. The provider operator
 must differ from the payout recipient. Keep the recipient's signing authority
 outside the serving process. If multiple wallets share a Circle account, their
@@ -95,7 +96,22 @@ addresses are separate but their account custody is shared.
 
 Circle retains its login session; mainnet and testnet sessions are separate and
 expire after 28 days. Renew the same session when needed and retain the original
-MPPI operation records. Circle Agent Wallet currently sponsors transaction gas,
+MPPI operation records. Renewal is an interactive email login, so a serving
+process cannot renew it. Until someone logs in again, every collection and close
+fails before it is sent: a `FAILED` result with no transaction hash, whose cause
+begins `NotSubmittedError`. The Rust SDK's cause names Circle's code,
+`NotSubmittedError: Authentication (AUTH_REQUIRED)` (`AUTH_EXPIRED` when
+Circle's service refuses a login the CLI still holds); the Python SDK's reads
+`NotSubmittedError: CircleAgentWalletError`. A session whose collection
+deadline passes in the meantime can no longer be collected. The Circle adapter
+checks the login before a collection or close unless a passing check began less
+than 60 seconds earlier; a collection or close whose login lapses within those 60
+seconds reaches the CLI after its intent is saved, and the CLI's refusal leaves
+it unknown with no transaction id, so the sessions it covers can no longer be
+collected. Set a reminder a few days
+before the 28 days end, or run the operator through a wallet that needs no
+interactive login: both provider SDKs accept any `TransactionWallet`, for example
+one backed by a key held in your cloud key-management service. Circle Agent Wallet currently sponsors transaction gas,
 subject to caps and fair use; operator funding is not a prerequisite for these
 sponsored operations. See Circle's [authentication](https://developers.circle.com/agent-stack/agent-wallets/wallet-operations/authenticate)
 and [fees](https://developers.circle.com/agent-stack/agent-wallets/fees).

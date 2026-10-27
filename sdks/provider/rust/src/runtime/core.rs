@@ -218,19 +218,45 @@ impl Runtime {
         Ok(())
     }
 
+    /// Wake the runs of session `sid` waiting for admission. A waiting run
+    /// reads only its own session's state and the runtime-wide state, so call
+    /// this after any change to the session, under the same lock; runtime-wide
+    /// changes call `wake_all_locked`. While stopping, shutdown waits for every
+    /// session's final reports, so this wakes it too.
+    pub(super) fn wake_locked(&self, state: &State, sid: B256) {
+        if let Some(session) = state.sessions.get(&sid) {
+            session.wake.notify_waiters();
+        }
+        if state.stopping {
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Wake every waiting run and shutdown: for shutdown itself and for a
+    /// change in chain readiness, which every session's admission reads.
+    pub(super) fn wake_all_locked(&self, state: &State) {
+        for session in state.sessions.values() {
+            session.wake.notify_waiters();
+        }
+        self.changed.notify_waiters();
+    }
+
     pub(super) fn detach_locked(&self, state: &mut State, id: u64) {
         let sid = state.attachments.get_mut(&id).and_then(|attachment| {
             attachment.live = false;
             attachment.sid
         });
-        if let Some(session) = sid.and_then(|sid| state.sessions.get(&sid))
+        let Some(sid) = sid else {
+            return;
+        };
+        if let Some(session) = state.sessions.get(&sid)
             && session.owner == Some(id)
         {
             for run in session.active() {
                 run.stop.cancel();
             }
         }
-        self.changed.notify_waiters();
+        self.wake_locked(state, sid);
     }
 
     pub(super) fn stop_session_locked(&self, state: &mut State, sid: B256) {
@@ -251,7 +277,7 @@ impl Runtime {
                 })),
             );
         }
-        self.changed.notify_waiters();
+        self.wake_locked(state, sid);
     }
 
     pub(super) fn begin_run(&self, request: proto::CompleteRequest) -> Result<RunHandle, Status> {
@@ -332,6 +358,7 @@ impl Runtime {
             unresolved: false,
             retained_bytes: prepared.payload().len(),
             queued: None,
+            refusal: None,
         };
         let identity = snapshot
             .identities()
@@ -359,12 +386,14 @@ impl Runtime {
             .publications
             .insert(catalog.rate_card_hash(), *identity.observation());
         session.runs.insert(context.run_id(), run);
+        let wake = session.wake.clone();
         state.retained_request_bytes = retained;
         Ok(RunHandle {
             context,
             request: prepared,
             stop,
             output,
+            wake,
         })
     }
 
@@ -390,6 +419,10 @@ impl Runtime {
         }
         let mut state = self.lock()?;
         let context = &handle.context;
+        #[cfg(test)]
+        if let Some(session) = state.sessions.get_mut(&context.session_id()) {
+            session.checks += 1;
+        }
         let timely = || {
             if expires.is_some_and(|end| Instant::now() >= end) {
                 Err(not_ready(
@@ -532,7 +565,7 @@ impl Runtime {
         run.covered_counts = bound;
         run.accounting = accounting;
         run.phase = RunPhase::Admitted;
-        self.changed.notify_waiters();
+        self.wake_locked(&state, context.session_id());
         Ok(Admission::Granted)
     }
 
@@ -574,7 +607,7 @@ impl Runtime {
                 }
             }
             state.retained_request_bytes -= released;
-            self.changed.notify_waiters();
+            self.wake_locked(&state, context.session_id());
         }
     }
 
@@ -599,8 +632,26 @@ impl Runtime {
         let terminal = run.terminal.clone();
         let released = std::mem::take(&mut run.retained_bytes);
         state.retained_request_bytes -= released;
-        self.changed.notify_waiters();
+        self.wake_locked(&state, context.session_id());
         Ok(terminal)
+    }
+
+    /// This runtime's own recorded refusal of the run's coverage, as its
+    /// payment status. Arbitrary host errors carry no payment meaning.
+    pub(super) fn refusal(&self, context: &RunContext) -> Option<Status> {
+        let state = self.lock().ok()?;
+        let failure = state
+            .sessions
+            .get(&context.session_id())?
+            .runs
+            .get(&context.run_id())
+            .filter(|run| &run.context == context)?
+            .refusal
+            .clone()?;
+        Some(wire::payment_status_with_limits(
+            &failure,
+            &self.limits.wire,
+        ))
     }
 
     pub(super) fn run_locked<'a>(
@@ -815,6 +866,13 @@ impl Runtime {
                     proto::DrainReason::ProviderInitiated
                 };
                 let owner = session.owner;
+                if let Some(run) = state
+                    .sessions
+                    .get_mut(&context.session_id())
+                    .and_then(|session| session.runs.get_mut(&context.run_id()))
+                {
+                    run.refusal.get_or_insert_with(|| failure.clone());
+                }
                 if let Some(owner) = owner {
                     let _ = self.send_locked(
                         &mut state,
@@ -1045,7 +1103,7 @@ impl Runtime {
                     let _ = self.send_locked(&mut state, owner, receipt);
                 }
             }
-            self.changed.notify_waiters();
+            self.wake_locked(&state, context.session_id());
         }
         Ok(result)
     }

@@ -4,7 +4,10 @@ use crate::{
     transport::LimitsService,
     types::{OperationState, Readiness, ShutdownResult},
 };
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime},
+};
 use tokio::{task::AbortHandle, time::timeout_at};
 
 impl Runtime {
@@ -84,8 +87,10 @@ impl Runtime {
             .collect::<Vec<_>>();
         self.spawn(async move {
             let _guards = guards;
+            // Each batch's calldata fits the wallet's call bound; the rest of
+            // the due sessions follow in further batches of this pass.
             let mut groups = ids
-                .chunks(wire::MAX_MESSAGE_BYTES / 512)
+                .chunks(batch_sessions(sdk.inner.max_call_bytes))
                 .rev()
                 .map(<[B256]>::to_vec)
                 .collect::<Vec<_>>();
@@ -108,6 +113,7 @@ impl Runtime {
         if !started && self.initialize().is_err() {
             return;
         }
+        let mut retire = None;
         if let Ok(mut state) = self.lock() {
             let stop = state
                 .sessions
@@ -121,7 +127,104 @@ impl Runtime {
             for sid in stop {
                 self.stop_session_locked(&mut state, sid);
             }
-            self.changed.notify_waiters();
+            self.retire_locked(&mut state);
+            if !state.retiring
+                && !state.retirable.is_empty()
+                && state
+                    .retire_after
+                    .is_none_or(|after| Instant::now() >= after)
+            {
+                state.retiring = true;
+                let references = std::mem::take(&mut state.retirable);
+                let unconfirmed = references
+                    .iter()
+                    .filter_map(|(reference, _)| {
+                        let record = state.unconfirmed.remove(reference)?;
+                        Some((reference.clone(), record))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                retire = Some((references, unconfirmed));
+            }
+            let near_capacity = self.wallet.near_capacity();
+            if near_capacity && !state.near_capacity {
+                self.observers.emit(hooks::Event::Error(HookError {
+                    operation: "wallet",
+                    code: tonic::Code::ResourceExhausted,
+                }));
+            }
+            state.near_capacity = near_capacity;
+            // Every session's admission reads chain readiness: a change can
+            // end every wait at once.
+            let readiness = self.chain.readiness(None);
+            if state.readiness.as_ref() != Some(&readiness) {
+                state.readiness = Some(readiness);
+                self.wake_all_locked(&state);
+            }
+        }
+        if let Some((references, unconfirmed)) = retire {
+            // One call at a time, outside the lock, for each whole second the
+            // references are due in, naming its latest time: for any wallet,
+            // never before a reference in it is due and less than a second
+            // after (the Circle adapter keeps whole seconds). After a refusal
+            // the rest wait for a later pass, at most once per settlement
+            // interval, so a wallet that refuses for a while loses none and is
+            // not asked every pass.
+            let runtime = self.clone();
+            let _ = self.spawn(async move {
+                let mut due = BTreeMap::<Option<u64>, Vec<(String, SystemTime)>>::new();
+                for (reference, at) in references {
+                    // A reference whose record no wallet answer in this
+                    // process matched goes only if the wallet's record of it
+                    // agrees now, by recovery's check; otherwise it is kept.
+                    // Every other one this process has reconciled already.
+                    if let Some(record) = unconfirmed.get(&reference)
+                        && !runtime
+                            .wallet
+                            .reconcile(&reference)
+                            .await
+                            .is_ok_and(|answer| super::recovery::agrees(record, &answer))
+                    {
+                        continue;
+                    }
+                    let second = at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|elapsed| elapsed.as_secs());
+                    due.entry(second).or_default().push((reference, at));
+                }
+                let mut refused = Vec::new();
+                for group in due.into_values() {
+                    // A recovery since the hand-over may have named a reference
+                    // again (`State::references`): a session needs it, so it is
+                    // not passed. This reads memory only.
+                    let group = match runtime.lock() {
+                        Ok(state) => group
+                            .into_iter()
+                            .filter(|(reference, _)| !state.references.contains_key(reference))
+                            .collect::<Vec<_>>(),
+                        Err(_) => Vec::new(),
+                    };
+                    let Some(at) = group.iter().map(|(_, at)| *at).max() else {
+                        continue;
+                    };
+                    let references = group
+                        .iter()
+                        .map(|(reference, _)| reference.clone())
+                        .collect::<Vec<_>>();
+                    if !refused.is_empty() || runtime.wallet.retire(&references, at).await.is_err()
+                    {
+                        refused.extend(group);
+                    }
+                }
+                if let Ok(mut state) = runtime.lock() {
+                    state.retiring = false;
+                    state.retire_after = (!refused.is_empty()).then(|| {
+                        Instant::now()
+                            + Duration::from_millis(runtime.config.settlement().interval_ms())
+                    });
+                    state.retirable.extend(refused);
+                }
+            });
         }
         let sdk = Mppi {
             inner: self.clone(),
@@ -236,7 +339,7 @@ impl ProviderLifecycle for Mppi {
             for sid in state.sessions.keys().copied().collect::<Vec<_>>() {
                 self.inner.stop_session_locked(&mut state, sid);
             }
-            self.inner.changed.notify_waiters();
+            self.inner.wake_all_locked(&state);
         }
         loop {
             let changed = self.inner.changed.notified();

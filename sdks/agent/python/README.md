@@ -1,5 +1,68 @@
 # MPPI agent SDK for Python
 
+Version `0.1.6` keeps the wire protocol, contract and signatures, uses protocol
+package `0.1.4` and works with the providers running `0.1.2` and `0.2.0`. A
+caller of `0.1.5` notices these changes:
+
+- an opening in a fresh process takes two chain round trips from an account
+  without code and three from a smart account, four before: the follower's
+  snapshot carries the registry's funding wallet and its code, and a new
+  session's first attachment is checked against its own opening with no read;
+- an RPC backend that serves a refresh from behind the block that proved the
+  agent's own opening, top-up or close is lag: requests no longer stop at
+  `INCONSISTENT_STATE` until a later refresh. Once refreshes have stayed behind
+  that block for longer than `max_age_ms`, requests stop with
+  `SESSION_NOT_READY` / `STATE_UNAVAILABLE` until one reaches it;
+- an opening the wallet left uncertain with no transaction hash is found by its
+  `SessionOpened` log and proven by its receipt. An opening intent saved by
+  `0.1.5` has no recorded block, so `0.1.6` never searches the log for it;
+- a request on a retained session that its provider or anyone else closed,
+  whatever close-pending state the provider had reported and also after the
+  agent's own `requestClose`, raises `PaymentError` with code `SESSION_NOT_READY` and reason
+  `SESSION_CLOSED`, with no reconnect, where `0.1.5` reconnected on every
+  request and failed as "Control is unavailable". `sessions.open` retires that
+  session as after the agent's own close and funds a new one with the same
+  signer, unless its settled total exceeds validated usage: then it raises
+  `CloseAccountingError`, whose `operation` is `None`;
+- once the chain shows the session closed, opening proves a close the provider
+  reported, where `0.1.5` raised "session close is pending" until
+  `sessions.close` proved it: proven, the next request or `sessions.open`
+  retires the session as after the agent's own close. A close the agent cannot
+  prove, a reported close whose proof fails or its own `withdraw` or
+  `releaseIdle` left `UNKNOWN` with no transaction hash, is a close by someone
+  else, as above; the archived record of a session `sessions.open` retires
+  that way holds `closed_by_other`, the proof and what it left unresolved;
+- opening first reconciles the agent's own `withdraw` or `releaseIdle` that is
+  still `PENDING` or `UNKNOWN`, after a restart too, where `0.1.5` raised
+  "session close is pending" until a `sessions.reconcile` of it; one with no
+  transaction hash is traceable after all when the wallet holds one. The rule
+  for what the wallet and chain then report applies;
+- a provider report that arrives while the agent retires a closed session no
+  longer writes that session back into the checkpoint, where since `0.1.5` the
+  next session could inherit the retired session's close;
+- a failed withdraw, idle release or close request can be retried; earlier
+  agents, every version before 0.1.6, returned the failed result forever;
+- a withdraw, idle release or close request whose journal save failed before
+  the wallet was asked can be called again, where it was kept as an unsent
+  attempt that blocked its kind for good;
+- once it retires a session, the agent stops reading it from the chain, and
+  hands the wallet's `retire` the operations of that session it holds a
+  transaction hash for, never one it holds no hash for; the Circle adapter
+  then forgets each of those records that holds a transaction hash. A wallet
+  that cannot, or does not return within the client's timeout, is reported to
+  `on_error` as `HookError("retire", ...)`, and the opening goes on
+  ([wallet requirements](../../../docs/sdk-interfaces.md#wallet-requirements));
+- the Circle adapter checks the CLI and wallet before an execute unless a check
+  began within the last 60 seconds, where `0.1.5` checked once per process; a
+  call it refuses for an invalid reference, or once its journal shows no record
+  of the reference, is `FAILED`, never `UNKNOWN`, and a
+  wallet's cause now reaches `on_error` as a `HookError`;
+- chain reads repeat after a random share of their wait and honour
+  `Retry-After` within the same bound.
+
+Do not downgrade to `0.1.5` over a Circle wallet journal `0.1.6` has saved:
+earlier releases refuse its compact records.
+
 Version `0.1.5` keeps the wire protocol, contract and signatures, uses protocol
 package `0.1.3` and works with the providers running `0.1.2`. A caller of
 `0.1.4.1` notices these changes:
@@ -233,7 +296,8 @@ reconciled using its original reference; it cannot create replacement funding.
 Retained session inspection and wallet-only exits restore from the checkpoint
 and verified chain state without requiring the provider's HTTP endpoint. A
 `CloseAccountingError` reports capture above validated usage while retaining
-the confirmed transaction in its `operation`; it does not imply a retry is safe.
+the confirmed transaction in its `operation` (`None` for a close the client did
+not make); it does not imply a retry is safe.
 
 Queue bounds and wait timeouts are explicit constructor settings. Slow output
 consumption cannot grow its queue without bound; failed or cancelled inference

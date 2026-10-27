@@ -1,5 +1,8 @@
 //! Native RPC adapters. Provider callbacks and network waits never hold state locks.
-use super::*;
+use super::{
+    hooks::{Part, Timing},
+    *,
+};
 use crate::{
     interfaces::IntegrationError, queue::QueueError, signing, transport::request_deadline,
 };
@@ -253,13 +256,12 @@ impl Runtime {
                         state.sessions.remove(&sid);
                         // This synchronous watch removal shares the state lock
                         // with deletion; it cannot race a recovered replacement.
-                        if state.pending_watch != Some(sid) {
+                        if !state.pending_watch.contains_key(&sid) {
                             let _ = self.chain.unwatch_session(sid);
                         }
                     }
                 }
             }
-            self.changed.notify_waiters();
         }
     }
 
@@ -357,9 +359,13 @@ impl Runtime {
                                         session.close_reference =
                                             Some(format!("close:{:x}", random_id()?));
                                     }
+                                    // Accepted once: its runs stop and its
+                                    // owner is told once (Drain).
+                                    let accepted = !session.close_pending;
                                     session.close_pending = true;
-                                    self.stop_session_locked(&mut state, sid);
-                                    self.changed.notify_waiters();
+                                    if accepted {
+                                        self.stop_session_locked(&mut state, sid);
+                                    }
                                     Some(sid)
                                 }
                             };
@@ -509,7 +515,11 @@ impl Runtime {
         )
     }
 
-    async fn opening(self: &Arc<Self>, id: u64, notice: proto::SessionOpen) -> Result<(), Status> {
+    pub(super) async fn opening(
+        self: &Arc<Self>,
+        id: u64,
+        notice: proto::SessionOpen,
+    ) -> Result<(), Status> {
         let _serial = self.openings.lock().await;
         let sid = B256::from_slice(notice.session_id.as_deref().unwrap());
         let tx = B256::from_slice(notice.open_tx.as_deref().unwrap());
@@ -526,11 +536,6 @@ impl Runtime {
                 return Err(Status::invalid_argument(
                     "Control already bound to a session",
                 ));
-            }
-            if !state.sessions.contains_key(&sid)
-                && state.sessions.len() >= self.limits.max_sessions
-            {
-                return Err(Status::resource_exhausted("session retention limit"));
             }
             attachment
                 .catalogs
@@ -582,18 +587,28 @@ impl Runtime {
                 attachment.sid = Some(sid);
                 return Ok(());
             }
-            if state
-                .start_block
-                .is_none_or(|block| evidence.block().observation().block_number() <= block)
-            {
-                return Err(not_ready("STATE_UNAVAILABLE", Some(sid), None));
-            }
         }
-        self.chain
+        let observed = self
+            .chain
             .watch_session(sid)
             .await
             .map_err(|_| not_ready("STATE_UNAVAILABLE", Some(sid), None))?;
+        // Nothing about a closed session can be served or collected. Installing
+        // one again (it may have retired) would be a fresh session with no
+        // runs; the dropped PendingWatch releases its watch. This comes before
+        // the start-block check, as in the Python runtime, so the agent of a
+        // closed session that opened before this process started learns that
+        // it closed.
+        if observed.status() == SessionStatus::Closed {
+            return Err(not_ready("SESSION_CLOSED", Some(sid), None));
+        }
         let mut state = self.lock()?;
+        if state
+            .start_block
+            .is_none_or(|block| evidence.block().observation().block_number() <= block)
+        {
+            return Err(not_ready("STATE_UNAVAILABLE", Some(sid), None));
+        }
         self.snapshot_locked(&state)?;
         let attachment = state
             .attachments
@@ -608,7 +623,11 @@ impl Runtime {
         Ok(())
     }
 
-    async fn receive_voucher(&self, id: u64, voucher: proto::Voucher) -> Result<(), Status> {
+    pub(super) async fn receive_voucher(
+        &self,
+        id: u64,
+        voucher: proto::Voucher,
+    ) -> Result<(), Status> {
         let sid = {
             let mut state = self.lock()?;
             let sid = self.owner_locked(&state, id, voucher.session_id.as_deref().unwrap())?;
@@ -619,7 +638,7 @@ impl Runtime {
                 .ok_or_else(|| not_ready("STATE_UNAVAILABLE", Some(sid), None))?;
             if voucher.cumulative.unwrap() <= chain.deposit() {
                 self.accept_voucher_locked(&mut state, sid, voucher)?;
-                self.changed.notify_waiters();
+                self.wake_locked(&state, sid);
                 return Ok(());
             }
             // Unauthenticated or forged messages must never trigger RPC work.
@@ -642,7 +661,7 @@ impl Runtime {
         // Ownership, closure and pause may change while network I/O is pending.
         self.gate_locked(&state, &state.sessions[&sid], None)?;
         self.accept_voucher_locked(&mut state, sid, voucher)?;
-        self.changed.notify_waiters();
+        self.wake_locked(&state, sid);
         Ok(())
     }
 
@@ -873,7 +892,7 @@ impl Runtime {
         if let Some(value) = advanced_voucher {
             self.observers.emit(hooks::Event::Voucher(value));
         }
-        self.changed.notify_waiters();
+        self.wake_locked(&state, sid);
         Ok(())
     }
 }
@@ -884,6 +903,7 @@ impl proto::chat_server::Chat for Mppi {
         &self,
         request: Request<proto::CompleteRequest>,
     ) -> Result<Response<Self::CompletionsStream>, Status> {
+        let arrived = Instant::now();
         let deadline = request_deadline(&request)?;
         let run = self
             .inner
@@ -899,11 +919,13 @@ impl proto::chat_server::Chat for Mppi {
             scope: Scope::Run(run.context.clone()),
             reader: None,
         };
+        let timing = Timing::new(&self.inner.observers, "admission", arrived);
         let prepared = async {
-            let bound = self
-                .inner
-                .coverage
-                .coverage(&run.request, &run.context)
+            let bound = timing
+                .part(
+                    Part::Coverage,
+                    self.inner.coverage.coverage(&run.request, &run.context),
+                )
                 .await
                 .map_err(|error| {
                     if error.is::<UpstreamFailure>() {
@@ -923,7 +945,9 @@ impl proto::chat_server::Chat for Mppi {
             }
             let mut expires = None;
             loop {
-                let changed = self.inner.changed.notified();
+                // Created before the check, so it receives every later wake-up
+                // (tokio Notify::notified).
+                let changed = run.wake.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
                 let checked_at = Instant::now();
@@ -952,8 +976,9 @@ impl proto::chat_server::Chat for Mppi {
                     // Covered: its turn comes within TURN, before any expiry.
                     Admission::Deferred => {}
                 }
-                // A changed follower also invalidates admission even without
-                // an incoming Control message. This never resets the deadline.
+                // Its session's changes, shutdown and a change in chain readiness
+                // wake it. The poll covers what no event marks, such as a turn
+                // ending or a new block. This never resets the deadline.
                 let poll = Instant::now() + Duration::from_millis(50);
                 let wake = expires.map_or(poll, |end| end.min(poll));
                 let _ = tokio::time::timeout_at(wake, changed).await;
@@ -968,6 +993,7 @@ impl proto::chat_server::Chat for Mppi {
         } else {
             prepared.await
         };
+        timing.finish(result.is_ok().then_some("admitted"));
         if let Err(error) = result {
             self.inner.observers.emit(hooks::Event::Error(HookError {
                 operation: "complete",
@@ -1096,11 +1122,13 @@ impl Runtime {
                             }
                             return Ok(terminal);
                         }
-                        return Err(not_ready(
-                            "STATE_UNAVAILABLE",
-                            Some(run.context.session_id()),
-                            Some(run.context.run_id()),
-                        ));
+                        return Err(self.refusal(&run.context).unwrap_or_else(|| {
+                            not_ready(
+                                "STATE_UNAVAILABLE",
+                                Some(run.context.session_id()),
+                                Some(run.context.run_id()),
+                            )
+                        }));
                     }
                 }
             }

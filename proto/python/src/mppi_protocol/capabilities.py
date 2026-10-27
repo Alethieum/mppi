@@ -53,7 +53,8 @@ class FundingAuthorization:
 
 class NotSubmittedError(RuntimeError):
     """A wallet adapter's own durable record proves the call never reached the
-    wallet service: nothing was submitted, so the same call may be sent again.
+    wallet service: nothing was submitted and the reference binds nothing, so
+    it may be sent again, with this call or another.
 
     Raise it only with that proof. Any other failure leaves the outcome unknown.
     """
@@ -63,6 +64,12 @@ class TransactionWallet(Protocol):
     """A wallet adapter's transactions. ``execute`` sends ``call`` once from
     ``address`` with zero native value and durably binds ``operation_ref`` to
     it first; ``reconcile`` reports that same submission and never sends.
+
+    The runtimes may call ``execute`` and ``reconcile`` for different
+    operations, or the same one, at once, from several threads (a recovery
+    reads before taking the runtime's locks), so an adapter serializes access
+    to its own records, as ``CircleAgentWallet`` does.
+    Every requirement is in docs/sdk-interfaces.md, Wallet requirements.
     """
 
     @property
@@ -79,7 +86,7 @@ class FundingWallet(TransactionWallet, Protocol):
     ``sign_funding_authorization`` returns bytes USDC accepts for exactly that
     authorization from ``address``: an ECDSA signature for an account without
     code, or bytes its ERC-1271 isValidSignature accepts. Before submitting
-    funding, the agent checks them and that its ERC-8004 agent id binds
+    an opening, the agent checks them and that its ERC-8004 agent id binds
     ``address``. No wallet implementation or version is pinned.
 
     A wallet whose service creates the signature when it executes declares an
@@ -87,6 +94,7 @@ class FundingWallet(TransactionWallet, Protocol):
     returns a placeholder that ``execute`` replaces. The agent neither verifies
     nor simulates the placeholder; it still checks the agent-id binding, and
     USDC verifies the real signature on chain.
+    Every requirement is in docs/sdk-interfaces.md, Wallet requirements.
     """
 
     def sign_funding_authorization(self, authorization: FundingAuthorization) -> bytes: ...
